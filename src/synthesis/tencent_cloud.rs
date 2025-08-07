@@ -18,62 +18,32 @@ const HOST: &str = "tts.cloud.tencent.com";
 const PATH: &str = "/stream_ws";
 /// TencentCloud TTS Response structure
 /// https://cloud.tencent.com/document/product/1073/94308   
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TencentCloudTtsResponse {
-    #[serde(rename = "Response")]
-    pub response: TencentCloudTtsResult,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
 pub struct Subtitle {
-    #[serde(rename = "Text")]
     pub text: String,
-    #[serde(rename = "BeginTime")]
     pub begin_time: u32,
-    #[serde(rename = "EndTime")]
     pub end_time: u32,
-    #[serde(rename = "BeginIndex")]
     pub begin_index: u32,
-    #[serde(rename = "EndIndex")]
     pub end_index: u32,
-    #[serde(rename = "Phoneme")]
     pub phoneme: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TencentCloudTtsResult {
-    #[serde(rename = "Audio")]
-    pub audio: Option<String>,
-    #[serde(rename = "SessionId")]
-    pub session_id: Option<String>,
-    #[serde(rename = "RequestId")]
-    pub request_id: String,
-    #[serde(rename = "Subtitle")]
-    pub subtitles: Option<Vec<Subtitle>>,
 }
 
 /// WebSocket response structure for real-time TTS
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketResponse {
-    #[serde(rename = "code")]
     pub code: i32,
-    #[serde(rename = "message")]
     pub message: String,
-    #[serde(rename = "session_id")]
     pub session_id: String,
-    #[serde(rename = "request_id")]
     pub request_id: String,
-    #[serde(rename = "message_id")]
     pub message_id: String,
-    #[serde(rename = "final")]
-    pub final_: i32,
-    #[serde(rename = "result")]
+    pub r#final: i32,
     pub result: WebSocketResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebSocketResult {
-    #[serde(rename = "subtitles")]
     pub subtitles: Option<Vec<Subtitle>>,
 }
 
@@ -230,7 +200,7 @@ impl TencentCloudTtsClient {
                                     ));
                                 }
                                 // Check if this is the final message
-                                if response.final_ == 1 {
+                                if response.r#final == 1 {
                                     Some((Ok(Vec::new()), (ws_stream, true)))
                                 } else {
                                     // Continue receiving data

@@ -1,5 +1,5 @@
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::{stream, SinkExt, Stream, StreamExt};
 use http::StatusCode;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -30,7 +30,7 @@ struct RunTaskCommand {
 struct CommandHeader {
     action: String,
     task_id: String,
-    stream: String,
+    streaming: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,7 +40,7 @@ struct RunTaskPayload {
     function: String,
     model: String,
     parameters: RunTaskParameters,
-    input: Option<PayloadInput>,
+    input: EmptyInput,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +66,17 @@ struct PayloadInput {
     text: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ContinueTaskCommand {
+    header: CommandHeader,
+    payload: ContinueTaskPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ContinueTaskPayload {
+    input: PayloadInput,
+}
+
 /// finish-task command structure
 #[derive(Debug, Serialize)]
 struct FinishTaskCommand {
@@ -85,6 +96,17 @@ struct EmptyInput {}
 #[derive(Debug, Deserialize)]
 struct WebSocketEvent {
     header: WebSocketEventHeader,
+    payload: WebSocketEventPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketEventPayload {
+    usage: Option<PayloadUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PayloadUsage {
+    characters: u32,
 }
 
 #[allow(dead_code)]
@@ -118,12 +140,7 @@ impl AliyunTtsClient {
     }
 
     /// Create run-task command
-    fn create_run_task_command(
-        &self,
-        option: &SynthesisOption,
-        task_id: &str,
-        text: &str,
-    ) -> RunTaskCommand {
+    fn create_run_task_command(&self, option: &SynthesisOption, task_id: &str) -> RunTaskCommand {
         let model = option
             .extra
             .as_ref()
@@ -150,7 +167,7 @@ impl AliyunTtsClient {
             header: CommandHeader {
                 action: "run-task".to_string(),
                 task_id: task_id.to_string(),
-                stream: "duplex".to_string(),
+                streaming: "duplex".to_string(),
             },
             payload: RunTaskPayload {
                 task_group: "audio".to_string(),
@@ -167,9 +184,22 @@ impl AliyunTtsClient {
                     pitch: None,
                     enable_ssml: None,
                 },
-                input: Some(PayloadInput {
+                input: EmptyInput {},
+            },
+        }
+    }
+
+    fn create_continue_task_command(&self, task_id: &str, text: &str) -> ContinueTaskCommand {
+        ContinueTaskCommand {
+            header: CommandHeader {
+                action: "continue-task".to_string(),
+                task_id: task_id.to_string(),
+                streaming: "duplex".to_string(),
+            },
+            payload: ContinueTaskPayload {
+                input: PayloadInput {
                     text: text.to_string(),
-                }),
+                },
             },
         }
     }
@@ -180,7 +210,7 @@ impl AliyunTtsClient {
             header: CommandHeader {
                 action: "finish-task".to_string(),
                 task_id: task_id.to_string(),
-                stream: "duplex".to_string(),
+                streaming: "duplex".to_string(),
             },
             payload: FinishTaskPayload {
                 input: EmptyInput {},
@@ -231,13 +261,22 @@ impl SynthesisClient for AliyunTtsClient {
         let (mut ws_sink, ws_stream) = ws_stream.split();
 
         // Send run-task command
-        let run_task_cmd = self.create_run_task_command(&option, &task_id, text);
+        let run_task_cmd = self.create_run_task_command(&option, &task_id);
         let run_task_json = serde_json::to_string(&run_task_cmd)?;
         debug!("Sending run-task command: {}", run_task_json);
         ws_sink
             .send(Message::text(run_task_json))
             .await
             .map_err(|e| anyhow!("Failed to send run-task command: {}", e))?;
+
+        // send continue-task command, tts input text send in here
+        let continue_task_cmd = self.create_continue_task_command(&task_id, text);
+        let continue_task_json = serde_json::to_string(&continue_task_cmd)?;
+        debug!("Sending continue-task command: {}", continue_task_json);
+        ws_sink
+            .send(Message::text(continue_task_json))
+            .await
+            .map_err(|e| anyhow!("Failed to send continue-task command: {}", e))?;
 
         // Send finish-task command
         let finish_task_cmd = self.create_finish_task_command(&task_id);
@@ -258,7 +297,6 @@ impl SynthesisClient for AliyunTtsClient {
 
                 match ws_stream.next().await {
                     Some(Ok(Message::Text(text))) => {
-                        // Handle JSON event messages
                         match serde_json::from_str::<WebSocketEvent>(&text) {
                             Ok(event) => {
                                 debug!("Received event: {:?}", event);
@@ -289,7 +327,9 @@ impl SynthesisClient for AliyunTtsClient {
                                         ))
                                     }
                                     "result-generated" => {
-                                        debug!("Result generated event");
+                                        if let Some(usage) = event.payload.usage {
+                                            debug!("characters: {}", usage.characters);
+                                        }
                                         Some((Ok(Vec::new()), (ws_stream, false)))
                                     }
                                     _ => {
