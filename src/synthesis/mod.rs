@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::stream::Stream;
+use futures::stream::{BoxStream};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, pin::Pin};
+use std::{collections::HashMap};
 mod aliyun;
 mod tencent_cloud;
 mod voiceapi;
@@ -110,15 +110,24 @@ impl SynthesisOption {
     }
 }
 
+pub trait SynthesisProgress{
+    fn get_current_progress(&self, current: u32) -> Option<SessionEvent>;
+}
+
+pub enum SynthesisResult {
+    Audio(Vec<u8>),
+    Processing(Box<dyn SynthesisProgress + Send + 'static>),
+}
+
 #[async_trait]
 pub trait SynthesisClient: Send {
     fn provider(&self) -> SynthesisType;
     /// Synthesize text to audio and return a stream of audio chunks
-    async fn synthesize<'a>(
-        &'a self,
-        text: &'a str,
+    async fn synthesize(
+        &self,
+        text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>>;
+    ) -> Result<BoxStream<Result<SynthesisResult>>>;
 }
 
 impl Default for SynthesisOption {
@@ -204,8 +213,4 @@ pub fn create_synthesis_client(option: SynthesisOption) -> Result<Box<dyn Synthe
             return Err(anyhow::anyhow!("Unsupported provider: {}", provider));
         }
     }
-}
-
-pub trait SynthesisProgress{
-    fn get_current_progress(&self, current: u32) -> Option<SessionEvent>;
 }

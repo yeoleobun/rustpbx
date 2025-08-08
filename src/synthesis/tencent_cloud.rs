@@ -1,13 +1,13 @@
-use crate::{event::SessionEvent, synthesis::SynthesisProgress};
+use crate::{event::SessionEvent, synthesis::{SynthesisProgress, SynthesisResult}};
 
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures::{Stream, StreamExt};
+use futures::{stream::BoxStream, StreamExt};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::{future::ready, pin::Pin};
+use std::{future::ready};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{client::IntoClientRequest, protocol::Message},
@@ -185,7 +185,7 @@ impl TencentCloudTtsClient {
         &self,
         text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+    ) -> Result<BoxStream<'_, Result<SynthesisResult>>> {
         let url = self.generate_websocket_url(text, option)?;
         debug!("connecting to WebSocket URL: {}", url);
 
@@ -232,7 +232,7 @@ impl TencentCloudTtsClient {
                 let session_id = session_id.clone();
                 async move {
                     match message {
-                        Ok(Message::Binary(data)) => Some(Ok(data.to_vec())),
+                        Ok(Message::Binary(data)) => Some(Ok(SynthesisResult::Audio(data.to_vec()))),
                         Ok(Message::Text(text)) => {
                             if let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text) {
                                 if response.code != 0 {
@@ -266,11 +266,11 @@ impl SynthesisClient for TencentCloudTtsClient {
     fn provider(&self) -> SynthesisType {
         SynthesisType::TencentCloud
     }
-    async fn synthesize<'a>(
-        &'a self,
-        text: &'a str,
+    async fn synthesize(
+        &self,
+        text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+    ) -> Result<BoxStream<Result<SynthesisResult>>> {
         // Use the new WebSocket streaming implementation
         self.synthesize_text_stream(text, option).await
     }

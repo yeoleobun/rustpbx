@@ -1,12 +1,12 @@
-use crate::{event::SessionEvent, synthesis::SynthesisProgress};
+use crate::{event::SessionEvent, synthesis::{SynthesisProgress, SynthesisResult}};
 
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{stream::BoxStream, SinkExt, StreamExt};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{future::ready, pin::Pin};
+use std::{future::ready};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -265,11 +265,11 @@ impl SynthesisClient for AliyunTtsClient {
         SynthesisType::Aliyun
     }
 
-    async fn synthesize<'a>(
-        &'a self,
-        text: &'a str,
+    async fn synthesize(
+        &self,
+        text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+    ) -> Result<BoxStream<Result<SynthesisResult>>> {
         let option = self.option.merge_with(option);
         let api_key = self.get_api_key(&option)?;
         let task_id = Uuid::new_v4().to_string();
@@ -356,7 +356,7 @@ impl SynthesisClient for AliyunTtsClient {
                     match message {
                         Ok(Message::Binary(data)) => {
                             debug!("task: {task_id} Received audio data: {} bytes", data.len());
-                            Some(Ok(data.to_vec()))
+                            Some(Ok(SynthesisResult::Audio(data.to_vec())))
                         }
                         Ok(Message::Text(text)) => {
                             if let Ok(event) = serde_json::from_str::<WebSocketEvent>(&text) {

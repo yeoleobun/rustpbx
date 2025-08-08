@@ -1,14 +1,15 @@
+use crate::synthesis::SynthesisResult;
 use crate::synthesis::{
-    tencent_cloud::TencentCloudTtsClient, AliyunTtsClient, SynthesisClient, SynthesisOption,
-    SynthesisType,
+    AliyunTtsClient, SynthesisClient, SynthesisOption, SynthesisType,
+    tencent_cloud::TencentCloudTtsClient,
 };
+use anyhow::Result;
 use dotenv::dotenv;
 use futures::StreamExt;
+use hound::{SampleFormat, WavSpec, WavWriter};
 use std::env;
 use std::fs::File;
 use std::io::Write;
-use hound::{WavSpec, WavWriter, SampleFormat};
-use anyhow::Result;
 
 fn get_tencent_credentials() -> Option<(String, String, String)> {
     dotenv().ok();
@@ -26,6 +27,11 @@ fn get_aliyun_credentials() -> Option<String> {
 
 #[tokio::test]
 async fn test_tencent_cloud_tts() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
     // Initialize crypto provider
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
@@ -49,20 +55,21 @@ async fn test_tencent_cloud_tts() {
     };
 
     let client = TencentCloudTtsClient::new(config);
-    let text = "Hello";
+    let text = "你好，我是阿里云的语音合成服务。";
     match client.synthesize(text, None).await {
         Ok(mut stream) => {
             // Collect all chunks from the stream
             let mut total_size = 0;
             let mut chunks_count = 0;
             let mut collected_audio = Vec::new();
-
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        total_size += chunk.len();
-                        chunks_count += 1;
-                        collected_audio.extend_from_slice(&chunk);
+                        if let SynthesisResult::Audio(audio) = chunk {
+                            total_size += audio.len();
+                            chunks_count += 1;
+                            collected_audio.extend_from_slice(&audio);
+                        }
                     }
                     Err(e) => {
                         panic!("Error in audio stream chunk: {:?}", e);
@@ -80,6 +87,11 @@ async fn test_tencent_cloud_tts() {
 
 #[tokio::test]
 async fn test_aliyun_tts() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
     // Initialize crypto provider
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
@@ -95,10 +107,10 @@ async fn test_aliyun_tts() {
         provider: Some(SynthesisType::Aliyun),
         secret_key: Some(api_key),
         speaker: Some("longyumi_v2".to_string()), // Default voice
-        volume: Some(5),                         // Medium volume (0-10)
-        speed: Some(1.0),                        // Normal speed
-        codec: Some("pcm".to_string()),          // PCM format for easy verification
-        samplerate: Some(16000),                 // 16kHz sample rate
+        volume: Some(5),                          // Medium volume (0-10)
+        speed: Some(1.0),                         // Normal speed
+        codec: Some("pcm".to_string()),           // PCM format for easy verification
+        samplerate: Some(16000),                  // 16kHz sample rate
         ..Default::default()
     };
 
@@ -109,30 +121,32 @@ async fn test_aliyun_tts() {
     println!("Aliyun TTS client created successfully");
     println!("Test passes - implementation is structurally correct");
 
-    let stream = client.synthesize("Hello", None).await;
+    let stream = client
+        .synthesize("你好，我是阿里云的语音合成服务。", None)
+        .await;
     if let Ok(mut stream) = stream {
         let mut audio_collector = Vec::with_capacity(8096);
         let mut chunks_count = 0;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    audio_collector.extend_from_slice(&chunk);
-                    chunks_count += 1;
+                    if let SynthesisResult::Audio(chunk) = chunk {
+                        audio_collector.extend_from_slice(&chunk);
+                        chunks_count += 1;
+                    }
                 }
                 Err(e) => {
                     panic!("Error in audio stream chunk: {:?}", e);
                 }
             }
-        }        
+        }
         println!("Total audio size: {} bytes", audio_collector.len());
         println!("Total chunks: {}", chunks_count);
         // save_audio_to_files(&audio_collector, 16000, "test_aliyun_tts").unwrap();
     } else {
         panic!("Error in audio stream: {:?}", stream.err());
     }
-
 }
-
 
 /// Save PCM audio data to files for testing
 #[allow(dead_code)]
@@ -146,7 +160,10 @@ fn save_audio_to_files(audio_data: &[u8], sample_rate: u32, prefix: &str) -> Res
     let mut pcm_file = File::create(&pcm_filename)?;
     pcm_file.write_all(audio_data)?;
     println!("✓ Saved raw PCM audio to: {}", pcm_filename);
-    println!("  Play with: ffplay -f s16le -ar {} -ac 1 {}", sample_rate, pcm_filename);
+    println!(
+        "  Play with: ffplay -f s16le -ar {} -ac 1 {}",
+        sample_rate, pcm_filename
+    );
 
     // Convert bytes to samples and save as WAV
     let samples: Vec<i16> = audio_data

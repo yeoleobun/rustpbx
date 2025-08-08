@@ -1,12 +1,13 @@
+use crate::synthesis::SynthesisResult;
+
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures::{stream, SinkExt, Stream, StreamExt};
+use futures::{stream::{self, BoxStream}, SinkExt, StreamExt};
 use http::{Request, StatusCode, Uri};
 use rand::random;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, warn};
 /// https://github.com/ruzhila/voiceapi
@@ -44,11 +45,11 @@ impl VoiceApiTtsClient {
         Self { option }
     }
     // WebSocket-based TTS synthesis
-    async fn ws_synthesize<'a>(
-        &'a self,
-        text: &'a str,
+    async fn ws_synthesize(
+        &self,
+        text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+    ) -> Result<BoxStream<'_, Result<SynthesisResult>>> {
         let option = self.option.merge_with(option);
         let endpoint = option
             .endpoint
@@ -108,7 +109,7 @@ impl VoiceApiTtsClient {
                 match read.next().await {
                     Some(Ok(Message::Binary(data))) => {
                         let audio_data = data.to_vec();
-                        Some((Ok(audio_data), (read, write, false)))
+                        Some((Ok(SynthesisResult::Audio(audio_data)), (read, write, false)))
                     }
                     Some(Ok(Message::Text(text_data))) => {
                         // Text data is metadata
@@ -121,12 +122,12 @@ impl VoiceApiTtsClient {
                                 let is_finished = metadata.progress >= 1.0;
 
                                 // Return empty chunk and continue or finish
-                                Some((Ok(Vec::new()), (read, write, is_finished)))
+                                Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, is_finished)))
                             }
                             Err(e) => {
                                 warn!("Failed to parse metadata: {}", e);
                                 // Continue receiving data
-                                Some((Ok(Vec::new()), (read, write, false)))
+                                Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
                             }
                         }
                     }
@@ -142,7 +143,7 @@ impl VoiceApiTtsClient {
                     }
                     _ => {
                         // Other message types (ping/pong/etc.)
-                        Some((Ok(Vec::new()), (read, write, false)))
+                        Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
                     }
                 }
             },
@@ -157,11 +158,11 @@ impl SynthesisClient for VoiceApiTtsClient {
     fn provider(&self) -> SynthesisType {
         SynthesisType::VoiceApi
     }
-    async fn synthesize<'a>(
-        &'a self,
-        text: &'a str,
+    async fn synthesize(
+        &self,
+        text: &str,
         option: Option<SynthesisOption>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+    ) -> Result<BoxStream<Result<SynthesisResult>>> {
         self.ws_synthesize(text, option).await
     }
 }

@@ -4,12 +4,14 @@ use dotenv::dotenv;
 use futures::StreamExt;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use regex::Regex;
-use rustpbx::{version, PcmBuf};
+use rustpbx::{PcmBuf, version};
 use std::path::PathBuf;
 use tracing::{debug, error, info};
 
 use rustpbx::media::codecs::bytes_to_samples;
-use rustpbx::synthesis::{SynthesisClient, SynthesisOption, SynthesisType, TencentCloudTtsClient};
+use rustpbx::synthesis::{
+    SynthesisClient, SynthesisOption, SynthesisResult, SynthesisType, TencentCloudTtsClient,
+};
 
 const SAMPLE_RATE: u32 = 16000;
 
@@ -233,11 +235,13 @@ async fn main() -> Result<()> {
                     while let Some(chunk_result) = audio_stream.next().await {
                         match chunk_result {
                             Ok(chunk) => {
-                                debug!("Received chunk of {} bytes", chunk.len());
-                                total_bytes += chunk.len();
-                                let samples: PcmBuf = bytes_to_samples(&chunk);
-                                for &sample in &samples {
-                                    writer.write_sample(sample)?;
+                                if let SynthesisResult::Audio(chunk) = chunk {
+                                    debug!("Received chunk of {} bytes", chunk.len());
+                                    total_bytes += chunk.len();
+                                    let samples: PcmBuf = bytes_to_samples(&chunk);
+                                    for &sample in &samples {
+                                        writer.write_sample(sample)?;
+                                    }
                                 }
                             }
                             Err(e) => {

@@ -7,7 +7,7 @@ use futures::StreamExt;
 use rustpbx::llm::LlmContent;
 use rustpbx::media::codecs::bytes_to_samples;
 use rustpbx::media::track::file::read_wav_file;
-use rustpbx::synthesis::SynthesisClient;
+use rustpbx::synthesis::{SynthesisClient, SynthesisResult};
 use rustpbx::transcription::TencentCloudAsrClientBuilder;
 use rustpbx::{PcmBuf, Sample};
 use std::collections::VecDeque;
@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(
                     "Unsupported sample format: {:?}",
                     sample_format
-                ))
+                ));
             }
         });
 
@@ -373,7 +373,7 @@ async fn main() -> Result<()> {
             return Err(anyhow::anyhow!(
                 "Unsupported sample format: {:?}",
                 sample_format
-            ))
+            ));
         }
     });
 
@@ -441,18 +441,21 @@ async fn main() -> Result<()> {
                                     {
                                         let mut total_bytes = 0;
                                         while let Some(Ok(chunk)) = audio_stream.next().await {
-                                            total_bytes += chunk.len();
-                                            let audio_data: PcmBuf = bytes_to_samples(&chunk);
-                                            let final_audio = if sample_rate != output_sample_rate {
-                                                resample::resample_mono(
-                                                    &audio_data,
-                                                    sample_rate,
-                                                    output_sample_rate,
-                                                )
-                                            } else {
-                                                audio_data
-                                            };
-                                            output_buffer.push(&final_audio);
+                                            if let SynthesisResult::Audio(chunk) = chunk {
+                                                total_bytes += chunk.len();
+                                                let audio_data: PcmBuf = bytes_to_samples(&chunk);
+                                                let final_audio =
+                                                    if sample_rate != output_sample_rate {
+                                                        resample::resample_mono(
+                                                            &audio_data,
+                                                            sample_rate,
+                                                            output_sample_rate,
+                                                        )
+                                                    } else {
+                                                        audio_data
+                                                    };
+                                                output_buffer.push(&final_audio);
+                                            }
                                         }
                                         info!(
                                             "TTS synthesis: {}ms ({}) bytes",
