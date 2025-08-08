@@ -440,21 +440,28 @@ async fn main() -> Result<()> {
                                         tts_client.synthesize(&text, None).await
                                     {
                                         let mut total_bytes = 0;
-                                        while let Some(Ok(chunk)) = audio_stream.next().await {
-                                            if let SynthesisResult::Audio(chunk) = chunk {
-                                                total_bytes += chunk.len();
-                                                let audio_data: PcmBuf = bytes_to_samples(&chunk);
-                                                let final_audio =
-                                                    if sample_rate != output_sample_rate {
-                                                        resample::resample_mono(
-                                                            &audio_data,
-                                                            sample_rate,
-                                                            output_sample_rate,
-                                                        )
-                                                    } else {
-                                                        audio_data
-                                                    };
-                                                output_buffer.push(&final_audio);
+                                        while let Some(Ok(res)) = audio_stream.next().await {
+                                            match res {
+                                                SynthesisResult::Audio(chunk) => {
+                                                    total_bytes += chunk.len();
+                                                    let audio_data: PcmBuf = bytes_to_samples(&chunk);
+                                                    let final_audio =
+                                                        if sample_rate != output_sample_rate {
+                                                            resample::resample_mono(
+                                                                &audio_data,
+                                                                sample_rate,
+                                                                output_sample_rate,
+                                                            )
+                                                        } else {
+                                                            audio_data
+                                                        };
+                                                    output_buffer.push(&final_audio);
+                                                }
+                                                SynthesisResult::Progress { finished, .. } => {
+                                                    if finished {
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                         info!(

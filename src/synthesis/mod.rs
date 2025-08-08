@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::stream::{BoxStream};
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap};
+use std::collections::HashMap;
 mod aliyun;
 mod tencent_cloud;
 mod voiceapi;
@@ -11,7 +11,6 @@ pub use aliyun::AliyunTtsClient;
 pub use tencent_cloud::TencentCloudTtsClient;
 pub use voiceapi::VoiceApiTtsClient;
 
-use crate::event::SessionEvent;
 
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
 pub enum SynthesisType {
@@ -110,19 +109,41 @@ impl SynthesisOption {
     }
 }
 
-pub trait SynthesisProgress{
-    fn get_current_progress(&self, current: u32) -> Option<SessionEvent>;
-}
 
 pub enum SynthesisResult {
+    /// Raw audio data chunk
     Audio(Vec<u8>),
-    Processing(Box<dyn SynthesisProgress + Send + 'static>),
+    /// Progress information including completion status
+    Progress {
+        /// Current text being processed (subtitle/transcript)
+        subtitles: String,
+        /// Current position in the text (character/word index)  
+        position: u32,
+        /// Amount of audio generated so far (in bytes or milliseconds)
+        current: u32,
+        /// Total expected audio length (in bytes or milliseconds)
+        total: u32,
+        /// Whether synthesis has completed
+        finished: bool,
+    },
+}
+
+impl SynthesisResult {
+    pub fn is_finished(&self) -> bool {
+        if let SynthesisResult::Progress { finished, .. } = self {
+            *finished
+        } else {
+            false
+        }
+    }
 }
 
 #[async_trait]
 pub trait SynthesisClient: Send {
+    /// Returns the provider type for this synthesis client.
     fn provider(&self) -> SynthesisType;
-    /// Synthesize text to audio and return a stream of audio chunks
+
+    // break out of stream polling loop when res is Err or Progress is finished
     async fn synthesize(
         &self,
         text: &str,
@@ -213,4 +234,9 @@ pub fn create_synthesis_client(option: SynthesisOption) -> Result<Box<dyn Synthe
             return Err(anyhow::anyhow!("Unsupported provider: {}", provider));
         }
     }
+}
+
+// for pcm samples, calculate duration in milliseconds from sample bytes size and sample rate
+pub fn bytes_size_to_duration(byte_size: u32, sample_rate: u32) -> u32 {
+    (500.0 * byte_size as f32 / sample_rate as f32) as u32
 }

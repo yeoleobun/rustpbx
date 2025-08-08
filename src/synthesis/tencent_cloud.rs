@@ -1,13 +1,14 @@
-use crate::{event::SessionEvent, synthesis::{SynthesisProgress, SynthesisResult}};
+use std::sync::{Arc, Mutex};
+
+use crate::synthesis::{SynthesisResult, bytes_size_to_duration};
 
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::{future::ready};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{client::IntoClientRequest, protocol::Message},
@@ -55,31 +56,35 @@ pub struct TencentCloudTtsClient {
     session_id: String, // session_id for tencent cloud tts request, identity of audio stream
 }
 
-struct TencentCloudSynthesisProgress {
-    subtitles: String,
-    duration: u32,
-    records: Vec<Subtitle>,
+struct TencentCloudTTSState {
+    session_id: String,
+    text: String,
+    begin_time: u32,
+    begin_index: u32,
+    bytes_size: u32,
+    finished: bool,
 }
 
-impl SynthesisProgress for TencentCloudSynthesisProgress {
-    fn get_current_progress(&self, current: u32) -> Option<SessionEvent> {
-        let mut word_count = 0;
-        for record in self.records.iter().rev() {
-            word_count += record.text.chars().count();
-            if current < record.begin_time {
-                continue;
-            }
-
-            let position = (self.subtitles.chars().count() - word_count) as u32;
-
-            return Some(SessionEvent::OnInterrupt {
-                subtitle: self.subtitles.clone(),
-                position,
-                total_duration: self.duration,
-                current,
-            });
+impl TencentCloudTTSState {
+    fn new(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            text: "".to_string(),
+            begin_time: 0,
+            begin_index: 0,
+            bytes_size: 0,
+            finished: false,
         }
-        None
+    }
+    fn progress(&self) -> SynthesisResult {
+        let duration = bytes_size_to_duration(self.bytes_size, 16000);
+        SynthesisResult::Progress {
+            subtitles: self.text.clone(),
+            position: self.begin_index,
+            current: self.begin_time,
+            total: duration,
+            finished: self.finished,
+        }
     }
 }
 
@@ -204,59 +209,66 @@ impl TencentCloudTtsClient {
             }
         }
 
-        let session_id = self.session_id.clone();
-        let session_id_clone = session_id.clone();
-        let stream = ws_stream
-            .take_while(move |message| {
-                if let Ok(Message::Text(text)) = message
-                    && let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text)
-                    && response.r#final == 1
-                {
-                    debug!("TTS Session: {session_id_clone} finished");
-                    return ready(false);
-                }
-
-                if let Ok(Message::Close(close_frame)) = message {
-                    if let Some(close_frame) = close_frame {
-                        debug!(
-                            "TTS Session: {session_id_clone} closed: {}, {}",
-                            close_frame.code, close_frame.reason
-                        );
+        let state = Arc::new(Mutex::new(TencentCloudTTSState::new(&self.session_id)));
+        let stream = ws_stream.filter_map(move |message| {
+            let state = state.clone();
+            async move {
+                let mut state = state.lock().unwrap();
+                match message {
+                    Ok(Message::Binary(data)) => {
+                        state.bytes_size += data.len() as u32;
+                        Some(Ok(SynthesisResult::Audio(data.to_vec())))
                     }
-                    return ready(false);
-                }
+                    Ok(Message::Text(text)) => {
+                        if let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text) {
+                            debug!(
+                                "Tencent TTS session: {}, response: {:?}",
+                                state.session_id, response
+                            );
 
-                ready(true)
-            })
-            .filter_map(move |message| {
-                let session_id = session_id.clone();
-                async move {
-                    match message {
-                        Ok(Message::Binary(data)) => Some(Ok(SynthesisResult::Audio(data.to_vec()))),
-                        Ok(Message::Text(text)) => {
-                            if let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text) {
-                                if response.code != 0 {
-                                    return Some(Err(anyhow!(format!(
-                                        "Tencent TTS faild, Session: {session_id}, error: {}",
-                                        response.message
-                                    ))));
-                                }
-
-                                // TODO: handle text message
-                                None
-                            } else {
-                                Some(Err(anyhow!(format!(
-                                    "TTS Session: {session_id} deserialize {text}"
-                                ))))
+                            if response.code != 0 {
+                                return Some(Err(anyhow!(
+                                    "Tencent TTS faild, Session: {}, error: {}",
+                                    state.session_id,
+                                    response.message
+                                )));
                             }
+
+                            if let Some(subtitles) = response.result.subtitles
+                                && let Some(last) = subtitles.last()
+                            {
+                                state.text = last.text.clone();
+                                state.begin_time = last.begin_time;
+                                state.begin_index = last.begin_index;
+                            }
+
+                            if response.r#final == 1 {
+                                state.finished = true;
+                            }
+                            
+                            Some(Ok(state.progress()))
+                        } else {
+                            Some(Err(anyhow!(
+                                "TTS Session: {} failed to deserialize {}",
+                                state.session_id,
+                                text
+                            )))
                         }
-                        Err(e) => Some(Err(anyhow!(format!(
-                            "Tencent TTS websocket error, Session: {session_id}, error: {e}"
-                        )))),
-                        _ => None,
                     }
+                    Ok(Message::Close(_)) => {
+                        debug!("Tencent TTS session: {} closed", state.session_id);
+                        state.finished = true;
+                        return Some(Ok(state.progress()));
+                    }
+                    Err(e) => Some(Err(anyhow!(
+                        "Tencent TTS websocket error, Session: {}, error: {}",
+                        state.session_id,
+                        e
+                    ))),
+                    _ => None,
                 }
-            });
+            }
+        });
         Ok(Box::pin(stream))
     }
 }

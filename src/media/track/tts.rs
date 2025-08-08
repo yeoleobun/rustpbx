@@ -235,47 +235,49 @@ impl Track for TtsTrack {
                         // Process each audio chunk as it arrives
                         while let Some(chunk_result) = stream.next().await {
                             match chunk_result {
-                                Ok(audio_chunk) => {
-                                    if let SynthesisResult::Audio(audio_chunk) = audio_chunk {
-                                        // Process the audio chunk
-                                        total_audio_len += audio_chunk.len();
+                                Ok(SynthesisResult::Audio(audio_chunk)) => {
+                                    // Process the audio chunk
+                                    total_audio_len += audio_chunk.len();
 
-                                        if first_chunk {
-                                            first_chunk = false;
-                                            // Send metrics event after the first chunk
-                                            event_sender
-                                                .send(SessionEvent::Metrics {
-                                                    timestamp: crate::get_timestamp(),
-                                                    key: format!("ttfb.tts.{}", client.provider()),
-                                                    data: serde_json::json!({
-                                                            "speaker": speaker,
-                                                            "playId": play_id,
-                                                            "length": audio_chunk.len(),
-                                                    }),
-                                                    duration: start_time.elapsed().as_millis()
-                                                        as u32,
-                                                })
-                                                .ok();
-                                        }
+                                    if first_chunk {
+                                        first_chunk = false;
+                                        // Send metrics event after the first chunk
+                                        event_sender
+                                            .send(SessionEvent::Metrics {
+                                                timestamp: crate::get_timestamp(),
+                                                key: format!("ttfb.tts.{}", client.provider()),
+                                                data: serde_json::json!({
+                                                        "speaker": speaker,
+                                                        "playId": play_id,
+                                                        "length": audio_chunk.len(),
+                                                }),
+                                                duration: start_time.elapsed().as_millis() as u32,
+                                            })
+                                            .ok();
+                                    }
 
-                                        // Strip wav header if present (only for the first chunk)
-                                        let processed_chunk = if audio_chunks.is_empty()
-                                            && audio_chunk.len() > 44
-                                            && audio_chunk[..4] == [0x52, 0x49, 0x46, 0x46]
-                                        {
-                                            audio_chunk[44..].to_vec()
-                                        } else {
-                                            audio_chunk
-                                        };
+                                    // Strip wav header if present (only for the first chunk)
+                                    let processed_chunk = if audio_chunks.is_empty()
+                                        && audio_chunk.len() > 44
+                                        && audio_chunk[..4] == [0x52, 0x49, 0x46, 0x46]
+                                    {
+                                        audio_chunk[44..].to_vec()
+                                    } else {
+                                        audio_chunk
+                                    };
 
-                                        // Store the processed chunk for caching later if needed
-                                        audio_chunks.push(processed_chunk.clone());
+                                    // Store the processed chunk for caching later if needed
+                                    audio_chunks.push(processed_chunk.clone());
 
-                                        // Convert to s16 and add to buffer immediately for streaming playback
-                                        buffer_clone
-                                            .lock()
-                                            .await
-                                            .extend(bytes_to_samples(&processed_chunk));
+                                    // Convert to s16 and add to buffer immediately for streaming playback
+                                    buffer_clone
+                                        .lock()
+                                        .await
+                                        .extend(bytes_to_samples(&processed_chunk));
+                                }
+                                Ok(SynthesisResult::Progress { finished, .. }) => {
+                                    if finished {
+                                        break;
                                     }
                                 }
                                 Err(e) => {
@@ -289,6 +291,7 @@ impl Track for TtsTrack {
                                             code: None,
                                         })
                                         .ok();
+                                    break;
                                 }
                             }
                         }

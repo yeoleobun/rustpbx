@@ -1,17 +1,18 @@
-use crate::{event::SessionEvent, synthesis::{SynthesisProgress, SynthesisResult}};
+use std::sync::{Arc, Mutex};
+
+use crate::synthesis::{SynthesisResult, bytes_size_to_duration};
 
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures::{stream::BoxStream, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::BoxStream};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{future::ready};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
-use tracing::{debug};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Aliyun CosyVoice WebSocket API Client
@@ -120,44 +121,6 @@ struct WebSocketEventHeader {
     error_message: Option<String>,
 }
 
-struct AliyunSynthesisProgress {
-    subtitles: String,
-    records: Vec<AliyunSynthesisRecord>,
-}
-struct AliyunSynthesisRecord {
-    audio_length: u32,
-    characters: u32,
-}
-
-impl SynthesisProgress for AliyunSynthesisProgress {
-    fn get_current_progress(&self, current: u32) -> Option<SessionEvent> {
-        for (index, record) in self.records.iter().enumerate().rev() {
-            if current > record.audio_length {
-                continue;
-            }
-
-            let byte_index = if index > 0 {
-                self.records[index - 1].characters
-            } else {
-                0
-            };
-
-            let position = self
-                .subtitles
-                .char_indices()
-                .position(|(i, _)| byte_index as usize == i)? as u32;
-
-            return Some(SessionEvent::OnInterrupt {
-                subtitle: self.subtitles.clone(),
-                position,
-                total_duration: record.audio_length as u32,
-                current,
-            });
-        }
-        None
-    }
-}
-
 impl AliyunTtsClient {
     pub fn create(option: &SynthesisOption) -> Result<Box<dyn SynthesisClient>> {
         let client = Self::new(option.clone());
@@ -179,7 +142,6 @@ impl AliyunTtsClient {
             })
     }
 
-    /// Create run-task command
     fn create_run_task_command(&self, option: &SynthesisOption, task_id: &str) -> RunTaskCommand {
         let model = option
             .extra
@@ -244,7 +206,6 @@ impl AliyunTtsClient {
         }
     }
 
-    /// Create finish-task command
     fn create_finish_task_command(&self, task_id: &str) -> FinishTaskCommand {
         FinishTaskCommand {
             header: CommandHeader {
@@ -255,6 +216,45 @@ impl AliyunTtsClient {
             payload: FinishTaskPayload {
                 input: EmptyInput {},
             },
+        }
+    }
+}
+
+struct AliyunSynthesisState {
+    task_id: String,
+    text: String,
+    bytes_size: u32,
+    sample_rate: u32,
+    usage: u32,
+    finished: bool,
+}
+
+impl AliyunSynthesisState {
+    fn new(task_id: &str, text: &str, sample_rate: u32) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            text: text.to_string(),
+            bytes_size: 0,
+            sample_rate,
+            usage: 0,
+            finished: false,
+        }
+    }
+
+    fn progress(&self) -> SynthesisResult {
+        let duration = bytes_size_to_duration(self.bytes_size, self.sample_rate);
+        let position = self
+            .text
+            .char_indices()
+            .position(|(i, _)| i == self.usage as usize)
+            .unwrap_or(self.text.len());
+
+        SynthesisResult::Progress {
+            subtitles: self.text.clone(),
+            position: position as u32,
+            current: duration,
+            total: duration,
+            finished: self.finished,
         }
     }
 }
@@ -284,10 +284,8 @@ impl SynthesisClient for AliyunTtsClient {
         headers.insert("Authorization", format!("Bearer {}", api_key).parse()?);
         headers.insert("X-DashScope-DataInspection", "enable".parse()?);
 
-        // Establish WebSocket connection
         let (ws_stream, response) = connect_async(request).await?;
 
-        // Check connection status
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(anyhow!(
                 "WebSocket connection failed: {}",
@@ -295,12 +293,8 @@ impl SynthesisClient for AliyunTtsClient {
             ));
         }
 
-        debug!("WebSocket connection established");
-
-        // Split read/write streams
         let (mut ws_sink, ws_stream) = ws_stream.split();
 
-        // Send run-task command
         let run_task_cmd = self.create_run_task_command(&option, &task_id);
         let run_task_json = serde_json::to_string(&run_task_cmd)?;
         debug!("Sending run-task command: {}", run_task_json);
@@ -309,7 +303,7 @@ impl SynthesisClient for AliyunTtsClient {
             .await
             .map_err(|e| anyhow!("Failed to send run-task command: {}", e))?;
 
-        // send continue-task command, tts input text send in here
+        // text send here
         let continue_task_cmd = self.create_continue_task_command(&task_id, text);
         let continue_task_json = serde_json::to_string(&continue_task_cmd)?;
         debug!("Sending continue-task command: {}", continue_task_json);
@@ -318,7 +312,7 @@ impl SynthesisClient for AliyunTtsClient {
             .await
             .map_err(|e| anyhow!("Failed to send continue-task command: {}", e))?;
 
-        // Send finish-task command
+        // oneshot task
         let finish_task_cmd = self.create_finish_task_command(&task_id);
         let finish_task_json = serde_json::to_string(&finish_task_cmd)?;
         debug!("Sending finish-task command: {}", finish_task_json);
@@ -327,79 +321,90 @@ impl SynthesisClient for AliyunTtsClient {
             .await
             .map_err(|e| anyhow!("Failed to send finish-task command: {}", e))?;
 
-        let task_id_clone = task_id.clone();
-        let stream = ws_stream
-            .take_while(move |message| {
-                if let Ok(Message::Text(text)) = message
-                    && let Ok(event) = serde_json::from_str::<WebSocketEvent>(&text)
-                    && event.header.event.as_str() == "task-finished"
-                {
-                    debug!("Task: {task_id_clone} finished");
-                    return ready(false);
-                }
+        let sample_rate = option.samplerate.unwrap_or(16000) as u32;
+        let state = Arc::new(Mutex::new(AliyunSynthesisState::new(
+            &task_id,
+            text,
+            sample_rate,
+        )));
 
-                if let Ok(Message::Close(close_frame)) = message {
-                    if let Some(close_frame) = close_frame {
+        let stream = ws_stream.filter_map(move |message| {
+            let state = state.clone();
+            async move {
+                let mut state = state.lock().unwrap();
+                match message {
+                    Ok(Message::Binary(data)) => {
+                        let bytes_size = data.len() as u32;
+                        state.bytes_size += bytes_size;
                         debug!(
-                            "Task: {task_id_clone} closed: {}, {}",
-                            close_frame.code, close_frame.reason
+                            "Task: {} Received audio data: {} bytes",
+                            state.task_id, bytes_size
                         );
+                        Some(Ok(SynthesisResult::Audio(data.to_vec())))
                     }
-                    return ready(false);
-                }
-
-                ready(true)
-            })
-            .filter_map(move |message| {
-                let task_id = task_id.clone();
-                async move {
-                    match message {
-                        Ok(Message::Binary(data)) => {
-                            debug!("task: {task_id} Received audio data: {} bytes", data.len());
-                            Some(Ok(SynthesisResult::Audio(data.to_vec())))
-                        }
-                        Ok(Message::Text(text)) => {
-                            if let Ok(event) = serde_json::from_str::<WebSocketEvent>(&text) {
-                                match event.header.event.as_str() {
-                                    "task-started" => {
-                                        debug!("Task: {task_id} started");
-                                        None
-                                    }
-                                    "task-failed" => {
-                                        let error_code = event
-                                            .header
-                                            .error_code
-                                            .unwrap_or_else(|| "Unknown error code".to_string());
-                                        let error_msg = event
-                                            .header
-                                            .error_message
-                                            .unwrap_or_else(|| "Unknown error message".to_string());
-                                        Some(Err(anyhow!(format!(
-                                            "Task {task_id} failed: {error_code}, {error_msg}"
-                                        ))))
-                                    }
-                                    "result-generated" => {
-                                        if let Some(usage) = event.payload.usage {
-                                            debug!("task: {task_id} usage: {}", usage.characters);
-                                        }
-                                        None
-                                    }
-                                    _ => {
-                                        debug!("Ignoring unknown event: {event:?}");
-                                        None
-                                    }
+                    Ok(Message::Text(message)) => {
+                        match serde_json::from_str::<WebSocketEvent>(&message) {
+                            Ok(event) => match event.header.event.as_str() {
+                                "task-started" => {
+                                    debug!("Task: {} started", state.task_id);
+                                    None
                                 }
-                            } else {
-                                Some(Err(anyhow!(format!(
-                                    "Task {task_id} failed to deserialize {text}"
-                                ))))
+                                "result-generated" => {
+                                    if let Some(usage) = event.payload.usage {
+                                        let characters = usage.characters;
+                                        state.usage = characters;
+                                        debug!("Task: {} usage: {}", state.task_id, characters);
+                                    }
+                                    Some(Ok(state.progress()))
+                                }
+                                "task-failed" => {
+                                    let error_code = event
+                                        .header
+                                        .error_code
+                                        .unwrap_or_else(|| "Unknown error code".to_string());
+                                    let error_msg = event
+                                        .header
+                                        .error_message
+                                        .unwrap_or_else(|| "Unknown error message".to_string());
+                                    Some(Err(anyhow!(
+                                        "Task: {} failed: {}, {}",
+                                        state.task_id,
+                                        error_code,
+                                        error_msg
+                                    )))
+                                }
+                                "task-finished" => {
+                                    debug!("Task: {} finished", state.task_id);
+                                    state.finished = true;
+                                    Some(Ok(state.progress()))
+                                }
+                                _ => {
+                                    warn!("Task: {} unknown event: {:?}", state.task_id, event);
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "Task: {} failed to deserialize {}: {}",
+                                    state.task_id, message, e
+                                );
+                                None
                             }
                         }
-                        Err(e) => Some(Err(anyhow!("Task {task_id} websocket error: {e}"))),
-                        _ => None,
                     }
+                    Ok(Message::Close(_)) => {
+                        state.finished = true;
+                        Some(Ok(state.progress()))
+                    }
+                    Err(e) => Some(Err(anyhow!(
+                        "Task: {} websocket error: {}",
+                        state.task_id,
+                        e
+                    ))),
+                    _ => None,
                 }
-            });
+            }
+        });
 
         Ok(Box::pin(stream))
     }

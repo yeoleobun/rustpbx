@@ -29,7 +29,6 @@ fn get_aliyun_credentials() -> Option<String> {
 async fn test_tencent_cloud_tts() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
-        .with_test_writer()
         .try_init()
         .ok();
     // Initialize crypto provider
@@ -55,7 +54,7 @@ async fn test_tencent_cloud_tts() {
     };
 
     let client = TencentCloudTtsClient::new(config);
-    let text = "你好，我是阿里云的语音合成服务。";
+    let text = "你好，我是秦始皇，我今天吃了肯德基，味道不行，明天还是吃拉面。";
     match client.synthesize(text, None).await {
         Ok(mut stream) => {
             // Collect all chunks from the stream
@@ -64,11 +63,14 @@ async fn test_tencent_cloud_tts() {
             let mut collected_audio = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
-                    Ok(chunk) => {
-                        if let SynthesisResult::Audio(audio) = chunk {
-                            total_size += audio.len();
-                            chunks_count += 1;
-                            collected_audio.extend_from_slice(&audio);
+                    Ok(SynthesisResult::Audio(audio)) => {
+                        total_size += audio.len();
+                        chunks_count += 1;
+                        collected_audio.extend_from_slice(&audio);
+                    }
+                    Ok(SynthesisResult::Progress { finished, .. }) => {
+                        if finished {
+                            break;
                         }
                     }
                     Err(e) => {
@@ -122,17 +124,20 @@ async fn test_aliyun_tts() {
     println!("Test passes - implementation is structurally correct");
 
     let stream = client
-        .synthesize("你好，我是阿里云的语音合成服务。", None)
+        .synthesize("你好，我是秦始皇", None)
         .await;
     if let Ok(mut stream) = stream {
         let mut audio_collector = Vec::with_capacity(8096);
         let mut chunks_count = 0;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    if let SynthesisResult::Audio(chunk) = chunk {
-                        audio_collector.extend_from_slice(&chunk);
-                        chunks_count += 1;
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok(SynthesisResult::Audio(chunk)) => {
+                    audio_collector.extend_from_slice(&chunk);
+                    chunks_count += 1;
+                }
+                Ok(SynthesisResult::Progress { finished, .. }) => {
+                    if finished {
+                        break;
                     }
                 }
                 Err(e) => {

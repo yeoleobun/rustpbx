@@ -1,15 +1,19 @@
 use crate::synthesis::SynthesisResult;
 
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use futures::{stream::{self, BoxStream}, SinkExt, StreamExt};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use futures::{
+    SinkExt, StreamExt,
+    future::ready,
+    stream::BoxStream,
+};
 use http::{Request, StatusCode, Uri};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, warn};
+use tracing::debug;
 /// https://github.com/ruzhila/voiceapi
 /// A simple and clean voice transcription/synthesis API with sherpa-onnx
 ///
@@ -96,60 +100,88 @@ impl VoiceApiTtsClient {
         // Send the TTS request
         ws_sender.send(Message::Text(text.into())).await?;
 
-        // Create a stream that will yield audio chunks
-        let stream = Box::pin(stream::unfold(
-            (ws_receiver, ws_sender, false),
-            move |(mut read, write, finished)| async move {
-                // If we've finished processing, end the stream
-                if finished {
-                    return None;
+        let stream = ws_receiver
+            .take_while(|message| {
+                if let Ok(Message::Text(text)) = message
+                    && let Ok(metadata) = serde_json::from_str::<TtsResult>(&text)
+                    && metadata.progress >= 1.0 
+                {
+                    return ready(false);
                 }
 
-                // Receive message from WebSocket
-                match read.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        let audio_data = data.to_vec();
-                        Some((Ok(SynthesisResult::Audio(audio_data)), (read, write, false)))
-                    }
-                    Some(Ok(Message::Text(text_data))) => {
-                        // Text data is metadata
-                        match serde_json::from_str::<TtsResult>(&text_data) {
-                            Ok(metadata) => {
-                                debug!("Received metadata: progress={}, elapsed={}, duration={}, size={}", 
-                                      metadata.progress, metadata.elapsed, metadata.duration, metadata.size);
+                if let Ok(Message::Close(_)) = message {
+                    return ready(false);
+                }
 
-                                // If progress is 1.0, this is the final message
-                                let is_finished = metadata.progress >= 1.0;
-
-                                // Return empty chunk and continue or finish
-                                Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, is_finished)))
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse metadata: {}", e);
-                                // Continue receiving data
-                                Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
-                            }
+                ready(true)
+            })
+            .filter_map(|message| async {
+                match message {
+                    Ok(Message::Binary(data)) => Some(Ok(SynthesisResult::Audio(data.to_vec()))),
+                    Ok(Message::Text(text)) => {
+                        if let Ok(_) = serde_json::from_str::<TtsResult>(&text) {
+                            // TODO: handle progress
                         }
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        // Connection closed
-                        debug!("WebSocket closed by server");
                         None
                     }
-                    Some(Err(e)) => {
-                        warn!("WebSocket error: {:?}", e);
-                        // Error occurred
-                        Some((Err(anyhow!("WebSocket error: {}", e)), (read, write, true)))
-                    }
-                    _ => {
-                        // Other message types (ping/pong/etc.)
-                        Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
-                    }
+                    Err(e) => Some(Err(anyhow!("WebSocket error: {}", e))),
+                    _ => None,
                 }
-            },
-        ));
+            });
+        // // Create a stream that will yield audio chunks
+        // let stream = Box::pin(stream::unfold(
+        //     (ws_receiver, ws_sender, false),
+        //     move |(mut read, write, finished)| async move {
+        //         // If we've finished processing, end the stream
+        //         if finished {
+        //             return None;
+        //         }
 
-        Ok(stream)
+        //         // Receive message from WebSocket
+        //         match read.next().await {
+        //             Some(Ok(Message::Binary(data))) => {
+        //                 let audio_data = data.to_vec();
+        //                 Some((Ok(SynthesisResult::Audio(audio_data)), (read, write, false)))
+        //             }
+        //             Some(Ok(Message::Text(text_data))) => {
+        //                 // Text data is metadata
+        //                 match serde_json::from_str::<TtsResult>(&text_data) {
+        //                     Ok(metadata) => {
+        //                         debug!("Received metadata: progress={}, elapsed={}, duration={}, size={}",
+        //                               metadata.progress, metadata.elapsed, metadata.duration, metadata.size);
+
+        //                         // If progress is 1.0, this is the final message
+        //                         let is_finished = metadata.progress >= 1.0;
+
+        //                         // Return empty chunk and continue or finish
+        //                         Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, is_finished)))
+        //                     }
+        //                     Err(e) => {
+        //                         warn!("Failed to parse metadata: {}", e);
+        //                         // Continue receiving data
+        //                         Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
+        //                     }
+        //                 }
+        //             }
+        //             Some(Ok(Message::Close(_))) => {
+        //                 // Connection closed
+        //                 debug!("WebSocket closed by server");
+        //                 None
+        //             }
+        //             Some(Err(e)) => {
+        //                 warn!("WebSocket error: {:?}", e);
+        //                 // Error occurred
+        //                 Some((Err(anyhow!("WebSocket error: {}", e)), (read, write, true)))
+        //             }
+        //             _ => {
+        //                 // Other message types (ping/pong/etc.)
+        //                 Some((Ok(SynthesisResult::Audio(Vec::new())), (read, write, false)))
+        //             }
+        //         }
+        //     },
+        // ));
+
+        Ok(Box::pin(stream))
     }
 }
 

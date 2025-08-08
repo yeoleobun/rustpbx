@@ -232,15 +232,20 @@ async fn main() -> Result<()> {
             match tts_client.synthesize(&segment.text, None).await {
                 Ok(mut audio_stream) => {
                     let mut total_bytes = 0;
-                    while let Some(chunk_result) = audio_stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if let SynthesisResult::Audio(chunk) = chunk {
+                    while let Some(res) = audio_stream.next().await {
+                        match res {
+                            Ok(res) => match res {
+                                SynthesisResult::Audio(chunk) => {
                                     debug!("Received chunk of {} bytes", chunk.len());
                                     total_bytes += chunk.len();
                                     let samples: PcmBuf = bytes_to_samples(&chunk);
                                     for &sample in &samples {
                                         writer.write_sample(sample)?;
+                                    }
+                                }
+                                SynthesisResult::Progress { finished, .. } => {
+                                    if finished {
+                                        break;
                                     }
                                 }
                             }
