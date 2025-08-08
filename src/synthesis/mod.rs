@@ -11,6 +11,8 @@ pub use aliyun::AliyunTtsClient;
 pub use tencent_cloud::TencentCloudTtsClient;
 pub use voiceapi::VoiceApiTtsClient;
 
+use crate::event::SessionEvent;
+
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
 pub enum SynthesisType {
     #[serde(rename = "tencent")]
@@ -202,4 +204,8 @@ pub fn create_synthesis_client(option: SynthesisOption) -> Result<Box<dyn Synthe
             return Err(anyhow::anyhow!("Unsupported provider: {}", provider));
         }
     }
+}
+
+pub trait SynthesisProgress{
+    fn get_current_progress(&self, current: u32) -> Option<SessionEvent>;
 }

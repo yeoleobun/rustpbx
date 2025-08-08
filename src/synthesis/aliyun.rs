@@ -1,15 +1,17 @@
+use crate::{event::SessionEvent, synthesis::SynthesisProgress};
+
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures::{stream, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
+use std::{future::ready, pin::Pin};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
-use tracing::{debug, warn};
+use tracing::{debug};
 use uuid::Uuid;
 
 /// Aliyun CosyVoice WebSocket API Client
@@ -116,6 +118,44 @@ struct WebSocketEventHeader {
     event: String,
     error_code: Option<String>,
     error_message: Option<String>,
+}
+
+struct AliyunSynthesisProgress {
+    subtitles: String,
+    records: Vec<AliyunSynthesisRecord>,
+}
+struct AliyunSynthesisRecord {
+    audio_length: u32,
+    characters: u32,
+}
+
+impl SynthesisProgress for AliyunSynthesisProgress {
+    fn get_current_progress(&self, current: u32) -> Option<SessionEvent> {
+        for (index, record) in self.records.iter().enumerate().rev() {
+            if current > record.audio_length {
+                continue;
+            }
+
+            let byte_index = if index > 0 {
+                self.records[index - 1].characters
+            } else {
+                0
+            };
+
+            let position = self
+                .subtitles
+                .char_indices()
+                .position(|(i, _)| byte_index as usize == i)? as u32;
+
+            return Some(SessionEvent::OnInterrupt {
+                subtitle: self.subtitles.clone(),
+                position,
+                total_duration: record.audio_length as u32,
+                current,
+            });
+        }
+        None
+    }
 }
 
 impl AliyunTtsClient {
@@ -287,88 +327,80 @@ impl SynthesisClient for AliyunTtsClient {
             .await
             .map_err(|e| anyhow!("Failed to send finish-task command: {}", e))?;
 
-        // Create audio data stream
-        let stream = Box::pin(stream::unfold(
-            (ws_stream, false),
-            |(mut ws_stream, finished)| async move {
-                if finished {
-                    return None;
+        let task_id_clone = task_id.clone();
+        let stream = ws_stream
+            .take_while(move |message| {
+                if let Ok(Message::Text(text)) = message
+                    && let Ok(event) = serde_json::from_str::<WebSocketEvent>(&text)
+                    && event.header.event.as_str() == "task-finished"
+                {
+                    debug!("Task: {task_id_clone} finished");
+                    return ready(false);
                 }
 
-                match ws_stream.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<WebSocketEvent>(&text) {
-                            Ok(event) => {
-                                debug!("Received event: {:?}", event);
+                if let Ok(Message::Close(close_frame)) = message {
+                    if let Some(close_frame) = close_frame {
+                        debug!(
+                            "Task: {task_id_clone} closed: {}, {}",
+                            close_frame.code, close_frame.reason
+                        );
+                    }
+                    return ready(false);
+                }
+
+                ready(true)
+            })
+            .filter_map(move |message| {
+                let task_id = task_id.clone();
+                async move {
+                    match message {
+                        Ok(Message::Binary(data)) => {
+                            debug!("task: {task_id} Received audio data: {} bytes", data.len());
+                            Some(Ok(data.to_vec()))
+                        }
+                        Ok(Message::Text(text)) => {
+                            if let Ok(event) = serde_json::from_str::<WebSocketEvent>(&text) {
                                 match event.header.event.as_str() {
                                     "task-started" => {
-                                        debug!("Task started");
-                                        Some((Ok(Vec::new()), (ws_stream, false)))
-                                    }
-                                    "task-finished" => {
-                                        debug!("Task finished");
-                                        Some((Ok(Vec::new()), (ws_stream, true)))
+                                        debug!("Task: {task_id} started");
+                                        None
                                     }
                                     "task-failed" => {
                                         let error_code = event
                                             .header
                                             .error_code
-                                            .unwrap_or_else(|| "Unknown error".to_string());
+                                            .unwrap_or_else(|| "Unknown error code".to_string());
                                         let error_msg = event
                                             .header
                                             .error_message
-                                            .unwrap_or_else(|| "Unknown error".to_string());
-                                        let error_msg =
-                                            format!("Task failed: {} {}", error_code, error_msg);
-                                        warn!("Task failed: {}:{}", error_code, error_msg);
-                                        Some((
-                                            Err(anyhow!("Task failed: {}", error_msg)),
-                                            (ws_stream, true),
-                                        ))
+                                            .unwrap_or_else(|| "Unknown error message".to_string());
+                                        Some(Err(anyhow!(format!(
+                                            "Task {task_id} failed: {error_code}, {error_msg}"
+                                        ))))
                                     }
                                     "result-generated" => {
                                         if let Some(usage) = event.payload.usage {
-                                            debug!("characters: {}", usage.characters);
+                                            debug!("task: {task_id} usage: {}", usage.characters);
                                         }
-                                        Some((Ok(Vec::new()), (ws_stream, false)))
+                                        None
                                     }
                                     _ => {
-                                        debug!("Ignoring unknown event: {}", event.header.event);
-                                        Some((Ok(Vec::new()), (ws_stream, false)))
+                                        debug!("Ignoring unknown event: {event:?}");
+                                        None
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse event message: {}", e);
-                                Some((Ok(Vec::new()), (ws_stream, false)))
+                            } else {
+                                Some(Err(anyhow!(format!(
+                                    "Task {task_id} failed to deserialize {text}"
+                                ))))
                             }
                         }
-                    }
-                    Some(Ok(Message::Binary(data))) => {
-                        // Audio data
-                        debug!("Received audio data: {} bytes", data.len());
-                        Some((Ok(data.to_vec()), (ws_stream, false)))
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        debug!("WebSocket connection closed");
-                        None
-                    }
-                    Some(Err(e)) => {
-                        warn!("WebSocket error: {:?}", e);
-                        Some((Err(anyhow!("WebSocket error: {}", e)), (ws_stream, true)))
-                    }
-                    None => {
-                        debug!("WebSocket stream ended");
-                        None
-                    }
-                    _ => {
-                        // Ignore other message types (ping/pong etc.)
-                        Some((Ok(Vec::new()), (ws_stream, false)))
+                        Err(e) => Some(Err(anyhow!("Task {task_id} websocket error: {e}"))),
+                        _ => None,
                     }
                 }
-            },
-        ));
+            });
 
-        Ok(stream)
+        Ok(Box::pin(stream))
     }
 }

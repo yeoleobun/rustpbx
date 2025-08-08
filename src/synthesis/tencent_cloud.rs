@@ -1,16 +1,18 @@
+use crate::{event::SessionEvent, synthesis::SynthesisProgress};
+
 use super::{SynthesisClient, SynthesisOption, SynthesisType};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures::{stream, Stream, StreamExt};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::{Stream, StreamExt};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
+use std::{future::ready, pin::Pin};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{client::IntoClientRequest, protocol::Message},
 };
-use tracing::{debug, warn};
+use tracing::debug;
 use urlencoding;
 use uuid;
 
@@ -50,6 +52,35 @@ pub struct WebSocketResult {
 #[derive(Debug)]
 pub struct TencentCloudTtsClient {
     option: SynthesisOption,
+    session_id: String, // session_id for tencent cloud tts request, identity of audio stream
+}
+
+struct TencentCloudSynthesisProgress {
+    subtitles: String,
+    duration: u32,
+    records: Vec<Subtitle>,
+}
+
+impl SynthesisProgress for TencentCloudSynthesisProgress {
+    fn get_current_progress(&self, current: u32) -> Option<SessionEvent> {
+        let mut word_count = 0;
+        for record in self.records.iter().rev() {
+            word_count += record.text.chars().count();
+            if current < record.begin_time {
+                continue;
+            }
+
+            let position = (self.subtitles.chars().count() - word_count) as u32;
+
+            return Some(SessionEvent::OnInterrupt {
+                subtitle: self.subtitles.clone(),
+                position,
+                total_duration: self.duration,
+                current,
+            });
+        }
+        None
+    }
 }
 
 impl TencentCloudTtsClient {
@@ -59,7 +90,10 @@ impl TencentCloudTtsClient {
     }
 
     pub fn new(option: SynthesisOption) -> Self {
-        Self { option }
+        Self {
+            option,
+            session_id: uuid::Uuid::new_v4().to_string(),
+        }
     }
 
     // Build with specific configuration
@@ -83,7 +117,6 @@ impl TencentCloudTtsClient {
         let speed = option.speed.unwrap_or(0.0);
         let codec = option.codec.clone().unwrap_or_else(|| "pcm".to_string());
         let sample_rate = option.samplerate.unwrap_or(16000);
-        let session_id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().timestamp() as u64;
         let expired = timestamp + 24 * 60 * 60; // 24 hours expiration
 
@@ -104,7 +137,7 @@ impl TencentCloudTtsClient {
             ("Expired", &expired_str),
             ("SampleRate", &sample_rate_str),
             ("SecretId", secret_id.as_str()),
-            ("SessionId", &session_id),
+            ("SessionId", &self.session_id),
             ("Speed", &speed_str),
             ("Text", text),
             ("Timestamp", &timestamp_str),
@@ -171,73 +204,60 @@ impl TencentCloudTtsClient {
             }
         }
 
-        // Create a stream that will yield audio chunks
-        let stream = Box::pin(stream::unfold(
-            (ws_stream, false),
-            move |(mut ws_stream, is_final)| async move {
-                // If we've received the final message, end the stream
-                if is_final {
-                    return None;
+        let session_id = self.session_id.clone();
+        let session_id_clone = session_id.clone();
+        let stream = ws_stream
+            .take_while(move |message| {
+                if let Ok(Message::Text(text)) = message
+                    && let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text)
+                    && response.r#final == 1
+                {
+                    debug!("TTS Session: {session_id_clone} finished");
+                    return ready(false);
                 }
 
-                // Receive message from WebSocket
-                match ws_stream.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        // Binary data is audio
-                        Some((Ok(data.to_vec()), (ws_stream, false)))
+                if let Ok(Message::Close(close_frame)) = message {
+                    if let Some(close_frame) = close_frame {
+                        debug!(
+                            "TTS Session: {session_id_clone} closed: {}, {}",
+                            close_frame.code, close_frame.reason
+                        );
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        // Text data is metadata
-                        match serde_json::from_str::<WebSocketResponse>(&text) {
-                            Ok(response) => {
+                    return ready(false);
+                }
+
+                ready(true)
+            })
+            .filter_map(move |message| {
+                let session_id = session_id.clone();
+                async move {
+                    match message {
+                        Ok(Message::Binary(data)) => Some(Ok(data.to_vec())),
+                        Ok(Message::Text(text)) => {
+                            if let Ok(response) = serde_json::from_str::<WebSocketResponse>(&text) {
                                 if response.code != 0 {
-                                    return Some((
-                                        Err(anyhow::anyhow!(
-                                            "WebSocket error: {}",
-                                            response.message
-                                        )),
-                                        (ws_stream, true),
-                                    ));
+                                    return Some(Err(anyhow!(format!(
+                                        "Tencent TTS faild, Session: {session_id}, error: {}",
+                                        response.message
+                                    ))));
                                 }
-                                // Check if this is the final message
-                                if response.r#final == 1 {
-                                    Some((Ok(Vec::new()), (ws_stream, true)))
-                                } else {
-                                    // Continue receiving data
-                                    Some((Ok(Vec::new()), (ws_stream, false)))
-                                }
-                            }
-                            Err(e) => {
-                                warn!("failed to parse WebSocket response: {}", e);
-                                Some((Ok(Vec::new()), (ws_stream, false)))
+
+                                // TODO: handle text message
+                                None
+                            } else {
+                                Some(Err(anyhow!(format!(
+                                    "TTS Session: {session_id} deserialize {text}"
+                                ))))
                             }
                         }
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        // Connection closed
-                        None
-                    }
-                    Some(Err(e)) => {
-                        warn!("WebSocket error: {:?}", e);
-                        // Error occurred
-                        Some((
-                            Err(anyhow::anyhow!("WebSocket error: {}", e)),
-                            (ws_stream, true),
-                        ))
-                    }
-                    None => {
-                        // Stream ended
-                        None
-                    }
-                    _ => {
-                        // Ignore other message types
-                        Some((Ok(Vec::new()), (ws_stream, false)))
+                        Err(e) => Some(Err(anyhow!(format!(
+                            "Tencent TTS websocket error, Session: {session_id}, error: {e}"
+                        )))),
+                        _ => None,
                     }
                 }
-            },
-        ));
-
-        Ok(stream)
+            });
+        Ok(Box::pin(stream))
     }
 }
 
