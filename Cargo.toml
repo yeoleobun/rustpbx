@@ -24,6 +24,7 @@ cross = ["opus", "offline", "aws-lc-rs/bindgen"]
 not_vad = []
 
 [dependencies]
+libc = "0.2"
 opusic-sys = { version = "0.5.8", optional = true }
 audio-codec = { version = "0.3.30", features = ["opus"] }
 #rustrtc = { path = "../rustrtc" }
@@ -84,6 +85,7 @@ urlencoding = "2.1.3"
 base64 = "0.22.1"
 url = "2.5.8"
 unic-emoji = "0.9.0"
+socket2 = "0.5"
 realfft = "3.3"
 rmp3 = "0.3"
 tempfile = "3.24.0"

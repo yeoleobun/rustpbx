@@ -30,7 +30,10 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
-use std::{path::Path, sync::atomic::AtomicU64};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -55,6 +58,7 @@ pub struct AppStateInner {
     pub total_calls: AtomicU64,
     pub total_failed_calls: AtomicU64,
     pub uptime: DateTime<Local>,
+    pub shutting_down: Arc<AtomicBool>,
 }
 
 pub type AppState = Arc<AppStateInner>;
@@ -215,6 +219,28 @@ impl AppStateInner {
             let (state_sender, state_receiver) = dialog_layer.new_dialog_state_channel();
             match tx.original.method {
                 rsip::Method::Invite | rsip::Method::Ack => {
+                    // Reject new INVITEs during graceful shutdown
+                    if self.shutting_down.load(Ordering::Relaxed) {
+                        info!(?key, "rejecting INVITE during graceful shutdown");
+                        match tx
+                            .reply_with(
+                                rsip::StatusCode::ServiceUnavailable,
+                                vec![rsip::Header::Other(
+                                    "Reason".into(),
+                                    "SIP;cause=503;text=\"Server shutting down\"".into(),
+                                )],
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                info!("error replying to request: {:?}", e);
+                            }
+                        }
+                        continue;
+                    }
+
                     let invitation_handler = match self.create_invitation_handler {
                         Some(ref create_invitation_handler) => {
                             create_invitation_handler(self.config.handler.as_ref()).ok()
@@ -378,7 +404,8 @@ impl AppStateInner {
     }
 
     pub fn stop(&self) {
-        info!("stopping");
+        info!("stopping, marking as shutting down");
+        self.shutting_down.store(true, Ordering::Relaxed);
         self.token.cancel();
     }
 
@@ -692,16 +719,121 @@ impl AppStateBuilder {
         let transport_layer = rsipstack::transport::TransportLayer::new(token.clone());
         let local_addr: SocketAddr = format!("{}:{}", local_ip, config.udp_port).parse()?;
 
-        let udp_conn = rsipstack::transport::udp::UdpConnection::create_connection(
-            local_addr,
+        // Create UDP socket with SO_REUSEPORT for graceful restarts
+        #[cfg(unix)]
+        let std_socket = {
+            use std::os::unix::io::FromRawFd;
+
+            let domain = if local_addr.is_ipv4() {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            };
+            let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+            if fd < 0 {
+                return Err(anyhow::anyhow!("Failed to create UDP socket"));
+            }
+
+            let optval: libc::c_int = 1;
+            unsafe {
+                // SO_REUSEADDR
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::close(fd);
+                    return Err(anyhow::anyhow!("Failed to set SO_REUSEADDR"));
+                }
+
+                // SO_REUSEPORT (Linux/BSD)
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly",
+                    target_os = "macos",
+                    target_os = "ios"
+                ))]
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::close(fd);
+                    return Err(anyhow::anyhow!("Failed to set SO_REUSEPORT"));
+                }
+
+                // Bind
+                let (sockaddr_ptr, sockaddr_len) = match local_addr {
+                    std::net::SocketAddr::V4(addr_v4) => {
+                        let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
+                        addr_in.sin_family = libc::AF_INET as libc::sa_family_t;
+                        addr_in.sin_port = addr_v4.port().to_be();
+                        addr_in.sin_addr.s_addr = u32::from(*addr_v4.ip()).to_be();
+                        (
+                            &addr_in as *const _ as *const libc::sockaddr,
+                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                        )
+                    }
+                    std::net::SocketAddr::V6(addr_v6) => {
+                        let mut addr_in6: libc::sockaddr_in6 = std::mem::zeroed();
+                        addr_in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                        addr_in6.sin6_port = addr_v6.port().to_be();
+                        addr_in6.sin6_addr.s6_addr = addr_v6.ip().octets();
+                        (
+                            &addr_in6 as *const _ as *const libc::sockaddr,
+                            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                        )
+                    }
+                };
+
+                if libc::bind(fd, sockaddr_ptr, sockaddr_len) < 0 {
+                    let err = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", err));
+                }
+
+                std::net::UdpSocket::from_raw_fd(fd)
+            }
+        };
+
+        #[cfg(not(unix))]
+        let std_socket = std::net::UdpSocket::bind(local_addr)?;
+
+        std_socket.set_nonblocking(true)?;
+        let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
+        // Use the actual bound address (important when port=0 lets OS assign a port)
+        let actual_addr = tokio_socket.local_addr()?;
+
+        let udp_inner = rsipstack::transport::udp::UdpInner {
+            conn: tokio_socket,
+            addr: rsipstack::transport::SipAddr {
+                r#type: Some(rsip::transport::Transport::Udp),
+                addr: actual_addr.into(),
+            },
+        };
+
+        let udp_conn = rsipstack::transport::udp::UdpConnection::attach(
+            udp_inner,
             None,
             Some(token.child_token()),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("Create useragent UDP connection: {} {}", local_addr, e))?;
+        .await;
 
         transport_layer.add_transport(udp_conn.into());
-        info!("start useragent, addr: {}", local_addr);
+        info!(
+            "start useragent, addr: {} (SO_REUSEPORT enabled)",
+            local_addr
+        );
 
         let endpoint_option = rsipstack::transaction::endpoint::EndpointOption::default();
         let mut endpoint_builder = rsipstack::EndpointBuilder::new();
@@ -782,6 +914,7 @@ impl AppStateBuilder {
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),
             uptime: Local::now(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(app_state)
