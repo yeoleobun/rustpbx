@@ -569,7 +569,11 @@ impl ActiveCall {
                                 let is_refer_hangup = cs
                                     .refer_callstate
                                     .as_ref()
-                                    .map(|rcs| rcs.blocking_read().ssrc == refer_ssrc)
+                                    .map(|rcs| {
+                                        rcs.try_read()
+                                            .map(|g| g.ssrc == refer_ssrc)
+                                            .unwrap_or(false)
+                                    })
                                     .unwrap_or(false);
 
                                 if is_refer_hangup {

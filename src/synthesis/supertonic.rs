@@ -61,9 +61,16 @@ impl SupertonicTtsClient {
 
         // Run synthesis in blocking task
         tokio::task::spawn_blocking(move || {
-            // Need write lock to use synthesize if it takes &mut self
-            // But if synthesize takes &mut self, blocking_write is needed.
-            let mut guard = tts_arc.blocking_write();
+            // Use try_write to avoid potential panics or deadlocks;
+            // blocking_write can panic/deadlock when the lock is held by an async task.
+            let mut guard = match tts_arc.try_write() {
+                Ok(g) => g,
+                Err(_) => {
+                    warn!("Supertonic TTS write lock unavailable, skipping synthesis");
+                    let _ = tx_clone.send((cmd_seq, Err(anyhow!("TTS write lock unavailable"))));
+                    return;
+                }
+            };
 
             if let Some(tts) = guard.as_mut() {
                 debug!(
