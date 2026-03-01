@@ -1,6 +1,6 @@
-# RustPBX API Documentation
+# Active Call API Documentation
 
-This document describes the REST API endpoints provided by RustPBX.
+This document describes the WebSocket and REST API endpoints provided by Active Call.
 
 ## Base URL
 
@@ -21,14 +21,16 @@ The following three endpoints establish WebSocket connections for different voic
 **Description:** Establishes a WebSocket connection for voice call handling with audio stream transmitted via WebSocket.
 
 **Parameters:**
-- `id` (optional, string): Session ID. If not provided, a new UUID will be generated.
-- `dump` (optional, boolean): Enable event dumping. Default: `true`.
+- `id` (optional, string): Session ID. If not provided, a new UUID will be generated (prefixed with `s.`).
+- `dump_events` (optional, boolean): Enable event dumping to file. Default: `true`.
+- `ping_interval` (optional, number): Interval in seconds to send Ping events. Default: `20`. Set to `0` to disable.
+- `server_side_track` (optional, string): Override server-side track ID.
 
 **Response:** WebSocket connection upgrade
 
 **Usage:**
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/call?id=session123&dump=true');
+const ws = new WebSocket('ws://localhost:8080/call?id=session123&dump_events=true&ping_interval=20');
 ```
 
 ### 2. WebRTC Call Handler
@@ -40,14 +42,16 @@ const ws = new WebSocket('ws://localhost:8080/call?id=session123&dump=true');
 > **Note**: WebRTC requires a Secure Context. Ensure you are accessing your web client via **HTTPS** or **127.0.0.1**, otherwise the browser will not enable WebRTC functionality.
 
 **Parameters:**
-- `id` (optional, string): Session ID. If not provided, a new UUID will be generated.
-- `dump` (optional, boolean): Enable event dumping. Default: `true`.
+- `id` (optional, string): Session ID. If not provided, a new UUID will be generated (prefixed with `s.`).
+- `dump_events` (optional, boolean): Enable event dumping to file. Default: `true`.
+- `ping_interval` (optional, number): Interval in seconds to send Ping events. Default: `20`. Set to `0` to disable.
+- `server_side_track` (optional, string): Override server-side track ID.
 
 **Response:** WebSocket connection upgrade
 
 **Usage:**
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/call/webrtc?id=session123&dump=true');
+const ws = new WebSocket('ws://localhost:8080/call/webrtc?id=session123&dump_events=true');
 ```
 
 ### 3. SIP Call Handler
@@ -57,14 +61,16 @@ const ws = new WebSocket('ws://localhost:8080/call/webrtc?id=session123&dump=tru
 **Description:** Establishes a WebSocket connection for SIP call handling with audio stream transmitted via SIP/RTP.
 
 **Parameters:**
-- `id` (optional, string): Session ID. If not provided, a new UUID will be generated.
-- `dump` (optional, boolean): Enable event dumping. Default: `true`.
+- `id` (optional, string): Session ID. If not provided, a new UUID will be generated (prefixed with `s.`).
+- `dump_events` (optional, boolean): Enable event dumping to file. Default: `true`.
+- `ping_interval` (optional, number): Interval in seconds to send Ping events. Default: `20`. Set to `0` to disable.
+- `server_side_track` (optional, string): Override server-side track ID.
 
 **Response:** WebSocket connection upgrade
 
 **Usage:**
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/call/sip?id=session123&dump=true');
+const ws = new WebSocket('ws://localhost:8080/call/sip?id=session123&dump_events=true');
 ```
 
 ## WebSocket Communication Flow
@@ -447,11 +453,16 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 
 #### Interrupt Command
 **Purpose:** Interrupts current TTS or audio playback.
-- `graceful`: (boolean, optional), if it is true, tts track will wait until playing tts command complete.
+
+**Fields:**
+- `command` (string): Always "interrupt"
+- `graceful` (boolean, optional): If true, waits for the current TTS command to finish playing before stopping. Default: `false`.
+- `fadeOutMs` (number, optional): Fade-out duration in milliseconds before stopping playback.
+
 ```json
 {
   "command": "interrupt",
-  "graceful": "false"
+  "graceful": false
 }
 ```
 
@@ -575,12 +586,16 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 - `command` (string): Always "hangup"
 - `reason` (string, optional): Reason for hanging up
 - `initiator` (string, optional): Who initiated the hangup (user, system, etc.)
+- `headers` (object, optional): Additional SIP headers to include in the BYE request (SIP calls only)
 
 ```json
 {
   "command": "hangup",
   "reason": "user_requested",
-  "initiator": "user"
+  "initiator": "user",
+  "headers": {
+    "X-Hangup-Cause": "normal"
+  }
 }
 ```
 
@@ -944,13 +959,17 @@ Events are received as JSON messages from the server. All timestamps are in mill
 - `trackId` (string): **Unique identifier for the audio track.**
 - `timestamp` (number): Event timestamp in milliseconds since Unix epoch
 - `startTime` (number): When speech started in milliseconds since Unix epoch
+- `isFiller` (boolean, optional): Whether this speech segment is a filler word
+- `confidence` (number, optional): Confidence score of the voice detection (0.0–1.0)
 
 ```json
 {
   "event": "speaking",
   "trackId": "track-abc123",
   "timestamp": 1640995200000,
-  "startTime": 1640995200000
+  "startTime": 1640995200000,
+  "isFiller": false,
+  "confidence": 0.95
 }
 ```
 
@@ -996,7 +1015,7 @@ Events are received as JSON messages from the server. All timestamps are in mill
 }
 ```
 
-#### End of Utterance (EOU) Event
+#### EOU (End of Utterance) Event
 **Triggered when:** End of utterance detection identifies when user has finished speaking.
 
 **Fields:**
@@ -1004,13 +1023,15 @@ Events are received as JSON messages from the server. All timestamps are in mill
 - `trackId` (string): **Unique identifier for the audio track.**
 - `timestamp` (number): Event timestamp in milliseconds since Unix epoch
 - `completed` (boolean): Whether the utterance was completed normally
+- `interruptPoint` (string, optional): Position in TTS subtitle text where the interruption occurred
 
 ```json
 {
   "event": "eou",
   "trackId": "track-abc123",
   "timestamp": 1640995200000,
-  "completed": true
+  "completed": true,
+  "interruptPoint": null
 }
 ```
 
@@ -1025,6 +1046,9 @@ Events are received as JSON messages from the server. All timestamps are in mill
 - `startTime` (number, optional): Start time of speech in milliseconds since Unix epoch
 - `endTime` (number, optional): End time of speech in milliseconds since Unix epoch
 - `text` (string): Final transcribed text
+- `isFiller` (boolean, optional): Whether this result is a filler word
+- `confidence` (number, optional): Confidence score (0.0–1.0)
+- `taskId` (string, optional): ASR provider task identifier
 
 ```json
 {
@@ -1034,7 +1058,10 @@ Events are received as JSON messages from the server. All timestamps are in mill
   "index": 1,
   "startTime": 1640995200000,
   "endTime": 1640995205000,
-  "text": "Hello, how can I help you today?"
+  "text": "Hello, how can I help you today?",
+  "isFiller": false,
+  "confidence": 0.98,
+  "taskId": "asr-task-001"
 }
 ```
 
@@ -1049,6 +1076,9 @@ Events are received as JSON messages from the server. All timestamps are in mill
 - `startTime` (number, optional): Start time of speech in milliseconds since Unix epoch
 - `endTime` (number, optional): End time of speech in milliseconds since Unix epoch
 - `text` (string): Partial transcribed text
+- `isFiller` (boolean, optional): Whether this result is a filler word
+- `confidence` (number, optional): Confidence score (0.0–1.0)
+- `taskId` (string, optional): ASR provider task identifier
 
 ```json
 {
@@ -1058,7 +1088,9 @@ Events are received as JSON messages from the server. All timestamps are in mill
   "timestamp": 1640995200000,
   "startTime": 1640995200000,
   "endTime": 1640995203000,
-  "text": "Hello, how can"
+  "text": "Hello, how can",
+  "isFiller": false,
+  "confidence": 0.85
 }
 ```
 
@@ -1151,6 +1183,80 @@ Events are received as JSON messages from the server. All timestamps are in mill
 ```
 
 ### System Events
+
+#### Ping Event
+**Triggered when:** Server sends a periodic heartbeat to keep the connection alive.
+
+**Fields:**
+- `event` (string): Always "ping"
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `payload` (string, optional): ISO 8601 timestamp of the ping
+
+> The client should respond with a WebSocket Pong frame (this is handled automatically by most WebSocket clients). The server sends a Ping every `ping_interval` seconds (default: 20). Set `ping_interval=0` to disable.
+
+```json
+{
+  "event": "ping",
+  "timestamp": 1640995200000,
+  "payload": "2024-01-01T12:00:00Z"
+}
+```
+
+#### Hold Event
+**Triggered when:** A call is placed on hold or taken off hold.
+
+**Fields:**
+- `event` (string): Always "hold"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+- `onHold` (boolean): `true` if call is now on hold, `false` if taken off hold
+
+```json
+{
+  "event": "hold",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000,
+  "onHold": true
+}
+```
+
+#### Inactivity Event
+**Triggered when:** Audio inactivity timeout expires (no audio activity detected for `inactivityTimeout` seconds).
+
+**Fields:**
+- `event` (string): Always "inactivity"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+
+```json
+{
+  "event": "inactivity",
+  "trackId": "track-abc123",
+  "timestamp": 1640995200000
+}
+```
+
+#### FunctionCall Event
+**Triggered when:** A function/tool call is made by the AI agent (Playbook mode).
+
+**Fields:**
+- `event` (string): Always "functionCall"
+- `trackId` (string): **Unique identifier for the audio track.**
+- `callId` (string): Unique identifier for this function call
+- `name` (string): Name of the function being called
+- `arguments` (string): JSON-encoded arguments string for the function
+- `timestamp` (number): Event timestamp in milliseconds since Unix epoch
+
+```json
+{
+  "event": "functionCall",
+  "trackId": "track-abc123",
+  "callId": "call-uuid-123",
+  "name": "get_weather",
+  "arguments": "{\"city\": \"Beijing\"}",
+  "timestamp": 1640995200000
+}
+```
 
 #### Metrics Event
 **Triggered when:** Performance metrics are available.
@@ -1280,7 +1386,7 @@ The `Attendee` object appears in call events and contains participant informatio
 
 ### 4. List Active Calls
 
-**Endpoint:** `GET /call/lists`
+**Endpoint:** `GET /list`
 
 **Description:** Returns a list of all currently active calls.
 
@@ -1289,16 +1395,13 @@ The `Attendee` object appears in call events and contains participant informatio
 **Response:**
 ```json
 {
-  "calls": [
+  "active_calls": [
     {
-      "id": "session-id",
-      "call_type": "webrtc",
-      "created_at": "2024-01-01T12:00:00Z",
-      "option": {
-        "caller": "1234567890",
-        "callee": "0987654321",
-        "offer": "sdp-offer-string"
-      }
+      "id": "s.session-id",
+      "callType": "webrtc",
+      "cs.option": { ... },
+      "ringTime": "2024-01-01T12:00:02Z",
+      "startTime": "2024-01-01T12:00:05Z"
     }
   ]
 }
@@ -1306,12 +1409,12 @@ The `Attendee` object appears in call events and contains participant informatio
 
 **Usage:**
 ```bash
-curl http://localhost:8080/call/lists
+curl http://localhost:8080/list
 ```
 
 ### 5. Kill Call
 
-**Endpoint:** `POST /call/kill/{id}`
+**Endpoint:** `GET /kill/{id}`
 
 **Description:** Terminates a specific active call by its session ID.
 
@@ -1320,12 +1423,17 @@ curl http://localhost:8080/call/lists
 
 **Response:**
 ```json
-true
+{ "status": "killed", "id": "s.session123" }
+```
+
+If the session is not found:
+```json
+{ "status": "not_found", "id": "s.session123" }
 ```
 
 **Usage:**
 ```bash
-curl -X POST http://localhost:8080/call/kill/session123
+curl http://localhost:8080/kill/s.session123
 ```
 
 ### 6. Get ICE Servers
@@ -1340,7 +1448,7 @@ curl -X POST http://localhost:8080/call/kill/session123
 ```json
 [
   {
-    "urls": ["stun:restsend.com:3478"],
+    "urls": ["stun:stun.l.google.com:19302"],
     "username": null,
     "credential": null
   },
@@ -1357,6 +1465,122 @@ curl -X POST http://localhost:8080/call/kill/session123
 curl http://localhost:8080/iceservers
 ```
 
+### 7. Playbook API
+
+#### List Playbooks
+
+**Endpoint:** `GET /api/playbooks`
+
+**Description:** Returns a list of all available playbook files in `config/playbook/`.
+
+**Response:**
+```json
+[
+  { "name": "demo.md", "updated": "2024-01-01T12:00:00Z" },
+  { "name": "simple-demo-en.md", "updated": "2024-01-02T08:00:00Z" }
+]
+```
+
+**Usage:**
+```bash
+curl http://localhost:8080/api/playbooks
+```
+
+#### Get Playbook
+
+**Endpoint:** `GET /api/playbooks/{name}`
+
+**Description:** Returns the content of a specific playbook file.
+
+**Parameters:**
+- `name` (path parameter, string): Playbook filename (e.g., `demo.md`)
+
+**Response:** Plain text content of the playbook file.
+
+**Usage:**
+```bash
+curl http://localhost:8080/api/playbooks/demo.md
+```
+
+#### Save Playbook
+
+**Endpoint:** `POST /api/playbooks/{name}`
+
+**Description:** Creates or updates a playbook file.
+
+**Parameters:**
+- `name` (path parameter, string): Playbook filename (e.g., `my-playbook.md`)
+- Body: Plain text playbook content
+
+**Response:** `200 OK` on success.
+
+**Usage:**
+```bash
+curl -X POST http://localhost:8080/api/playbooks/my-playbook.md \
+  -H "Content-Type: text/plain" \
+  --data-binary @my-playbook.md
+```
+
+#### Run Playbook
+
+**Endpoint:** `POST /api/playbook/run`
+
+**Description:** Associates a playbook with a future WebSocket session. When the session connects, the playbook will automatically be loaded.
+
+**Request Body (JSON):**
+```json
+{
+  "playbook": "demo.md",
+  "type": "webrtc",
+  "to": "sip:bob@example.com"
+}
+```
+Or with inline content:
+```json
+{
+  "content": "---\nname: inline-demo\n...",
+  "type": "webrtc"
+}
+```
+
+**Fields:**
+- `playbook` (string): Playbook filename to load from `config/playbook/`
+- `content` (string): Inline YAML playbook content (alternative to `playbook`)
+- `type` (string, optional): Call type hint
+- `to` (string, optional): Callee address
+
+**Response:**
+```json
+{ "session_id": "s.uuid-here" }
+```
+
+Use the returned `session_id` as the `id` parameter when connecting the WebSocket.
+
+**Usage:**
+```bash
+curl -X POST http://localhost:8080/api/playbook/run \
+  -H "Content-Type: application/json" \
+  -d '{"playbook": "demo.md"}'
+```
+
+#### List Records
+
+**Endpoint:** `GET /api/records`
+
+**Description:** Returns a list of call event records (`.events.jsonl` files in the recorder directory).
+
+**Response:**
+```json
+[
+  { "id": "s.session-uuid", "date": "2024-01-01T12:00:00Z", "duration": "0s", "status": "completed" }
+]
+```
+
+**Usage:**
+```bash
+curl http://localhost:8080/api/records
+```
+
 ## Error Handling
 
 All endpoints return appropriate HTTP status codes:
@@ -1371,8 +1595,8 @@ WebSocket connections may be closed with specific close codes indicating the rea
 
 - All WebSocket endpoints support real-time bidirectional communication
 - Call sessions are automatically cleaned up when the WebSocket connection is closed
-- Event dumping can be disabled by setting `dump=false` parameter
-- ICE servers are automatically configured based on environment variables
+- Event dumping to file can be disabled by setting `dump_events=false` query parameter
+- ICE servers are automatically configured based on server configuration
 - Audio codecs are automatically negotiated based on capabilities
 - VAD (Voice Activity Detection) events are sent for speech detection
 - ASR (Automatic Speech Recognition) provides real-time transcription
@@ -1380,4 +1604,6 @@ WebSocket connections may be closed with specific close codes indicating the rea
 - **All timestamps are in milliseconds**
 - **trackId is used to identify which audio track generated an event**
 - **playId prevents interruption of previous TTS playback when the same ID is used. For TTS commands, playId is the specified identifier; for Play commands, playId is the URL**
+- **Session IDs generated by the server are prefixed with `s.` (WebSocket sessions) or `c.` (CLI outbound calls)**
+- **The `ping_interval` parameter controls heartbeat frequency (default 20s). Set to 0 to disable**
 - **autoHangup automatically ends the call after TTS/playback completion**
