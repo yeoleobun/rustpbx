@@ -781,12 +781,13 @@ impl AppStateBuilder {
         let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
         // Use the actual bound address (important when port=0 lets OS assign a port)
         let actual_addr = tokio_socket.local_addr()?;
+        let bind_addr = rsipstack::transport::SipConnection::resolve_bind_address(actual_addr);
 
         let udp_inner = rsipstack::transport::udp::UdpInner {
             conn: tokio_socket,
             addr: rsipstack::transport::SipAddr {
                 r#type: Some(rsip::transport::Transport::Udp),
-                addr: actual_addr.into(),
+                addr: bind_addr.into(),
             },
         };
 
