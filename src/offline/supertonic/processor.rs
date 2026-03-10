@@ -223,7 +223,7 @@ pub fn sample_noisy_latent(
     let mut noisy_latent = Array3::<f32>::zeros((bsz, latent_dim_val, latent_len));
 
     let normal = Normal::new(0.0, 1.0).unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     for b in 0..bsz {
         for d in 0..latent_dim_val {

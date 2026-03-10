@@ -10,7 +10,7 @@ mod tests {
     use audio_codec::opus::OpusEncoder;
     use audio_codec::pcmu::{PcmuDecoder, PcmuEncoder};
     use audio_codec::{Decoder, Encoder, Resampler};
-    use rand::Rng;
+    use rand::RngExt;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -32,16 +32,16 @@ mod tests {
 
         let total_chunks = (duration_sec * 1000) / chunk_ms;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Data for PCMU scenario
         let input_data_pcmu: Vec<u8> = (0..total_chunks * samples_per_chunk_pcmu)
-            .map(|_| rng.r#gen())
+            .map(|_| rng.random())
             .collect();
 
         // Data for G729 scenario
         let input_data_g729: Vec<u8> = (0..total_chunks * bytes_per_chunk_g729)
-            .map(|_| rng.r#gen())
+            .map(|_| rng.random())
             .collect();
 
         // --- Common Components ---

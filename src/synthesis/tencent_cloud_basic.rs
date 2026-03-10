@@ -9,7 +9,7 @@ use futures::{
     FutureExt, StreamExt, future,
     stream::{self, BoxStream},
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -58,7 +58,7 @@ pub fn strip_emoji_chars(text: &str) -> String {
 // session_id is used for tencent cloud tts service, not the session_id of media session
 fn construct_request_url(option: &SynthesisOption, session_id: &str, text: &str) -> String {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let nonce = rand::thread_rng().r#gen::<u64>().to_string();
+    let nonce = rand::rng().random::<u64>().to_string();
     let session_id = session_id.to_string();
     let secret_id = option.secret_id.clone().unwrap_or_default();
     let secret_key = option.secret_key.clone().unwrap_or_default();
