@@ -1,6 +1,6 @@
 use crate::{
     event::SessionEvent,
-    media::Samples,
+    media::{Samples, cache},
     media::track::{Track, tts::TtsTrack},
     synthesis::{
         Subtitle, SynthesisClient, SynthesisCommand, SynthesisEvent, SynthesisOption, SynthesisType,
@@ -12,6 +12,7 @@ use bytes::BufMut;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::{
     sync::{broadcast, mpsc},
@@ -537,6 +538,11 @@ async fn test_tts_track_end_of_stream() -> Result<()> {
 
 #[tokio::test]
 async fn test_tts_track_base64() -> Result<()> {
+    let original_cache_dir = cache::get_cache_dir()?;
+    let temp_dir = tempfile::tempdir()?;
+    let test_cache_dir = temp_dir.path().join("mediacache");
+    cache::set_cache_dir(test_cache_dir.to_str().unwrap())?;
+
     // Create a command channel
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -609,5 +615,12 @@ async fn test_tts_track_base64() -> Result<()> {
     }
 
     assert!(sample_received >= 8000, "Not enough bytes");
+    let leaked_cache_file = PathBuf::from(format!("{}.pcm", test_cache_dir.display()));
+    assert!(
+        !tokio::fs::try_exists(&leaked_cache_file).await?,
+        "base64 playback should not create an empty-key cache file at {}",
+        leaked_cache_file.display()
+    );
+    cache::set_cache_dir(original_cache_dir.to_str().unwrap())?;
     Ok(())
 }

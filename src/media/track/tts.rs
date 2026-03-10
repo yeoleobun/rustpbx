@@ -730,6 +730,7 @@ impl TtsTask {
 
                 // if cache is enabled, cache key set by handle_cache
                 if self.cache_enabled
+                    && !entry.cache_key.is_empty()
                     && !cache::is_cached(&entry.cache_key).await.unwrap_or_default()
                 {
                     if let Err(e) =
@@ -755,6 +756,8 @@ impl TtsTask {
                             "stored audio in cache"
                         );
                     }
+                    entry.chunks.clear();
+                } else if self.cache_enabled && entry.cache_key.is_empty() {
                     entry.chunks.clear();
                 }
 
