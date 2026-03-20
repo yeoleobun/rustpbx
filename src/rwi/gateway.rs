@@ -1,9 +1,12 @@
 use crate::rwi::auth::RwiIdentity;
+use crate::rwi::call_leg::RwiCallLegHandle;
 use crate::rwi::proto::RwiEvent;
 use crate::rwi::session::{OwnershipMode, RwiSession, SupervisorMode};
+use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Arc as StdArc};
 use tokio::sync::{RwLock, mpsc};
+use tracing::{debug, info, warn};
 
 pub type SessionId = String;
 pub type CallId = String;
@@ -30,6 +33,16 @@ pub struct RwiGateway {
     context_subscriptions: HashMap<Context, HashSet<SessionId>>,
     call_ownership: HashMap<CallId, SessionId>,
     supervisor_calls: HashMap<CallId, SessionId>,
+    call_legs: HashMap<CallId, RwiCallLegHandle>,
+    bridges_by_id: HashMap<String, RwiBridgeState>,
+    bridge_by_leg: HashMap<CallId, String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RwiBridgeState {
+    pub leg_a: String,
+    pub leg_b: String,
+    pub bridge: Arc<MediaBridge>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +60,9 @@ impl RwiGateway {
             context_subscriptions: HashMap::new(),
             call_ownership: HashMap::new(),
             supervisor_calls: HashMap::new(),
+            call_legs: HashMap::new(),
+            bridges_by_id: HashMap::new(),
+            bridge_by_leg: HashMap::new(),
         }
     }
 
@@ -90,14 +106,20 @@ impl RwiGateway {
         if let Some(session) = self.sessions.get(session_id) {
             let mut session = session.write().await;
             session.subscribe(contexts.clone());
-            for ctx in contexts {
+            for ctx in &contexts {
                 self.context_subscriptions
-                    .entry(ctx)
+                    .entry(ctx.clone())
                     .or_insert_with(HashSet::new)
                     .insert(session_id.clone());
             }
+            info!(
+                session_id,
+                contexts = ?contexts,
+                "RWI session subscribed to contexts"
+            );
             true
         } else {
+            warn!(session_id, "RWI subscribe: session not found");
             false
         }
     }
@@ -217,6 +239,46 @@ impl RwiGateway {
         self.sessions.keys().cloned().collect()
     }
 
+    pub(crate) fn register_leg(&mut self, call_id: CallId, leg: RwiCallLegHandle) {
+        self.call_legs.insert(call_id, leg);
+    }
+
+    pub(crate) fn get_leg(&self, call_id: &CallId) -> Option<RwiCallLegHandle> {
+        self.call_legs.get(call_id).cloned()
+    }
+
+    pub(crate) fn list_legs(&self) -> Vec<RwiCallLegHandle> {
+        self.call_legs.values().cloned().collect()
+    }
+
+    pub(crate) fn remove_leg(&mut self, call_id: &CallId) -> Option<RwiCallLegHandle> {
+        self.call_legs.remove(call_id)
+    }
+
+    pub(crate) fn register_bridge(&mut self, bridge_id: String, bridge_state: RwiBridgeState) {
+        self.bridge_by_leg
+            .insert(bridge_state.leg_a.clone(), bridge_id.clone());
+        self.bridge_by_leg
+            .insert(bridge_state.leg_b.clone(), bridge_id.clone());
+        self.bridges_by_id.insert(bridge_id, bridge_state);
+    }
+
+    pub(crate) fn bridge_id_for_leg(&self, call_id: &CallId) -> Option<String> {
+        self.bridge_by_leg.get(call_id).cloned()
+    }
+
+    pub(crate) fn remove_bridge_by_id(&mut self, bridge_id: &str) -> Option<RwiBridgeState> {
+        let bridge_state = self.bridges_by_id.remove(bridge_id)?;
+        self.bridge_by_leg.remove(&bridge_state.leg_a);
+        self.bridge_by_leg.remove(&bridge_state.leg_b);
+        Some(bridge_state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bridge_count(&self) -> usize {
+        self.bridges_by_id.len()
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -229,8 +291,13 @@ impl RwiGateway {
     pub fn send_event_to_session(&self, session_id: &SessionId, event: &RwiEvent) {
         if let Some(sender) = self.session_event_senders.get(session_id) {
             if let Ok(value) = serde_json::to_value(event) {
-                let _ = sender.send(value);
+                match sender.send(value) {
+                    Ok(_) => debug!(session_id, "RWI event sent to session"),
+                    Err(e) => warn!(session_id, error = %e, "RWI event send failed"),
+                }
             }
+        } else {
+            debug!(session_id, "RWI send_event_to_session: no sender for session");
         }
     }
 
@@ -245,9 +312,21 @@ impl RwiGateway {
     /// Used for inbound `call.incoming` notifications.
     pub fn fan_out_event_to_context(&self, context: &str, event: &RwiEvent) {
         if let Some(subscribers) = self.context_subscriptions.get(context) {
+            info!(
+                context,
+                subscriber_count = subscribers.len(),
+                "RWI fan_out_event_to_context"
+            );
             for session_id in subscribers {
                 self.send_event_to_session(session_id, event);
             }
+        } else {
+            warn!(
+                context,
+                total_contexts = self.context_subscriptions.len(),
+                total_sessions = self.session_event_senders.len(),
+                "RWI fan_out_event_to_context: no subscribers for context"
+            );
         }
     }
 

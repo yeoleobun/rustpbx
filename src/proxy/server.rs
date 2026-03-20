@@ -274,9 +274,9 @@ impl SipServerBuilder {
 
     pub fn with_rwi_gateway(
         mut self,
-        gateway: Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>,
+        gateway: Option<Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>>,
     ) -> Self {
-        self.rwi_gateway = Some(gateway);
+        self.rwi_gateway = gateway;
         self
     }
 

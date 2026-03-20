@@ -11,6 +11,7 @@ pub trait MediaPeer: Send + Sync {
     async fn update_track(&self, track: Box<dyn Track>, play_id: Option<String>);
     async fn get_tracks(&self) -> Vec<Arc<AsyncMutex<Box<dyn Track>>>>;
     async fn update_remote_description(&self, track_id: &str, remote: &str) -> Result<()>;
+    async fn renegotiate_track(&self, track_id: &str, remote_offer: &str) -> Result<String>;
     async fn suppress_forwarding(&self, track_id: &str);
     async fn resume_forwarding(&self, track_id: &str);
     fn is_suppressed(&self, track_id: &str) -> bool;
@@ -47,6 +48,10 @@ impl MediaPeer for VoiceEnginePeer {
         self.stream
             .update_remote_description(track_id, remote)
             .await
+    }
+
+    async fn renegotiate_track(&self, track_id: &str, remote_offer: &str) -> Result<String> {
+        self.stream.renegotiate_track(track_id, remote_offer).await
     }
 
     async fn suppress_forwarding(&self, track_id: &str) {

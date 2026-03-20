@@ -68,6 +68,7 @@ impl RwiRequest {
     }
 }
 
+#[allow(dead_code)]
 struct RwiTestClient {
     ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
 }

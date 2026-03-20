@@ -3,6 +3,7 @@ use crate::callrecord::CallRecordHangupReason;
 use crate::proxy::active_call_registry::{
     ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
 };
+use crate::rwi::proto::RwiEvent;
 use crate::rwi::SupervisorMode;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Immutable context for the entire duration of a call
 #[derive(Clone)]
@@ -136,6 +138,7 @@ pub struct CallSessionShared {
     registry: Option<Weak<ActiveProxyCallRegistry>>,
     events: Arc<RwLock<Option<ProxyCallEventSender>>>,
     app_event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<crate::call::app::ControllerEvent>>>>,
+    dtmf_listener_cancel: Arc<RwLock<Option<CancellationToken>>>,
 }
 
 impl CallSessionShared {
@@ -168,6 +171,7 @@ impl CallSessionShared {
             registry: registry.map(|r| Arc::downgrade(&r)),
             events: Arc::new(RwLock::new(None)),
             app_event_tx: Arc::new(RwLock::new(None)),
+            dtmf_listener_cancel: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -196,6 +200,23 @@ impl CallSessionShared {
         false
     }
 
+    pub fn set_dtmf_listener_cancel(&self, cancel: Option<CancellationToken>) {
+        if let Ok(mut slot) = self.dtmf_listener_cancel.write() {
+            *slot = cancel;
+        }
+    }
+
+    pub fn cancel_dtmf_listener(&self) {
+        let cancel = self
+            .dtmf_listener_cancel
+            .write()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+    }
+
     pub fn snapshot(&self) -> CallSessionSnapshot {
         let inner = self.inner.read().unwrap();
         inner.clone()
@@ -209,6 +230,23 @@ impl CallSessionShared {
     pub fn answer_sdp(&self) -> Option<String> {
         let inner = self.inner.read().unwrap();
         inner.answer_sdp.clone()
+    }
+
+    pub fn rwi_hangup_event(&self) -> RwiEvent {
+        let inner = self.inner.read().unwrap();
+        let reason = inner
+            .hangup_reason
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| inner.last_error_reason.clone());
+        let sip_status = inner
+            .last_error_code
+            .or_else(|| inner.hangup_reason.as_ref().map(|_| 200));
+        RwiEvent::CallHangup {
+            call_id: inner.session_id.clone(),
+            reason,
+            sip_status,
+        }
     }
 
     pub fn queue_name(&self) -> Option<String> {
@@ -538,6 +576,11 @@ impl CallSessionHandle {
     pub fn send_app_event(&self, event: crate::call::app::ControllerEvent) -> bool {
         self.shared.send_app_event(event)
     }
+
+    pub fn cancel_dtmf_listener(&self) {
+        self.shared.cancel_dtmf_listener();
+    }
+
 }
 
 #[cfg(test)]

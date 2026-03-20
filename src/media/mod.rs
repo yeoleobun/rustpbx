@@ -188,6 +188,18 @@ impl MediaStream {
         guard.set_remote_description(remote).await
     }
 
+    pub async fn renegotiate_track(&self, track_id: &str, remote_offer: &str) -> Result<String> {
+        let handle = {
+            let tracks = self.tracks.lock().unwrap();
+            tracks.get(track_id).cloned()
+        };
+        let Some(track) = handle else {
+            return Err(anyhow!("track not found: {track_id}"));
+        };
+        let guard = track.lock().await;
+        guard.handshake(remote_offer.to_string()).await
+    }
+
     pub async fn suppress_forwarding(&self, track_id: &str) {
         let mut suppressed = self.suppressed.lock().unwrap();
         suppressed.insert(track_id.to_string());
