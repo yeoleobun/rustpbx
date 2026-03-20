@@ -533,7 +533,7 @@ impl CallSession {
             .update_routed_parties(self.routed_caller.clone(), self.routed_callee.clone());
     }
 
-    fn is_webrtc_sdp(sdp: &str) -> bool {
+    pub(crate) fn is_webrtc_sdp(sdp: &str) -> bool {
         sdp.contains("RTP/SAVPF")
     }
 
@@ -542,6 +542,22 @@ impl CallSession {
         self.caller_leg
             .media
             .create_caller_answer(
+                "caller-track",
+                codec_info,
+                caller_offer_sdp.as_deref(),
+                &self.context.media_config,
+            )
+            .await
+    }
+
+    pub(crate) async fn build_caller_answer_trickle(
+        &mut self,
+        codec_info: Vec<CodecInfo>,
+    ) -> Result<String> {
+        let caller_offer_sdp = self.caller_leg.offer_sdp.clone();
+        self.caller_leg
+            .media
+            .create_caller_answer_trickle(
                 "caller-track",
                 codec_info,
                 caller_offer_sdp.as_deref(),
@@ -922,6 +938,28 @@ impl CallSession {
                 self.caller_leg.answer_sdp.clone(),
             );
             self.negotiation_state = NegotiationState::Stable;
+        }
+    }
+
+    pub async fn handle_trickle_ice(&mut self, payload: &str) {
+        for line in payload.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let candidate = line
+                .strip_prefix("a=candidate:")
+                .or_else(|| line.strip_prefix("candidate:"));
+            if let Some(candidate) = candidate {
+                if let Err(err) = self
+                    .caller_leg
+                    .media
+                    .add_remote_ice_candidate("caller-track", candidate.trim())
+                    .await
+                {
+                    warn!(
+                        session_id = %self.context.session_id,
+                        error = %err,
+                        "Failed to add remote trickle ICE candidate"
+                    );
+                }
+            }
         }
     }
 
@@ -1412,6 +1450,10 @@ impl CallSession {
                         _ => rsip::Method::Invite, // Default to Invite for now
                     };
                     self.handle_reinvite(method, sdp_opt).await;
+                    Ok(())
+                }
+                SessionAction::HandleTrickleIce(payload) => {
+                    self.handle_trickle_ice(&payload).await;
                     Ok(())
                 }
                 SessionAction::PlayPrompt {
@@ -2243,6 +2285,9 @@ impl CallSession {
             Some(reporter),
         ));
 
+        session.caller_leg.sip.supports_trickle_ice =
+            SipLeg::has_trickle_ice_support(&initial_request.headers);
+
         if use_media_proxy {
             session.caller_leg.offer_sdp = Some(offer_sdp);
             session.callee_leg.offer_sdp =
@@ -2428,25 +2473,40 @@ impl CallSession {
         }
 
         if !self.server_dialog.state().is_terminated() {
-            let (code, reason) = if self.context.dialplan.passthrough_failure {
-                self.last_error.clone().unwrap_or((
-                    StatusCode::ServerInternalError,
-                    Some("Call failed".to_string()),
-                ))
-            } else {
-                (
-                    StatusCode::ServerInternalError,
-                    Some("Call failed".to_string()),
-                )
-            };
-
-            info!(
-                session_id = %self.context.session_id,
-                status_code = %code,
-                passthrough = self.context.dialplan.passthrough_failure,
-                "Rejecting caller with failure response"
+            let server_state = self.server_dialog.state();
+            let normal_hangup = matches!(
+                self.hangup_reason,
+                Some(CallRecordHangupReason::ByCallee) | Some(CallRecordHangupReason::ByCaller)
             );
-            let _ = self.server_dialog.reject(Some(code), reason);
+
+            if normal_hangup && (server_state.is_confirmed() || server_state.waiting_ack()) {
+                info!(
+                    session_id = %self.context.session_id,
+                    hangup_reason = ?self.hangup_reason,
+                    "Sending BYE to caller for normal call teardown"
+                );
+                let _ = self.server_dialog.bye().await;
+            } else {
+                let (code, reason) = if self.context.dialplan.passthrough_failure {
+                    self.last_error.clone().unwrap_or((
+                        StatusCode::ServerInternalError,
+                        Some("Call failed".to_string()),
+                    ))
+                } else {
+                    (
+                        StatusCode::ServerInternalError,
+                        Some("Call failed".to_string()),
+                    )
+                };
+
+                info!(
+                    session_id = %self.context.session_id,
+                    status_code = %code,
+                    passthrough = self.context.dialplan.passthrough_failure,
+                    "Rejecting caller with failure response"
+                );
+                let _ = self.server_dialog.reject(Some(code), reason);
+            }
         }
     }
 }

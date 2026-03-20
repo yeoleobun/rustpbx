@@ -38,7 +38,7 @@ pub(crate) fn build_optimized_caller_codec_info(
     caller_offer_sdp: Option<&str>,
     callee_answer_sdp: &str,
     allow_codecs: &[CodecType],
-    use_media_proxy: bool,
+    _use_media_proxy: bool,
 ) -> Option<Vec<CodecInfo>> {
     let caller_offer_sdp = caller_offer_sdp?;
     let callee_extracted = MediaNegotiator::extract_codec_params(callee_answer_sdp);
@@ -57,14 +57,12 @@ pub(crate) fn build_optimized_caller_codec_info(
         }
     }
 
-    if should_advertise_caller_dtmf(use_media_proxy, !callee_extracted.dtmf.is_empty()) {
-        let mut used_payload_types = codec_info.iter().map(|codec| codec.payload_type).collect();
-        append_dtmf_codecs(
-            &mut codec_info,
-            &caller_extracted.dtmf,
-            &mut used_payload_types,
-        );
-    }
+    let mut used_payload_types = codec_info.iter().map(|codec| codec.payload_type).collect();
+    append_dtmf_codecs(
+        &mut codec_info,
+        &caller_extracted.dtmf,
+        &mut used_payload_types,
+    );
 
     Some(codec_info)
 }

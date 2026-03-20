@@ -11,7 +11,7 @@ use audio_codec::CodecType;
 use anyhow::{Result, anyhow};
 use rustrtc::SessionDescription;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -257,6 +257,22 @@ impl MediaEndpoint {
         None
     }
 
+    pub async fn trickle_ice_context(
+        &self,
+        track_id: &str,
+    ) -> Option<(
+        rustrtc::PeerConnection,
+        broadcast::Receiver<rustrtc::transports::ice::IceCandidate>,
+        watch::Receiver<rustrtc::IceGatheringState>,
+    )> {
+        let track = self.find_track(track_id).await?;
+        let guard = track.lock().await;
+        let pc = guard.get_peer_connection().await?;
+        let candidate_rx = guard.subscribe_ice_candidates()?;
+        let gathering_rx = guard.subscribe_ice_gathering_state()?;
+        Some((pc, candidate_rx, gathering_rx))
+    }
+
     fn is_webrtc_sdp(sdp: &str) -> bool {
         sdp.contains("RTP/SAVPF")
     }
@@ -379,6 +395,49 @@ impl MediaEndpoint {
         Ok(answer)
     }
 
+    pub async fn create_caller_answer_trickle(
+        &mut self,
+        track_id: &str,
+        codec_info: Vec<CodecInfo>,
+        caller_offer_sdp: Option<&str>,
+        media_config: &MediaConfig,
+    ) -> Result<String> {
+        if let Some(answer) = self.answer_sdp.as_ref() {
+            return Ok(answer.clone());
+        }
+
+        let is_webrtc = caller_offer_sdp
+            .map(Self::is_webrtc_sdp)
+            .unwrap_or(false);
+        let track_builder =
+            self.build_track_builder(track_id.to_string(), codec_info, media_config, is_webrtc);
+
+        let answer = if let Some(offer) = caller_offer_sdp {
+            if offer.trim().is_empty() {
+                let track = track_builder.build();
+                let sdp = track.local_description_trickle().await?;
+                self.peer.update_track(Box::new(track), None).await;
+                sdp
+            } else if let Some(existing) = self.find_track(track_id).await {
+                let guard = existing.lock().await;
+                guard.handshake_trickle(offer.to_string()).await?
+            } else {
+                let track = track_builder.build();
+                let processed = track.handshake_trickle(offer.to_string()).await?;
+                self.peer.update_track(Box::new(track), None).await;
+                processed
+            }
+        } else {
+            let track = track_builder.build();
+            let sdp = track.local_description_trickle().await?;
+            self.peer.update_track(Box::new(track), None).await;
+            sdp
+        };
+
+        self.answer_sdp = Some(answer.clone());
+        Ok(answer)
+    }
+
     pub async fn apply_remote_answer(
         &mut self,
         track_id: &str,
@@ -414,6 +473,15 @@ impl MediaEndpoint {
 
     pub async fn update_remote_offer(&self, track_id: &str, offer: &str) -> Result<()> {
         self.peer.update_remote_description(track_id, offer).await
+    }
+
+    pub async fn add_remote_ice_candidate(&self, track_id: &str, candidate_sdp: &str) -> Result<()> {
+        let track = self
+            .find_track(track_id)
+            .await
+            .ok_or_else(|| anyhow!("track not found: {track_id}"))?;
+        let guard = track.lock().await;
+        guard.add_remote_ice_candidate(candidate_sdp)
     }
 
     pub fn select_or_store_negotiated_audio(

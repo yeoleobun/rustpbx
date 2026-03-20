@@ -159,6 +159,70 @@ async fn test_media_track_handshake() {
 }
 
 #[tokio::test]
+async fn test_media_track_handshake_trickle_preserves_custom_dtmf_rtpmap() {
+    let caller_offer = RtpTrackBuilder::new("caller-offer-dtmf".to_string())
+        .with_mode(TransportMode::WebRtc)
+        .with_codec_info(vec![
+            negotiate::CodecInfo {
+                payload_type: 111,
+                codec: CodecType::Opus,
+                clock_rate: 48000,
+                channels: 2,
+            },
+            negotiate::CodecInfo {
+                payload_type: 110,
+                codec: CodecType::TelephoneEvent,
+                clock_rate: 48000,
+                channels: 1,
+            },
+            negotiate::CodecInfo {
+                payload_type: 126,
+                codec: CodecType::TelephoneEvent,
+                clock_rate: 8000,
+                channels: 1,
+            },
+        ])
+        .build()
+        .local_description_trickle()
+        .await
+        .unwrap();
+
+    let answerer = RtpTrackBuilder::new("answerer-dtmf".to_string())
+        .with_mode(TransportMode::WebRtc)
+        .with_codec_info(vec![
+            negotiate::CodecInfo {
+                payload_type: 111,
+                codec: CodecType::Opus,
+                clock_rate: 48000,
+                channels: 2,
+            },
+            negotiate::CodecInfo {
+                payload_type: 110,
+                codec: CodecType::TelephoneEvent,
+                clock_rate: 48000,
+                channels: 1,
+            },
+            negotiate::CodecInfo {
+                payload_type: 126,
+                codec: CodecType::TelephoneEvent,
+                clock_rate: 8000,
+                channels: 1,
+            },
+        ])
+        .build();
+
+    let answer_sdp = answerer.handshake_trickle(caller_offer).await.unwrap();
+    assert!(
+        answer_sdp.contains("a=rtpmap:110 telephone-event/48000"),
+        "trickle answer should preserve telephone-event/48000"
+    );
+    assert!(
+        answer_sdp.contains("a=rtpmap:126 telephone-event/8000"),
+        "trickle answer should preserve telephone-event/8000"
+    );
+}
+
+#[tokio::test]
 async fn test_media_track_stop() {
     let track = RtpTrackBuilder::new("test-track-stop".to_string()).build();
 

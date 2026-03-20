@@ -17,6 +17,18 @@ use tracing::{debug, info, warn};
 pub(crate) struct SessionLoopRuntime;
 
 impl SessionLoopRuntime {
+    fn is_trickle_ice_info(request: &rsip::Request) -> bool {
+        request.headers.iter().any(|header| match header {
+            rsip::Header::ContentType(value) => value
+                .to_string()
+                .eq_ignore_ascii_case("application/trickle-ice-sdpfrag"),
+            rsip::Header::Other(name, value) if name.eq_ignore_ascii_case("Content-Type") => {
+                value.eq_ignore_ascii_case("application/trickle-ice-sdpfrag")
+            }
+            _ => false,
+        })
+    }
+
     pub async fn run_server_events_loop(
         context: CallContext,
         proxy_config: Arc<crate::config::ProxyConfig>,
@@ -54,8 +66,12 @@ impl SessionLoopRuntime {
                                     cancel_token.cancel();
                                     break;
                                 }
-                                DialogState::Info(dialog_id, _request, tx_handle) => {
+                                DialogState::Info(dialog_id, request, tx_handle) => {
                                     debug!(session_id = %context.session_id, %dialog_id, "Received INFO on server dialog");
+                                    if Self::is_trickle_ice_info(&request) && !request.body.is_empty() {
+                                        let payload = String::from_utf8_lossy(&request.body).to_string();
+                                        let _ = handle.send_command(SessionAction::HandleTrickleIce(payload));
+                                    }
                                     tx_handle.reply(rsip::StatusCode::OK).await.ok();
                                 }
                                 DialogState::Updated(dialog_id, request, tx_handle) => {

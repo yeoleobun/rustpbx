@@ -494,7 +494,7 @@ impl TargetRuntime {
 
         let callee_uri = &invite_option.callee;
         let callee_realm = callee_uri.host_with_port.to_string();
-        if session.server.is_same_realm(&callee_realm).await {
+        if invite_option.destination.is_none() && session.server.is_same_realm(&callee_realm).await {
             let dialplan = &session.context.dialplan;
             let locations = session.server.locator.lookup(callee_uri).await.map_err(|e| {
                 (rsip::StatusCode::TemporarilyUnavailable, Some(e.to_string()))
