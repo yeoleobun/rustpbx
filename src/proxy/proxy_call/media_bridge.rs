@@ -522,7 +522,6 @@ impl MediaBridge {
         let mut last_seq: Option<u16> = None;
         let mut packet_count: u64 = 0;
         let target_pt = target_params.payload_type;
-
         // Stats tracking
         let mut last_stats_time = std::time::Instant::now();
         let mut packets_since_last_stat = 0;

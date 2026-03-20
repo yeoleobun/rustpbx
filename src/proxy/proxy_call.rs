@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod call_leg;
 pub(crate) mod media_bridge;
 pub(crate) mod media_peer;
 pub(crate) mod reporter;

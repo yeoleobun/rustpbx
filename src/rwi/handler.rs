@@ -357,8 +357,16 @@ fn parse_action(action: &str, params: &serde_json::Value) -> Result<RwiCommandPa
         })
     };
 
-    let req: crate::rwi::session::RwiRequest =
-        serde_json::from_value(json).map_err(|e| e.to_string())?;
+    let req: crate::rwi::session::RwiRequest = match serde_json::from_value(json) {
+        Ok(req) => req,
+        Err(error) if params.as_object().map(|o| o.is_empty()).unwrap_or(false) => {
+            let fallback_json = serde_json::json!({
+                "action": action
+            });
+            serde_json::from_value(fallback_json).map_err(|_| error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     Ok(req.into())
 }
@@ -499,6 +507,17 @@ mod tests {
         let v = process_msg(r#"{"action": "session.list_calls", "action_id": "req-1"}"#).await;
         assert_eq!(v["response"], "success");
         assert_eq!(v["action_id"], "req-1");
+    }
+
+    #[tokio::test]
+    async fn test_session_list_calls_accepts_empty_params_object() {
+        let v = process_msg(
+            r#"{"action": "session.list_calls", "action_id": "req-2", "params": {}}"#,
+        )
+        .await;
+        assert_eq!(v["response"], "success");
+        assert_eq!(v["action_id"], "req-2");
+        assert!(v["data"].is_array(), "list_calls should return array data: {v}");
     }
 
     #[tokio::test]

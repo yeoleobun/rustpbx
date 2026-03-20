@@ -43,10 +43,32 @@ async fn ws_connect(rwi_url: &str) -> WsStream {
     ws
 }
 
-/// Send a JSON message and wait for the next text frame.
+/// Send a JSON message and wait for the response frame with the matching action_id.
 async fn ws_send_recv(ws: &mut WsStream, json: &str) -> serde_json::Value {
+    let request: serde_json::Value = serde_json::from_str(json).expect("request should be JSON");
+    let action_id = request
+        .get("action_id")
+        .and_then(|v| v.as_str())
+        .expect("request missing action_id")
+        .to_string();
     ws.send(Message::Text(json.into())).await.unwrap();
-    recv_next(ws).await
+    loop {
+        let msg = timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("recv timeout")
+            .expect("stream ended")
+            .expect("ws error");
+        match msg {
+            Message::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(&t).expect("not JSON");
+                if v.get("action_id").and_then(|v| v.as_str()) == Some(action_id.as_str()) {
+                    return v;
+                }
+            }
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
 }
 
 /// Wait for the next text frame (up to 5 s).
@@ -291,7 +313,7 @@ async fn test_originate_and_bridge() {
 
     // Originate to Alice
     let call_a = format!("e2e-bridge-a-{}", Uuid::new_v4());
-    let (_, orig_a_json) = rwi_req(
+    let (_orig_a_id, orig_a_json) = rwi_req(
         "call.originate",
         serde_json::json!({
             "call_id": call_a,
@@ -310,7 +332,7 @@ async fn test_originate_and_bridge() {
 
     // Originate to Bob
     let call_b = format!("e2e-bridge-b-{}", Uuid::new_v4());
-    let (_, orig_b_json) = rwi_req(
+    let (_orig_b_id, orig_b_json) = rwi_req(
         "call.originate",
         serde_json::json!({
             "call_id": call_b,
@@ -375,7 +397,7 @@ async fn test_media_play() {
     let call_id = format!("e2e-play-{}", Uuid::new_v4());
     let destination = bob.sip_uri("bob");
 
-    let (_, orig_json) = rwi_req(
+    let (_orig_id, orig_json) = rwi_req(
         "call.originate",
         serde_json::json!({
             "call_id": call_id,
@@ -704,17 +726,13 @@ async fn test_list_calls() {
     let (_, list_json) = rwi_req("session.list_calls", serde_json::json!({}));
     let v = ws_send_recv(&mut ws, &list_json).await;
     tracing::info!("list_calls (with call): {:?}", v);
-    // Should contain at least one call
+    assert_eq!(v["response"], "success", "list_calls should succeed: {v}");
     assert!(
-        v.get("data").is_some(),
-        "list_calls response missing 'data': {:?}",
-        v
+        v["data"].is_array(),
+        "list_calls data must be an array, got: {v}"
     );
     let calls = v["data"].as_array().expect("data should be an array");
-    assert!(
-        !calls.is_empty(),
-        "list_calls should return at least one call"
-    );
+    assert!(!calls.is_empty(), "list_calls should return at least one call");
 
     ws.close(None).await.unwrap();
     bob.stop();

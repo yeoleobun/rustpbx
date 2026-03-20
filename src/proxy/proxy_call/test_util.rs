@@ -33,6 +33,9 @@ pub mod tests {
         async fn update_remote_description(&self, _track_id: &str, _sdp: &str) -> Result<()> {
             Ok(())
         }
+        async fn renegotiate_track(&self, _track_id: &str, _remote_offer: &str) -> Result<String> {
+            Ok("v=0\r\n".to_string())
+        }
         async fn suppress_forwarding(&self, _track_id: &str) {}
         async fn resume_forwarding(&self, _track_id: &str) {}
         fn is_suppressed(&self, _track_id: &str) -> bool {
