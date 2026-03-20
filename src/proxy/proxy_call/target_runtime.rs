@@ -629,7 +629,8 @@ impl TargetRuntime {
                     }
                 }
                 state = state_rx.recv() => {
-                    if let Some(DialogState::Early(_, response)) = state {
+                    if let Some(DialogState::Early(dialog_id, response)) = state {
+                        session.add_callee_dialog(dialog_id);
                         let sdp = String::from_utf8_lossy(response.body()).to_string();
                         let action = SessionAction::StartRinging{ ringback: Some(sdp), passthrough: false };
                         session.apply_session_action(action, None).await.ok();

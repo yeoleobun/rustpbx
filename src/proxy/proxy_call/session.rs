@@ -501,15 +501,7 @@ impl CallSession {
             routed_contact: self.routed_contact.clone(),
             routed_destination: self.routed_destination.clone(),
             last_queue_name: self.last_queue_name(),
-            callee_dialogs: self
-                .callee_leg
-                .sip
-                .dialog_ids
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect(),
+            callee_dialogs: self.callee_leg.sip.recorded_dialogs(),
             server_dialog_id: self.server_dialog.id(),
             extensions: self.context.dialplan.extensions.clone(),
         }
@@ -869,7 +861,7 @@ impl CallSession {
 
     pub fn add_callee_dialog(&mut self, dialog_id: DialogId) {
         {
-            let callee_dialogs = self.callee_leg.sip.dialog_ids.lock().unwrap();
+            let callee_dialogs = self.callee_leg.sip.active_dialog_ids.lock().unwrap();
             if callee_dialogs.contains(&dialog_id) {
                 return;
             }
@@ -2369,7 +2361,7 @@ impl CallSession {
 
         let server_timer = self.caller_leg.sip.session_timer.clone();
         let client_timer = self.callee_leg.sip.session_timer.clone();
-        let callee_dialogs = self.callee_leg.sip.dialog_ids.clone();
+        let callee_dialogs = self.callee_leg.sip.active_dialog_ids.clone();
         let server_dialog_clone = self.server_dialog.clone();
         let handle_for_events = self.handle.clone().unwrap();
 
