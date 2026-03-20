@@ -1,16 +1,74 @@
 use crate::call::RingbackMode;
 use crate::proxy::proxy_call::caller_negotiation;
 use crate::proxy::proxy_call::session::CallSession;
+use crate::proxy::proxy_call::sip_leg::TRICKLE_ICE_TAG;
 use crate::proxy::proxy_call::state::ProxyCallEvent;
 use anyhow::{Result, anyhow};
 use rsip::StatusCode;
 use rsipstack::dialog::DialogId;
 use std::time::Instant;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
 pub(crate) struct AnswerRuntime;
 
 impl AnswerRuntime {
+    fn trickle_ice_enabled(session: &CallSession) -> bool {
+        session.caller_leg.sip.supports_trickle_ice
+            && session
+                .caller_leg
+                .offer_sdp
+                .as_deref()
+                .map(CallSession::is_webrtc_sdp)
+                .unwrap_or(false)
+    }
+
+    async fn spawn_inbound_trickle_ice_sender(session: &CallSession) {
+        let server_dialog = session.server_dialog.clone();
+        let cancel_token = session.cancel_token.child_token();
+        let session_id = session.context.session_id.clone();
+        let Some((_pc, mut candidate_rx, mut gathering_rx)) =
+            session.caller_leg.media.trickle_ice_context("caller-track").await
+        else {
+            return;
+        };
+        crate::utils::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    candidate = candidate_rx.recv() => match candidate {
+                        Ok(candidate) => {
+                            let body = format!("a=mid:0\r\na=candidate:{}\r\n", candidate.to_sdp());
+                            let headers = vec![
+                                rsip::Header::ContentType("application/trickle-ice-sdpfrag".into()),
+                            ];
+                            if let Err(err) = server_dialog.info(Some(headers), Some(body.into_bytes())).await {
+                                warn!(session_id = %session_id, error = %err, "Failed to send local trickle ICE candidate");
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    changed = gathering_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *gathering_rx.borrow() == rustrtc::IceGatheringState::Complete {
+                            let headers = vec![
+                                rsip::Header::ContentType("application/trickle-ice-sdpfrag".into()),
+                            ];
+                            let body = "a=mid:0\r\na=end-of-candidates\r\n".as_bytes().to_vec();
+                            if let Err(err) = server_dialog.info(Some(headers), Some(body)).await {
+                                warn!(session_id = %session_id, error = %err, "Failed to send end-of-candidates");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start_ringing(session: &mut CallSession, answer: String) {
         Self::start_ringing_internal(session, answer, None).await;
     }
@@ -235,7 +293,12 @@ impl AnswerRuntime {
                     &session.context.dialplan.allow_codecs,
                     session.use_media_proxy,
                 ) {
-                    match session.build_caller_answer(codec_info).await {
+                    let build_result = if Self::trickle_ice_enabled(session) {
+                        session.build_caller_answer_trickle(codec_info).await
+                    } else {
+                        session.build_caller_answer(codec_info).await
+                    };
+                    match build_result {
                         Ok(optimized_answer) => session.set_answer(optimized_answer),
                         Err(e) => warn!(
                             session_id = %session.context.session_id,
@@ -248,13 +311,23 @@ impl AnswerRuntime {
         }
 
         if session.caller_leg.answer_sdp.is_none() {
-            let answer_for_caller = session
-                .build_caller_answer(
-                    caller_negotiation::build_passthrough_caller_answer_codec_info(
-                        session.caller_leg.offer_sdp.as_deref(),
-                    ),
-                )
-                .await?;
+            let answer_for_caller = if Self::trickle_ice_enabled(session) {
+                session
+                    .build_caller_answer_trickle(
+                        caller_negotiation::build_passthrough_caller_answer_codec_info(
+                            session.caller_leg.offer_sdp.as_deref(),
+                        ),
+                    )
+                    .await?
+            } else {
+                session
+                    .build_caller_answer(
+                        caller_negotiation::build_passthrough_caller_answer_codec_info(
+                            session.caller_leg.offer_sdp.as_deref(),
+                        ),
+                    )
+                    .await?
+            };
             session.set_answer(answer_for_caller);
         }
 
@@ -316,12 +389,20 @@ impl AnswerRuntime {
                 ));
             }
         }
+        if session.caller_leg.sip.supports_trickle_ice {
+            headers.push(rsip::Header::Supported(
+                rsip::headers::Supported::from(TRICKLE_ICE_TAG).into(),
+            ));
+        }
 
         if let Err(e) = session.server_dialog.accept(
             Some(headers),
             session.caller_leg.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
         ) {
             return Err(anyhow!("Failed to send 200 OK: {}", e));
+        }
+        if first_answer && Self::trickle_ice_enabled(session) {
+            Self::spawn_inbound_trickle_ice_sender(session).await;
         }
         session.mark_active_call_answered();
         if first_answer {

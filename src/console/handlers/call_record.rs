@@ -211,6 +211,7 @@ async fn download_call_record_sip_flow(
 
     for (item, role, cid) in flow_items {
         let raw_message = String::from_utf8_lossy(&item.payload).to_string();
+        let (src_role, dst_role) = classify_sip_flow_roles(&role, &raw_message);
         flow_json.push(json!({
             "timestamp": item.timestamp,
             "seq": item.seq,
@@ -219,6 +220,9 @@ async fn download_call_record_sip_flow(
             "dst_addr": item.dst_addr,
             "raw_message": raw_message,
             "role": role,
+            "leg_role": role,
+            "src_role": src_role,
+            "dst_role": dst_role,
             "call_id": cid,
         }));
     }
@@ -243,6 +247,29 @@ async fn download_call_record_sip_flow(
         "rtp_streams": rtp_streams,
     }))
     .into_response()
+}
+
+fn classify_sip_flow_roles(role: &str, raw_message: &str) -> (&'static str, &'static str) {
+    let first_line = raw_message.lines().next().unwrap_or_default().trim();
+    let is_response = first_line.starts_with("SIP/2.0");
+    match role.to_ascii_lowercase().as_str() {
+        "caller" | "primary" | "leg-a" => {
+            if is_response {
+                ("pbx", "leg-a")
+            } else {
+                ("leg-a", "pbx")
+            }
+        }
+        "callee" | "leg-b" => {
+            if is_response {
+                ("leg-b", "pbx")
+            } else {
+                ("pbx", "leg-b")
+            }
+        }
+        "pbx" | "b2bua" => ("pbx", "pbx"),
+        _ => ("", ""),
+    }
 }
 
 async fn stream_call_recording(
@@ -1140,6 +1167,16 @@ fn build_record_payload(
     state: &ConsoleState,
     inline_recording_url: Option<&str>,
 ) -> Value {
+    build_record_payload_with_cdr(record, related, state, inline_recording_url, None)
+}
+
+fn build_record_payload_with_cdr(
+    record: &CallRecordModel,
+    related: &RelatedContext,
+    state: &ConsoleState,
+    inline_recording_url: Option<&str>,
+    cdr: Option<&CdrData>,
+) -> Value {
     let tags = extract_tags(&record.tags);
     let extension_number = record
         .extension_id
@@ -1172,13 +1209,36 @@ fn build_record_payload(
     let rewrite_caller_final = caller_uri.clone();
     let rewrite_callee_original = record.rewrite_original_to.clone();
     let rewrite_callee_final = callee_uri.clone();
-    let rewrite_contact = Option::<String>::None;
-    let rewrite_destination = Option::<String>::None;
-    let status_code = Option::<u16>::None;
-    let ring_time = Option::<String>::None;
-    let answer_time = Option::<String>::None;
-    let hangup_reason = Option::<String>::None;
-    let hangup_messages = Vec::<Value>::new();
+    let rewrite_contact = cdr
+        .and_then(|data| data.record.details.rewrite.contact.clone())
+        .filter(|value| !value.is_empty());
+    let rewrite_destination = cdr
+        .and_then(|data| data.record.details.rewrite.destination.clone())
+        .filter(|value| !value.is_empty());
+    let status_code = cdr.map(|data| data.record.status_code);
+    let ring_time = cdr.and_then(|data| data.record.ring_time.map(|dt| dt.to_rfc3339()));
+    let answer_time = cdr.and_then(|data| data.record.answer_time.map(|dt| dt.to_rfc3339()));
+    let hangup_reason = cdr.and_then(|data| {
+        data.record
+            .hangup_reason
+            .as_ref()
+            .map(|reason| reason.to_string())
+    });
+    let hangup_messages = cdr
+        .map(|data| {
+            data.record
+                .hangup_messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "code": message.code,
+                        "reason": message.reason,
+                        "target": message.target,
+                    })
+                })
+                .collect::<Vec<Value>>()
+        })
+        .unwrap_or_default();
 
     json!({
         "id": record.id,
@@ -1245,13 +1305,6 @@ fn build_recording_payload(
         }
     } else if let Some(fallback) = inline_recording_url {
         fallback.to_string()
-    } else if state
-        .sip_server()
-        .map(|server| server.sip_flow.is_some())
-        .unwrap_or(false)
-    {
-        // If sipflow is enabled, allow trying to play/download the recording
-        state.url_for(&format!("/call-records/{}/recording", record.id))
     } else {
         return None;
     };
@@ -1274,14 +1327,6 @@ fn derive_recording_download_url(state: &ConsoleState, record: &CallRecordModel)
         } else {
             return Some(state.url_for(&format!("/call-records/{}/recording", record.id)));
         }
-    }
-
-    if state
-        .sip_server()
-        .map(|server| server.sip_flow.is_some())
-        .unwrap_or(false)
-    {
-        return Some(state.url_for(&format!("/call-records/{}/recording", record.id)));
     }
 
     None
@@ -1403,8 +1448,13 @@ fn build_detail_payload(
 ) -> Value {
     let inline_recording_url = select_recording_path(record, cdr)
         .map(|_| state.url_for(&format!("/call-records/{}/recording", record.id)));
-    let record_payload =
-        build_record_payload(record, related, state, inline_recording_url.as_deref());
+    let record_payload = build_record_payload_with_cdr(
+        record,
+        related,
+        state,
+        inline_recording_url.as_deref(),
+        cdr,
+    );
     let participants = build_participants(record, related);
 
     let media_metrics = json!({
@@ -1720,6 +1770,71 @@ mod tests {
             .expect("related context");
         let payload = build_record_payload(&record, &related, &state, None);
         assert_eq!(payload["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn build_record_payload_uses_cdr_timeline_fields() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        let started_at = Utc::now();
+        let ring_time = started_at + chrono::Duration::seconds(1);
+        let answer_time = started_at + chrono::Duration::seconds(2);
+
+        let record = call_record::ActiveModel {
+            call_id: Set("call-2".into()),
+            direction: Set("outbound".into()),
+            status: Set("completed".into()),
+            started_at: Set(started_at),
+            ended_at: Set(Some(started_at + chrono::Duration::seconds(8))),
+            duration_secs: Set(8),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert call record");
+
+        let related = load_related_context(&db, &[record.clone()])
+            .await
+            .expect("related context");
+
+        let cdr = CdrData {
+            record: crate::callrecord::CallRecord {
+                call_id: "call-2".into(),
+                start_time: started_at,
+                ring_time: Some(ring_time),
+                answer_time: Some(answer_time),
+                end_time: started_at + chrono::Duration::seconds(8),
+                caller: "sip:1001@localhost".into(),
+                callee: "sip:3007@192.168.3.7:5060".into(),
+                status_code: 200,
+                hangup_reason: Some(crate::callrecord::CallRecordHangupReason::ByCaller),
+                hangup_messages: vec![crate::callrecord::CallRecordHangupMessage {
+                    code: 200,
+                    reason: Some("OK".into()),
+                    target: Some("callee".into()),
+                }],
+                recorder: vec![],
+                sip_leg_roles: HashMap::new(),
+                details: crate::callrecord::CallDetails::default(),
+                extensions: http::Extensions::default(),
+            },
+            raw_content: String::new(),
+            cdr_path: String::new(),
+            storage: None,
+        };
+
+        let payload = build_record_payload_with_cdr(&record, &related, &state, None, Some(&cdr));
+
+        assert_eq!(payload["ring_time"], ring_time.to_rfc3339());
+        assert_eq!(payload["answer_time"], answer_time.to_rfc3339());
+        assert_eq!(payload["status_code"], 200);
+        assert_eq!(payload["hangup_reason"], "caller");
+        assert_eq!(payload["hangup_messages"][0]["code"], 200);
     }
 
     #[tokio::test]

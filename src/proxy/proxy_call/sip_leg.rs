@@ -2,7 +2,7 @@ use crate::call::sip::DialogStateReceiverGuard;
 use crate::call::Location;
 use crate::proxy::proxy_call::call_leg::CallLegDirection;
 use crate::proxy::proxy_call::session_timer::{
-    HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, TIMER_TAG, get_header_value,
+    HEADER_SESSION_EXPIRES, HEADER_SUPPORTED, SessionRefresher, SessionTimerState, TIMER_TAG, get_header_value,
     has_timer_support, parse_session_expires,
 };
 use anyhow::Result;
@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+pub(crate) const TRICKLE_ICE_TAG: &str = "trickle-ice";
+
 pub(crate) struct SipLeg {
     #[allow(dead_code)]
     pub role: CallLegDirection,
@@ -25,6 +27,7 @@ pub(crate) struct SipLeg {
     pub dialog_event_tx: Option<mpsc::UnboundedSender<DialogState>>,
     pub dialog_guards: Vec<DialogStateReceiverGuard>,
     pub session_timer: Arc<Mutex<SessionTimerState>>,
+    pub supports_trickle_ice: bool,
 }
 
 impl SipLeg {
@@ -36,7 +39,24 @@ impl SipLeg {
             dialog_event_tx: None,
             dialog_guards: Vec::new(),
             session_timer: Arc::new(Mutex::new(SessionTimerState::default())),
+            supports_trickle_ice: false,
         }
+    }
+
+    pub fn has_trickle_ice_support(headers: &rsip::Headers) -> bool {
+        headers.iter().any(|h| match h {
+            rsip::Header::Supported(s) => s
+                .to_string()
+                .split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case(TRICKLE_ICE_TAG)),
+            rsip::Header::Other(n, v) if n.eq_ignore_ascii_case(HEADER_SUPPORTED) => v
+                .split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case(TRICKLE_ICE_TAG)),
+            rsip::Header::Other(n, v) if n.eq_ignore_ascii_case("X-RustPBX-Trickle-ICE") => {
+                matches!(v.trim(), "1" | "true" | "yes")
+            }
+            _ => false,
+        })
     }
 
     pub fn add_dialog(&self, dialog_id: DialogId) {

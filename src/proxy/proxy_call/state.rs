@@ -66,6 +66,7 @@ pub enum SessionAction {
         initiator: Option<String>,
     },
     HandleReInvite(String, String), // (method, sdp)
+    HandleTrickleIce(String),
     RefreshSession,
     MuteTrack(String),
     UnmuteTrack(String),

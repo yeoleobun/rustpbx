@@ -2,13 +2,14 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::CodecType;
 use rustrtc::{
-    Attribute, IceServer, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-    SessionDescription, TransceiverDirection, TransportMode,
+    Attribute, IceGatheringState, IceServer, MediaKind, PeerConnection, RtcConfiguration,
+    RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection, TransportMode,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
+use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -83,10 +84,27 @@ fn audio_frame_timing(codec: CodecType, rtp_clock_rate: u32) -> AudioFrameTiming
 pub trait Track: Send + Sync {
     fn id(&self) -> &str;
     async fn handshake(&self, remote_offer: String) -> Result<String>;
+    async fn handshake_trickle(&self, remote_offer: String) -> Result<String> {
+        self.handshake(remote_offer).await
+    }
     async fn local_description(&self) -> Result<String>;
+    async fn local_description_trickle(&self) -> Result<String> {
+        self.local_description().await
+    }
     async fn set_remote_description(&self, remote: &str) -> Result<()>;
     async fn stop(&self);
     async fn get_peer_connection(&self) -> Option<rustrtc::PeerConnection>;
+    fn subscribe_ice_candidates(
+        &self,
+    ) -> Option<broadcast::Receiver<rustrtc::transports::ice::IceCandidate>> {
+        None
+    }
+    fn subscribe_ice_gathering_state(&self) -> Option<tokio::sync::watch::Receiver<IceGatheringState>> {
+        None
+    }
+    fn add_remote_ice_candidate(&self, _candidate_sdp: &str) -> Result<()> {
+        Ok(())
+    }
     async fn set_recorder_option(&mut self, _option: RecorderOption) {}
     fn set_codec_preference(&mut self, _codecs: Vec<CodecType>) {
         // Optional: override to set codec preference
@@ -333,12 +351,54 @@ impl Track for RtcTrack {
         Ok(sdp)
     }
 
+    async fn handshake_trickle(&self, remote_offer: String) -> Result<String> {
+        self.set_remote(&self.pc, &remote_offer, SdpType::Offer)
+            .await?;
+        let mut answer = self.pc.create_answer().await?;
+        if let Some(section) = answer
+            .media_sections
+            .iter_mut()
+            .find(|m| m.kind == MediaKind::Audio)
+        {
+            section
+                .attributes
+                .retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+        }
+        self.set_local(&self.pc, answer).await
+    }
+
     async fn local_description(&self) -> Result<String> {
         self.pc.wait_for_gathering_complete().await;
         match self.pc.create_offer().await {
             Ok(offer) => {
                 let sdp = self.set_local(&self.pc, offer).await?;
                 Ok(sdp)
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("HaveLocalOffer") {
+                    if let Some(desc) = self.pc.local_description() {
+                        return Ok(desc.to_sdp_string());
+                    }
+                }
+                Err(anyhow!(e))
+            }
+        }
+    }
+
+    async fn local_description_trickle(&self) -> Result<String> {
+        match self.pc.create_offer().await {
+            Ok(mut offer) => {
+                if let Some(section) = offer
+                    .media_sections
+                    .iter_mut()
+                    .find(|m| m.kind == MediaKind::Audio)
+                {
+                    section
+                        .attributes
+                        .retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+                }
+                self.set_local(&self.pc, offer).await
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -363,6 +423,24 @@ impl Track for RtcTrack {
 
     async fn get_peer_connection(&self) -> Option<PeerConnection> {
         Some(self.pc.clone())
+    }
+
+    fn subscribe_ice_candidates(
+        &self,
+    ) -> Option<broadcast::Receiver<rustrtc::transports::ice::IceCandidate>> {
+        Some(self.pc.subscribe_ice_candidates())
+    }
+
+    fn subscribe_ice_gathering_state(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<IceGatheringState>> {
+        Some(self.pc.subscribe_ice_gathering_state())
+    }
+
+    fn add_remote_ice_candidate(&self, candidate_sdp: &str) -> Result<()> {
+        let candidate = rustrtc::transports::ice::IceCandidate::from_sdp(candidate_sdp)?;
+        self.pc.add_ice_candidate(candidate)?;
+        Ok(())
     }
 
     fn preferred_codec_info(&self) -> Option<negotiate::CodecInfo> {

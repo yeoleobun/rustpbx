@@ -737,6 +737,7 @@
             mediaMetrics: {},
             roleMap: new Map(),
             rolePortMap: {},
+            roleHostMap: {},
             rtpStreams: [],
 
             updateUrl: '',
@@ -2148,6 +2149,8 @@
             // Identify roles from SIP flow entries
             identifyRoles() {
                 this.roleMap.clear();
+                this.rolePortMap = {};
+                this.roleHostMap = {};
 
                 if (!this.sipFlowEntries || this.sipFlowEntries.length === 0) {
                     console.warn('No sipFlowEntries found');
@@ -2173,12 +2176,16 @@
                     // Leg A is the source of first INVITE
                     const legAAddr = this.normalizeAddr(firstInvite.src_addr);
                     const legAPort = this.extractPort(firstInvite.src_addr);
+                    const legAHost = this.extractHost(firstInvite.src_addr);
                     this.roleMap.set(legAAddr, 'leg-a');
+                    if (legAHost) this.roleHostMap[legAHost] = 'leg-a';
 
                     // PBX is the destination of first INVITE
                     const pbxAddr = this.normalizeAddr(firstInvite.dst_addr);
                     const pbxPort = this.extractPort(firstInvite.dst_addr);
+                    const pbxHost = this.extractHost(firstInvite.dst_addr);
                     this.roleMap.set(pbxAddr, 'pbx');
+                    if (pbxHost) this.roleHostMap[pbxHost] = 'pbx';
 
                     // Find PBX's INVITE to Leg B
                     const pbxInvite = sipMessages.find(e =>
@@ -2190,7 +2197,9 @@
                     if (pbxInvite) {
                         const legBAddr = this.normalizeAddr(pbxInvite.dst_addr);
                         const legBPort = this.extractPort(pbxInvite.dst_addr);
+                        const legBHost = this.extractHost(pbxInvite.dst_addr);
                         this.roleMap.set(legBAddr, 'leg-b');
+                        if (legBHost) this.roleHostMap[legBHost] = 'leg-b';
 
                         // Store ports for fallback matching
                         this.rolePortMap = {
@@ -2251,6 +2260,14 @@
                 return parts.length > 1 ? parts[1] : null;
             },
 
+            extractHost(addr) {
+                const normalized = this.normalizeAddr(addr);
+                if (!normalized) return null;
+                const idx = normalized.lastIndexOf(':');
+                if (idx === -1) return normalized;
+                return normalized.substring(0, idx);
+            },
+
             // Normalize address for comparison (keep IP:port for local scenarios)
             normalizeAddr(addr) {
                 if (!addr) return '';
@@ -2273,6 +2290,15 @@
                                 break;
                             }
                         }
+                    }
+                }
+
+                // In-dialog requests can legitimately target a different contact port.
+                // Fall back to host matching so the timeline still renders the message.
+                if (!role && this.roleHostMap) {
+                    const host = this.extractHost(addr);
+                    if (host && this.roleHostMap[host]) {
+                        role = this.roleHostMap[host];
                     }
                 }
 

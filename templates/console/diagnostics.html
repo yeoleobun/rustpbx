@@ -975,6 +975,22 @@
                                         placeholder="••••••">
                                 </label>
                             </div>
+                            <div class="rounded-lg border border-slate-200 bg-slate-50/80 px-4 py-3" x-show="callMode === 'standard'">
+                                <label class="flex items-start gap-3">
+                                    <input type="checkbox" x-model="sipForm.trickleIce"
+                                        class="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400">
+                                    <span class="space-y-1">
+                                        <span class="block text-sm font-semibold text-slate-700">{{ "diagnostics.enable_trickle_ice" | t }}</span>
+                                    </span>
+                                </label>
+                            </div>
+                            <label class="flex flex-col gap-1.5" x-show="callMode === 'standard'">
+                                <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{ "diagnostics.label_ice_servers" | t }}</span>
+                                <textarea x-model.trim="sipForm.iceServersText" rows="5"
+                                    class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    placeholder="stun:stun.l.google.com:19302"></textarea>
+                                <span class="text-[11px] text-slate-400">{{ "diagnostics.ice_servers_hint" | t }}</span>
+                            </label>
                             <div>
                                 <template x-for="plugin in activePlugins" :key="plugin.id">
                                     <div x-html="plugin.ui_form" x-show="callMode === plugin.mode" class="mb-4"></div>
@@ -1249,7 +1265,14 @@
                 let sipUa = null;
                 let sipSession = null;
                 const RECENT_TARGETS_KEY = 'rustpbx.console.sipRecentTargets';
-                const FALLBACK_ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302'] }];
+                const DEFAULT_ICE_SERVER_LINES = [
+                    'stun:stun.l.google.com:19302',
+                    'stun:stun1.l.google.com:19302',
+                    'stun:stun2.l.google.com:19302',
+                    'stun:stun3.l.google.com:19302',
+                    'stun:stun4.l.google.com:19302',
+                ];
+                const FALLBACK_ICE_SERVERS = DEFAULT_ICE_SERVER_LINES.map((url) => ({ urls: [url] }));
                 return {
                     t: {},
                     init() {
@@ -1339,7 +1362,16 @@
                     dialogCallIdInput: '',
                     dialogCallId: '',
                     dialer: {},
-                    sipForm: { wsServer: '', uri: '', authUser: '', password: '', displayName: '', target: '' },
+                    sipForm: {
+                        wsServer: '',
+                        uri: '',
+                        authUser: '',
+                        password: '',
+                        displayName: '',
+                        target: '',
+                        trickleIce: false,
+                        iceServersText: DEFAULT_ICE_SERVER_LINES.join('\n'),
+                    },
                     sipUaReady: false,
                     get hasSipUa() {
                         return Boolean(this.sipUaReady);
@@ -1661,7 +1693,26 @@
                             })
                             .filter(Boolean);
                     },
+                    manualIceServers() {
+                        const raw = String(this.sipForm.iceServersText || '');
+                        const urls = raw
+                            .split(/\r?\n|,/)
+                            .map((line) => line.trim())
+                            .filter(Boolean)
+                            .map((line) => (/^(stun|turn|turns):/i.test(line) ? line : `stun:${line}`));
+                        if (!urls.length) {
+                            return [];
+                        }
+                        return this.normalizeIceServers(urls.map((url) => ({ urls: [url] })));
+                    },
                     async ensureIceServers(options = {}) {
+                        const manualServers = this.manualIceServers();
+                        if (manualServers.length) {
+                            this.sipIceServers = manualServers;
+                            this.sipIceServersError = null;
+                            this.sipIceServersFetched = true;
+                            return this.sipIceServers;
+                        }
                         const force = Boolean(options?.force);
                         if (this.sipIceServersPromise) {
                             try {
@@ -1992,6 +2043,9 @@
                             this.ensureTransportTap();
                         }
                     },
+                    isActiveSipUa(ua) {
+                        return Boolean(ua && sipUa === ua);
+                    },
                     async registerSip() {
                         if (this.sipRegistering) {
                             return;
@@ -2063,12 +2117,18 @@
                         sipUa = ua;
                         this.sipUaReady = true;
                         ua.on('connected', () => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             this.appendSipEvent('WebSocket connected', 'success');
                             this.setSipStatus(this.t.sip_status_connected || 'Connected', 'pending');
                             this.ensureTransportTap();
                             this.sipUaReady = true;
                         });
                         ua.on('disconnected', () => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             this.appendSipEvent('WebSocket disconnected', 'warning');
                             this.setSipStatus(this.sipRegistered ? (this.t.sip_status_disconnected || 'Disconnected') : (this.t.sip_status_unregistered || 'Unregistered'), this.sipRegistered ? 'error' : 'idle');
                             this.sipRegistered = false;
@@ -2077,6 +2137,9 @@
                             this.resetSipSessionState();
                         });
                         ua.on('registered', () => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             this.sipRegistered = true;
                             this.sipRegistering = false;
                             this.appendSipEvent('Registered', 'success');
@@ -2085,6 +2148,9 @@
                             this.sipUaReady = true;
                         });
                         ua.on('unregistered', () => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             this.appendSipEvent('Unregistered', 'info');
                             this.setSipStatus(this.t.sip_status_unregistered || 'Unregistered', 'idle');
                             this.sipRegistered = false;
@@ -2094,6 +2160,9 @@
                             }
                         });
                         ua.on('registrationFailed', (data) => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             const cause = data?.cause || 'unknown';
                             this.appendSipEvent(`Registration failed: ${cause}`, 'error');
                             this.sipRegisterError = `Registration failed: ${cause}`;
@@ -2108,6 +2177,9 @@
                             }
                         });
                         ua.on('newRTCSession', (data) => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             const session = data.session;
                             if (sipSession && session !== sipSession) {
                                 this.appendSipEvent('Rejecting concurrent session (busy).', 'warning');
@@ -2126,6 +2198,9 @@
                             }
                         });
                         ua.on('newMessage', (data) => {
+                            if (!this.isActiveSipUa(ua)) {
+                                return;
+                            }
                             const originator = data.originator === 'remote' ? 'incoming' : 'outgoing';
                             this.appendSipEvent(`${originator === 'incoming' ? 'Received' : 'Sent'} MESSAGE`, 'info');
                         });
@@ -2206,6 +2281,10 @@
                             rtcOfferConstraints: { offerToReceiveAudio: true, offerToReceiveVideo: false },
                             sessionTimersExpires: 120,
                         };
+                        const extraHeaders = this.buildSipExtraHeaders();
+                        if (extraHeaders.length) {
+                            options.extraHeaders = extraHeaders;
+                        }
                         const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
                         if (iceServers.length) {
                             options.pcConfig = { iceServers };
@@ -2247,6 +2326,10 @@
                                 mediaStream: stream,
                                 mediaConstraints: { audio: true, video: false },
                             };
+                            const extraHeaders = this.buildSipExtraHeaders();
+                            if (extraHeaders.length) {
+                                options.extraHeaders = extraHeaders;
+                            }
                             const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
                             if (iceServers.length) {
                                 options.pcConfig = { iceServers };
@@ -2273,6 +2356,10 @@
                         this.resetSipSessionState();
                     },
                     bindSipSession(session, direction) {
+                        if (!session || session.__rustpbxSessionBound) {
+                            return;
+                        }
+                        session.__rustpbxSessionBound = true;
                         // Clean up any previous session state to prevent audio bleeding
                         if (this.sipRemoteStream) {
                             try {
@@ -2330,9 +2417,40 @@
                         session.on('peerconnection', (event) => {
                             this.handlePeerConnection(event?.peerconnection || session.connection);
                         });
+                        session.on('icecandidate', (event) => {
+                            this.handleSessionIceCandidate(session, event);
+                        });
 
                         if (session.connection) {
                             this.handlePeerConnection(session.connection);
+                        }
+                    },
+                    buildSipExtraHeaders() {
+                        if (!this.sipForm.trickleIce) {
+                            return [];
+                        }
+                        return ['Supported: trickle-ice', 'X-RustPBX-Trickle-ICE: 1'];
+                    },
+                    handleSessionIceCandidate(session, event) {
+                        if (!session || !this.sipForm.trickleIce) {
+                            return;
+                        }
+                        if (session.__rustpbxTrickleInviteReleased) {
+                            return;
+                        }
+                        const candidate = event?.candidate || null;
+                        if (!candidate || !candidate.candidate) {
+                            if (typeof event?.ready === 'function') {
+                                session.__rustpbxTrickleInviteReleased = true;
+                                event.ready();
+                                this.appendSipEvent('Sent INVITE after ICE gathering finished', 'info');
+                            }
+                            return;
+                        }
+                        if (typeof event.ready === 'function') {
+                            session.__rustpbxTrickleInviteReleased = true;
+                            event.ready();
+                            this.appendSipEvent('Sent INVITE after first ICE candidate', 'info');
                         }
                     },
                     handlePeerConnection(pc) {
