@@ -29,12 +29,12 @@ impl CallReporter {
         let start_time =
             now - Duration::from_std(self.context.start_time.elapsed()).unwrap_or_default();
 
-        let ring_time = snapshot.ring_time.map(|rt| {
+        let ring_time = snapshot.ring_time.map(|rt: std::time::Instant| {
             start_time
                 + Duration::from_std(rt.duration_since(self.context.start_time)).unwrap_or_default()
         });
 
-        let answer_time = snapshot.answer_time.map(|at| {
+        let answer_time = snapshot.answer_time.map(|at: std::time::Instant| {
             start_time
                 + Duration::from_std(at.duration_since(self.context.start_time)).unwrap_or_default()
         });
@@ -42,7 +42,7 @@ impl CallReporter {
         let status_code = snapshot
             .last_error
             .as_ref()
-            .map(|(code, _)| u16::from(code.clone()))
+            .map(|(code, _): &(rsip::StatusCode, Option<String>)| u16::from(code.clone()))
             .unwrap_or(200);
 
         let hangup_reason = snapshot.hangup_reason.clone().or_else(|| {
@@ -94,7 +94,7 @@ impl CallReporter {
         let last_error = snapshot
             .last_error
             .as_ref()
-            .map(|(code, reason)| CallRecordLastError {
+            .map(|(code, reason): &(rsip::StatusCode, Option<String>)| CallRecordLastError {
                 code: u16::from(code.clone()),
                 reason: reason.clone(),
             });
