@@ -22,7 +22,8 @@ pub(crate) const TRICKLE_ICE_TAG: &str = "trickle-ice";
 pub(crate) struct SipLeg {
     #[allow(dead_code)]
     pub role: CallLegDirection,
-    pub dialog_ids: Arc<Mutex<HashSet<DialogId>>>,
+    pub active_dialog_ids: Arc<Mutex<HashSet<DialogId>>>,
+    pub recorded_dialog_ids: Arc<Mutex<HashSet<DialogId>>>,
     pub connected_dialog_id: Option<DialogId>,
     pub dialog_event_tx: Option<mpsc::UnboundedSender<DialogState>>,
     pub dialog_guards: Vec<DialogStateReceiverGuard>,
@@ -34,7 +35,8 @@ impl SipLeg {
     pub fn new(role: CallLegDirection) -> Self {
         Self {
             role,
-            dialog_ids: Arc::new(Mutex::new(HashSet::new())),
+            active_dialog_ids: Arc::new(Mutex::new(HashSet::new())),
+            recorded_dialog_ids: Arc::new(Mutex::new(HashSet::new())),
             connected_dialog_id: None,
             dialog_event_tx: None,
             dialog_guards: Vec::new(),
@@ -60,8 +62,21 @@ impl SipLeg {
     }
 
     pub fn add_dialog(&self, dialog_id: DialogId) {
-        let mut dialogs = self.dialog_ids.lock().unwrap();
-        dialogs.insert(dialog_id);
+        {
+            let mut dialogs = self.active_dialog_ids.lock().unwrap();
+            dialogs.insert(dialog_id.clone());
+        }
+        let mut recorded = self.recorded_dialog_ids.lock().unwrap();
+        recorded.insert(dialog_id);
+    }
+
+    pub fn recorded_dialogs(&self) -> Vec<DialogId> {
+        self.recorded_dialog_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn set_connected_dialog(&mut self, dialog_id: DialogId) {

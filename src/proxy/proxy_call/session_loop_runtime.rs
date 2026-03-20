@@ -137,8 +137,8 @@ impl SessionLoopRuntime {
                             match state {
                                 DialogState::Terminated(dialog_id, reason) => {
                                     let is_active = {
-                                        let dialogs = callee_dialogs.lock().unwrap();
-                                        dialogs.contains(&dialog_id)
+                                        let mut dialogs = callee_dialogs.lock().unwrap();
+                                        dialogs.remove(&dialog_id)
                                     };
                                     if is_active {
                                         info!(session_id = %context.session_id, reason = ?reason, %dialog_id, "Callee dialog terminated");

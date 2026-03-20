@@ -422,7 +422,7 @@
 
                                                 <!-- Caller Column -->
                                                 <div class="relative">
-                                                    <template x-if="getRole(entry.src_addr) === 'leg-a'">
+                                                    <template x-if="showsCallerToPbx(entry)">
                                                         <div>
                                                             <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
                                                                 :class="getMessageColorClass(entry.raw_message)">
@@ -448,7 +448,7 @@
                                                 <div class="relative">
                                                     <!-- PBX to Caller (PBX sends response back) -->
                                                     <template
-                                                        x-if="getRole(entry.src_addr) === 'pbx' && (getRole(entry.dst_addr) === 'leg-a' || entry._correctedDstRole === 'leg-a')">
+                                                        x-if="showsPbxToCaller(entry)">
                                                         <div>
                                                             <!-- Arrow Left -->
                                                             <div
@@ -470,7 +470,7 @@
 
                                                     <!-- PBX to Callee (PBX forwards request) -->
                                                     <template
-                                                        x-if="getRole(entry.src_addr) === 'pbx' && (getRole(entry.dst_addr) === 'leg-b' || entry._correctedDstRole === 'leg-b')">
+                                                        x-if="showsPbxToCallee(entry)">
                                                         <div>
                                                             <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
                                                                 :class="getMessageColorClass(entry.raw_message)">
@@ -493,7 +493,7 @@
 
                                                     <!-- PBX internal messages (same src and dst, no correction) -->
                                                     <template
-                                                        x-if="getRole(entry.src_addr) === 'pbx' && getRole(entry.dst_addr) === 'pbx' && !entry._correctedDstRole">
+                                                        x-if="showsInternalPbx(entry)">
                                                         <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md border-dashed"
                                                             :class="getMessageColorClass(entry.raw_message)">
                                                             <div class="font-semibold whitespace-nowrap"
@@ -505,7 +505,7 @@
                                                 <!-- Callee Column -->
                                                 <div class="relative">
                                                     <!-- Only show messages FROM leg-b (callee sends) -->
-                                                    <template x-if="getRole(entry.src_addr) === 'leg-b'">
+                                                    <template x-if="showsCalleeToPbx(entry)">
                                                         <div>
                                                             <!-- Arrow Left -->
                                                             <div
@@ -2303,6 +2303,112 @@
                 }
 
                 return role || null;
+            },
+
+            normalizeLegRole(value) {
+                const role = (value || '').toString().trim().toLowerCase();
+                if (role === 'caller' || role === 'primary') {
+                    return 'leg-a';
+                }
+                if (role === 'callee') {
+                    return 'leg-b';
+                }
+                if (role === 'leg-a' || role === 'leg-b' || role === 'pbx') {
+                    return role;
+                }
+                return null;
+            },
+
+            getEntrySrcRole(entry) {
+                const explicitSrc = this.normalizeLegRole(entry?.src_role);
+                if (explicitSrc) {
+                    return explicitSrc;
+                }
+                const inferredSrc = this.getRole(entry?.src_addr);
+                const inferredDst = this.getRole(entry?.dst_addr);
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+
+                if (explicit === 'leg-a' || explicit === 'leg-b') {
+                    if (inferredSrc === 'pbx') {
+                        return 'pbx';
+                    }
+                    if (inferredDst === 'pbx') {
+                        return explicit;
+                    }
+                }
+
+                return inferredSrc;
+            },
+
+            getEntryDstRole(entry) {
+                const explicitDst = this.normalizeLegRole(entry?.dst_role);
+                if (explicitDst) {
+                    return explicitDst;
+                }
+                const inferredSrc = this.getRole(entry?.src_addr);
+                const inferredDst = this.getRole(entry?.dst_addr);
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+
+                if (explicit === 'leg-a' || explicit === 'leg-b') {
+                    if (inferredSrc === 'pbx') {
+                        return explicit;
+                    }
+                    if (inferredDst === 'pbx') {
+                        return 'pbx';
+                    }
+                }
+
+                return inferredDst;
+            },
+
+            isSipResponse(entry) {
+                const firstLine = ((entry?.raw_message || '').split('\n')[0] || '').trim();
+                return /^SIP\/\d\.\d\s+\d{3}/.test(firstLine);
+            },
+
+            isSipRequest(entry) {
+                return !!entry && !this.isSipResponse(entry);
+            },
+
+            showsCallerToPbx(entry) {
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+                if (explicit) {
+                    return explicit === 'leg-a' && this.isSipRequest(entry);
+                }
+                return this.getEntrySrcRole(entry) === 'leg-a';
+            },
+
+            showsPbxToCaller(entry) {
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+                if (explicit) {
+                    return explicit === 'leg-a' && this.isSipResponse(entry);
+                }
+                return this.getEntrySrcRole(entry) === 'pbx' &&
+                    (this.getEntryDstRole(entry) === 'leg-a' || entry?._correctedDstRole === 'leg-a');
+            },
+
+            showsPbxToCallee(entry) {
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+                if (explicit) {
+                    return explicit === 'leg-b' && this.isSipRequest(entry);
+                }
+                return this.getEntrySrcRole(entry) === 'pbx' &&
+                    (this.getEntryDstRole(entry) === 'leg-b' || entry?._correctedDstRole === 'leg-b');
+            },
+
+            showsCalleeToPbx(entry) {
+                const explicit = this.normalizeLegRole(entry?.leg_role || entry?.role);
+                if (explicit) {
+                    return explicit === 'leg-b' && this.isSipResponse(entry);
+                }
+                return this.getEntrySrcRole(entry) === 'leg-b';
+            },
+
+            showsInternalPbx(entry) {
+                return !this.normalizeLegRole(entry?.leg_role || entry?.role) &&
+                    this.getEntrySrcRole(entry) === 'pbx' &&
+                    this.getEntryDstRole(entry) === 'pbx' &&
+                    !entry?._correctedDstRole;
             },
 
             // Extract SIP method from message

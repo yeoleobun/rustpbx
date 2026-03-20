@@ -264,12 +264,9 @@ impl AnswerRuntime {
             let matched_dialog_id = session
                 .callee_leg
                 .sip
-                .dialog_ids
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|id: &&DialogId| id.to_string() == **id_str)
-                .cloned();
+                .recorded_dialogs()
+                .into_iter()
+                .find(|id| id.to_string() == *id_str);
             if let Some(id) = matched_dialog_id {
                 session.callee_leg.sip.set_connected_dialog(id);
             }
