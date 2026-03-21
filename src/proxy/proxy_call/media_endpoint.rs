@@ -475,6 +475,15 @@ impl MediaEndpoint {
         self.peer.update_remote_description(track_id, offer).await
     }
 
+    pub async fn local_track_description(&self, track_id: &str) -> Result<String> {
+        let track = self
+            .find_track(track_id)
+            .await
+            .ok_or_else(|| anyhow!("track not found: {track_id}"))?;
+        let guard = track.lock().await;
+        guard.local_description().await
+    }
+
     pub async fn add_remote_ice_candidate(&self, track_id: &str, candidate_sdp: &str) -> Result<()> {
         let track = self
             .find_track(track_id)

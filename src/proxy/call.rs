@@ -940,25 +940,16 @@ impl CallModule {
         let is_update = tx.original.method == rsip::Method::Update;
         let has_sdp = !tx.original.body.is_empty();
 
-        if (is_reinvite || is_update) && has_sdp {
-            if let Some(handle) = self
+        if (is_reinvite || is_update)
+            && has_sdp
+            && self
                 .inner
                 .server
                 .active_call_registry
                 .get_handle_by_dialog(&dialog_id.to_string())
-            {
-                let snapshot = handle.snapshot();
-                if let Some(sdp) = snapshot.answer_sdp {
-                    info!(%dialog_id, ?tx.original.method, "Replying to mid-dialog request with SDP from shared state");
-                    let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-                    tx.reply_with(rsip::StatusCode::OK, headers, Some(sdp.into_bytes()))
-                        .await
-                        .map_err(|e| anyhow!(e))?;
-
-                    // Still pass it to the dialog so it can emit events and update its state
-                    return dialog.handle(tx).await.map_err(|e| anyhow!(e));
-                }
-            }
+                .is_some()
+        {
+            return dialog.handle(tx).await.map_err(|e| anyhow!(e));
         }
 
         dialog.handle(tx).await.map_err(|e| anyhow!(e))

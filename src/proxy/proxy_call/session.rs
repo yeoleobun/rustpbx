@@ -1,5 +1,6 @@
 use crate::call::sip::{DialogStateReceiverGuard, ServerDialogGuard};
 use crate::media::mixer::SupervisorMixerMode;
+use crate::media::negotiate::MediaNegotiator;
 use crate::media::negotiate::CodecInfo;
 use crate::proxy::proxy_call::answer_runtime::AnswerRuntime;
 use crate::proxy::proxy_call::app_runtime::AppRuntime;
@@ -27,7 +28,8 @@ use crate::{
         proxy_call::{
             media_peer::{MediaPeer, VoiceEnginePeer},
             state::{
-                CallContext, CallSessionHandle, CallSessionShared, ProxyCallEvent, SessionAction,
+                CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg,
+                ProxyCallEvent, SessionAction,
             },
         },
         server::SipServerRef,
@@ -632,13 +634,8 @@ impl CallSession {
 
 
     /// Create offer SDP for a specific target based on its WebRTC support
-<<<<<<< HEAD
-    async fn create_offer_for_target(&mut self, target: &Location) -> Option<Vec<u8>> {
-        debug!(
-=======
     pub(crate) async fn create_offer_for_target(&mut self, target: &Location) -> Option<Vec<u8>> {
         info!(
->>>>>>> c8b7077 (refactore session.rs)
             session_id = %self.context.session_id,
             target = %target.aor,
             supports_webrtc = target.supports_webrtc,
@@ -684,151 +681,10 @@ impl CallSession {
     }
 
     pub async fn create_callee_track(&mut self, is_webrtc: bool) -> Result<String> {
-<<<<<<< HEAD
-        debug!(
-            session_id = %self.context.session_id,
-            is_webrtc,
-            "create_callee_track called"
-        );
-
-        self.callee_leg.peer
-            .remove_track(Self::RINGBACK_TRACK_ID, true)
-            .await;
-        let track_id = Self::CALLEE_TRACK_ID.to_string();
-        let caller_rtp_map = self
-            .caller_leg
-            .offer_sdp
-            .as_ref()
-            .and_then(|caller_offer| {
-                rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, caller_offer).ok()
-            })
-            .and_then(|sdp| {
-                sdp.media_sections
-                    .iter()
-                    .find(|m| m.kind == rustrtc::MediaKind::Audio)
-                    .map(MediaNegotiator::parse_rtp_map_from_section)
-            })
-            .unwrap_or_default();
-
-        let allow_codecs = &self.context.dialplan.allow_codecs;
-        let mut codec_info = Vec::new();
-        let mut seen_codecs = Vec::new();
-        let mut used_payload_types = std::collections::HashSet::new();
-        let caller_dtmf_codecs = Self::extract_telephone_event_codecs(&caller_rtp_map);
-
-        for (pt, (codec, clock, channels)) in &caller_rtp_map {
-            if *codec == CodecType::TelephoneEvent {
-                continue;
-            }
-            if (!allow_codecs.is_empty() && !allow_codecs.contains(codec))
-                || seen_codecs.contains(codec)
-            {
-                continue;
-            }
-            seen_codecs.push(*codec);
-            used_payload_types.insert(*pt);
-            codec_info.push(CodecInfo {
-                payload_type: *pt,
-                codec: *codec,
-                clock_rate: *clock,
-                channels: *channels,
-            });
-        }
-
-        if !allow_codecs.is_empty() {
-            let mut next_pt = 96;
-            for codec in allow_codecs {
-                if *codec == CodecType::TelephoneEvent {
-                    continue;
-                }
-                if seen_codecs.contains(codec) {
-                    continue;
-                }
-                seen_codecs.push(*codec);
-
-                let payload_type = if !codec.is_dynamic() {
-                    codec.payload_type()
-                } else {
-                    while used_payload_types.contains(&next_pt) {
-                        next_pt += 1;
-                    }
-                    next_pt
-                };
-                used_payload_types.insert(payload_type);
-                codec_info.push(CodecInfo {
-                    payload_type,
-                    codec: *codec,
-                    clock_rate: codec.clock_rate(),
-                    channels: codec.channels(),
-                });
-            }
-        }
-
-        Self::append_supported_dtmf_codecs(
-            &mut codec_info,
-            &caller_dtmf_codecs,
-            &mut used_payload_types,
-        );
-
-        // Unified track creation using RtpTrackBuilder
-        let mut track_builder = RtpTrackBuilder::new(track_id.clone())
-            .with_cancel_token(self.callee_leg.peer.cancel_token())
-            .with_codec_info(codec_info)
-            .with_enable_latching(self.context.media_config.enable_latching);
-
-        if let Some(ref addr) = self.context.media_config.external_ip {
-            track_builder = track_builder.with_external_ip(addr.clone());
-        }
-
-        let (start_port, end_port) = if is_webrtc {
-            (
-                self.context.media_config.webrtc_port_start,
-                self.context.media_config.webrtc_port_end,
-            )
-        } else {
-            (
-                self.context.media_config.rtp_start_port,
-                self.context.media_config.rtp_end_port,
-            )
-        };
-
-        if let (Some(start), Some(end)) = (start_port, end_port) {
-            track_builder = track_builder.with_rtp_range(start, end);
-        }
-
-        // Set mode based on is_webrtc flag
-        if is_webrtc {
-            debug!(
-                session_id = %self.context.session_id,
-                "Setting callee track to WebRTC mode"
-            );
-            track_builder = track_builder.with_mode(rustrtc::TransportMode::WebRtc);
-        } else {
-            debug!(
-                session_id = %self.context.session_id,
-                "Using default RTP mode for callee track"
-            );
-        }
-
-        if let Some(existing) = self.find_track(&self.callee_leg.peer, &track_id).await {
-            info!(
-                session_id = %self.context.session_id,
-                %track_id,
-                "Reusing existing callee track for local description"
-            );
-            debug!(%track_id, "Reusing existing callee track for local description");
-            let guard = existing.lock().await;
-            guard.local_description().await
-        } else {
-            debug!(
-                session_id = %self.context.session_id,
-                %track_id,
-=======
         self.callee_leg
             .media
             .create_local_track_offer(
                 Self::CALLEE_TRACK_ID.to_string(),
->>>>>>> c8b7077 (refactore session.rs)
                 is_webrtc,
                 self.caller_leg.offer_sdp.as_deref(),
                 &self.context.dialplan.allow_codecs,
@@ -877,11 +733,263 @@ impl CallSession {
         AnswerRuntime::start_ringing(self, answer).await;
     }
 
-    pub async fn handle_reinvite(&mut self, method: rsip::Method, sdp: Option<String>) {
+    fn media_direction_from_sdp(sdp: &str) -> &'static str {
+        if sdp.contains("\r\na=inactive\r\n") || sdp.ends_with("\r\na=inactive") {
+            "inactive"
+        } else if sdp.contains("\r\na=sendonly\r\n") || sdp.ends_with("\r\na=sendonly") {
+            "sendonly"
+        } else if sdp.contains("\r\na=recvonly\r\n") || sdp.ends_with("\r\na=recvonly") {
+            "recvonly"
+        } else {
+            "sendrecv"
+        }
+    }
+
+    fn rewrite_sdp_direction(answer_sdp: &str, offer_sdp: &str) -> String {
+        let answer_direction = match Self::media_direction_from_sdp(offer_sdp) {
+            "sendonly" => "recvonly",
+            "recvonly" => "sendonly",
+            "inactive" => "inactive",
+            _ => "sendrecv",
+        };
+
+        let lines: Vec<String> = answer_sdp
+            .split("\r\n")
+            .filter(|line| !line.is_empty())
+            .filter(|line| {
+                !matches!(
+                    *line,
+                    "a=sendrecv" | "a=sendonly" | "a=recvonly" | "a=inactive"
+                )
+            })
+            .map(str::to_string)
+            .collect();
+
+        let mut rewritten = Vec::with_capacity(lines.len() + 2);
+        let mut inserted = false;
+        for line in lines {
+            rewritten.push(line.clone());
+            if !inserted && line.starts_with("m=audio ") {
+                rewritten.push(format!("a={answer_direction}"));
+                inserted = true;
+            }
+        }
+        if !inserted {
+            rewritten.push(format!("a={answer_direction}"));
+        }
+        rewritten.join("\r\n") + "\r\n"
+    }
+
+    fn current_callee_codec(&self) -> Option<CodecType> {
+        self.callee_leg
+            .media
+            .negotiated_audio
+            .as_ref()
+            .map(|(codec, _, _)| *codec)
+            .or_else(|| {
+                self.callee_leg
+                    .media
+                    .answer_sdp
+                    .as_deref()
+                    .and_then(|sdp| {
+                        MediaEndpoint::select_best_audio_from_sdp(
+                            sdp,
+                            &self.context.dialplan.allow_codecs,
+                        )
+                    })
+                    .map(|(codec, _, _)| codec)
+            })
+            .or_else(|| {
+                self.callee_leg
+                    .media
+                    .offer_sdp
+                    .as_deref()
+                    .and_then(|sdp| {
+                        MediaEndpoint::select_best_audio_from_sdp(
+                            sdp,
+                            &self.context.dialplan.allow_codecs,
+                        )
+                    })
+                    .map(|(codec, _, _)| codec)
+            })
+    }
+
+    fn offer_supports_current_callee_codec(&self, offer_sdp: &str) -> bool {
+        let Some(current_codec) = self.current_callee_codec() else {
+            return false;
+        };
+        MediaNegotiator::extract_codec_params(offer_sdp)
+            .audio
+            .iter()
+            .any(|codec| codec.codec == current_codec)
+    }
+
+    async fn respond_to_mid_dialog(
+        &self,
+        leg: MidDialogLeg,
+        dialog_id: &str,
+        status: StatusCode,
+        body: Option<String>,
+    ) -> bool {
+        let Some(handle) = self.shared.take_mid_dialog_reply(leg.clone(), dialog_id) else {
+            warn!(
+                session_id = %self.context.session_id,
+                ?leg,
+                dialog_id,
+                %status,
+                "Missing pending mid-dialog reply handle"
+            );
+            return false;
+        };
+
+        let result = if let Some(body) = body {
+            let headers = Some(vec![rsip::Header::ContentType("application/sdp".into())]);
+            handle.respond(status, headers, Some(body.into_bytes())).await
+        } else {
+            handle.reply(status).await
+        };
+
+        if let Err(err) = result {
+            warn!(
+                session_id = %self.context.session_id,
+                ?leg,
+                dialog_id,
+                error = %err,
+                "Failed to send mid-dialog response"
+            );
+            return false;
+        }
+
+        true
+    }
+
+    async fn handle_callee_reinvite(
+        &mut self,
+        method: rsip::Method,
+        dialog_id: String,
+        sdp: Option<String>,
+    ) {
+        info!(
+            session_id = %self.context.session_id,
+            ?method,
+            dialog_id,
+            "Handling mid-dialog request on callee leg"
+        );
+
+        let response_body = if let Some(offer) = sdp {
+            self.negotiation_state = NegotiationState::RemoteOfferReceived;
+
+            if !self.offer_supports_current_callee_codec(&offer) {
+                warn!(
+                    session_id = %self.context.session_id,
+                    ?method,
+                    "Rejecting callee re-INVITE because current negotiated codec is not offered"
+                );
+                self.respond_to_mid_dialog(
+                    MidDialogLeg::Callee,
+                    &dialog_id,
+                    StatusCode::NotAcceptableHere,
+                    None,
+                )
+                .await;
+                self.negotiation_state = NegotiationState::Stable;
+                return;
+            }
+
+            let base_answer = self
+                .callee_leg
+                .media
+                .answer_sdp
+                .clone()
+                .or_else(|| self.callee_leg.offer_sdp.clone());
+            let Some(base_answer) = base_answer else {
+                warn!(
+                    session_id = %self.context.session_id,
+                    ?method,
+                    "Missing existing negotiated SDP for callee re-INVITE"
+                );
+                self.respond_to_mid_dialog(
+                    MidDialogLeg::Callee,
+                    &dialog_id,
+                    StatusCode::NotAcceptableHere,
+                    None,
+                )
+                .await;
+                self.negotiation_state = NegotiationState::Stable;
+                return;
+            };
+
+            let offered_direction = Self::media_direction_from_sdp(&offer);
+            let answer = Self::rewrite_sdp_direction(&base_answer, &offer);
+
+            self.callee_leg.media.offer_sdp = Some(offer);
+            self.callee_leg.media.answer_sdp = Some(answer.clone());
+
+            let bridge_result = match offered_direction {
+                "sendonly" | "inactive" => {
+                    self.bridge_runtime
+                        .suppress_or_pause_callee_forwarding(
+                            Self::CALLEE_TRACK_ID,
+                            self.caller_leg.peer.clone(),
+                        )
+                        .await
+                }
+                _ => {
+                    self.bridge_runtime
+                        .resume_or_unpause_callee_forwarding(
+                            Self::CALLEE_TRACK_ID,
+                            self.caller_leg.peer.clone(),
+                        )
+                        .await
+                }
+            };
+            if let Err(err) = bridge_result {
+                warn!(
+                    session_id = %self.context.session_id,
+                    direction = offered_direction,
+                    error = %err,
+                    "Failed to update bridge forwarding for callee re-INVITE"
+                );
+            }
+
+            self.negotiation_state = NegotiationState::Stable;
+            Some(answer)
+        } else {
+            self.negotiation_state = NegotiationState::Stable;
+            if method == rsip::Method::Update {
+                None
+            } else {
+                self.callee_leg.media.answer_sdp.clone()
+            }
+        };
+
+        self.respond_to_mid_dialog(MidDialogLeg::Callee, &dialog_id, StatusCode::OK, response_body)
+            .await;
+    }
+
+    pub async fn handle_reinvite(
+        &mut self,
+        leg: MidDialogLeg,
+        method: rsip::Method,
+        dialog_id: String,
+        sdp: Option<String>,
+    ) {
         if self.caller_leg.answer_sdp.is_none() {
             self.caller_leg.answer_sdp = self.shared.answer_sdp();
         }
-        info!(session_id = %self.context.session_id, ?method, has_answer = self.caller_leg.answer_sdp.is_some(), "Handle re-INVITE/UPDATE");
+        info!(
+            session_id = %self.context.session_id,
+            ?leg,
+            ?method,
+            dialog_id,
+            has_answer = self.caller_leg.answer_sdp.is_some(),
+            "Handle re-INVITE/UPDATE"
+        );
+
+        if leg == MidDialogLeg::Callee {
+            self.handle_callee_reinvite(method, dialog_id, sdp).await;
+            return;
+        }
 
         if let Some(offer) = sdp {
             debug!(?method, "Received Re-invite/UPDATE with SDP (Offer)");
@@ -889,9 +997,13 @@ impl CallSession {
 
             if let Err(e) = self.caller_leg.media.update_remote_offer("caller-track", &offer).await {
                 warn!(?method, "Failed to update caller peer with offer: {}", e);
-                let _ = self
-                    .server_dialog
-                    .reject(Some(StatusCode::NotAcceptableHere), None);
+                self.respond_to_mid_dialog(
+                    MidDialogLeg::Caller,
+                    &dialog_id,
+                    StatusCode::NotAcceptableHere,
+                    None,
+                )
+                .await;
                 self.negotiation_state = NegotiationState::Stable;
                 return;
             }
@@ -905,30 +1017,28 @@ impl CallSession {
                 )
                 .await;
 
-            if method == rsip::Method::Invite {
-                if self
-                    .caller_leg
-                    .sip
-                    .reply_to_server_reinvite(&self.server_dialog, self.caller_leg.answer_sdp.clone())
-                {
-                    info!(?method, "Replied to re-INVITE with current SDP");
-                }
-                self.negotiation_state = NegotiationState::Stable;
+            let body = self.caller_leg.answer_sdp.clone();
+            let status = if body.is_none() {
+                StatusCode::NotAcceptableHere
             } else {
-                self.negotiation_state = NegotiationState::Stable;
-                debug!(?method, "Marked negotiation stable after processing UPDATE");
-            }
+                StatusCode::OK
+            };
+            self.respond_to_mid_dialog(MidDialogLeg::Caller, &dialog_id, status, body)
+                .await;
+            self.negotiation_state = NegotiationState::Stable;
         } else {
             debug!(
                 ?method,
                 "Received Re-invite/UPDATE without SDP (Request for Offer)"
             );
             self.negotiation_state = NegotiationState::LocalOfferSent;
-
-            self.caller_leg.sip.reply_to_server_offerless_update(
-                &self.server_dialog,
-                self.caller_leg.answer_sdp.clone(),
-            );
+            let body = if method == rsip::Method::Invite {
+                self.caller_leg.answer_sdp.clone()
+            } else {
+                None
+            };
+            self.respond_to_mid_dialog(MidDialogLeg::Caller, &dialog_id, StatusCode::OK, body)
+                .await;
             self.negotiation_state = NegotiationState::Stable;
         }
     }
@@ -984,210 +1094,7 @@ impl CallSession {
         callee_answer: Option<String>,
         dialog_id: Option<String>,
     ) -> Result<()> {
-<<<<<<< HEAD
-        // Ensure queue hold tones cease immediately once the call is answered.
-        // self.stop_queue_hold().await;
-
-        let first_answer = self.answer_time.is_none();
-
-        if let Some(callee_addr) = callee {
-            let resolved_callee = self.routed_callee.clone().unwrap_or(callee_addr);
-            self.connected_callee = Some(resolved_callee);
-        }
-        if let Some(ref id_str) = dialog_id {
-            let matched_dialog_id = self
-                .callee_leg
-                .dialog_ids
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|id| id.to_string() == **id_str)
-                .cloned();
-            if let Some(id) = matched_dialog_id {
-                self.callee_leg.connected_dialog_id = Some(id.clone());
-            }
-        }
-        if first_answer {
-            self.answer_time = Some(Instant::now());
-        }
-        debug!(
-            server_dialog_id = %self.server_dialog.id(),
-            use_media_proxy = self.use_media_proxy,
-            has_answer = self.caller_leg.answer_sdp.is_some(),
-            dialog_id = ?dialog_id,
-            "Call answered"
-        );
-
-        // Only optimize the caller-facing answer before we have sent the initial 200 OK.
-        // Once the inbound leg is already answered, changing local preferences here does not
-        // renegotiate the caller endpoint and can leave the bridge assuming the wrong codec.
-        if first_answer && !self.caller_leg.early_media_sent {
-            if let Some(ref callee_sdp) = callee_answer {
-                if let Some(optimized_answer) = self.optimize_caller_codec(callee_sdp).await {
-                    self.set_answer(optimized_answer);
-                }
-            }
-        }
-
-        if self.caller_leg.answer_sdp.is_none() {
-            let answer_for_caller = self.create_caller_answer_from_offer().await?;
-            self.set_answer(answer_for_caller);
-        }
-
-        if first_answer {
-            self.freeze_answered_caller_audio();
-        }
-
-        if self.use_media_proxy {
-            let track_id = Self::CALLEE_TRACK_ID.to_string();
-            self.caller_leg.peer
-                .remove_track(Self::RINGBACK_TRACK_ID, true)
-                .await;
-            if let Some(answer) = callee_answer.as_ref() {
-                self.setup_callee_track(answer, None).await?;
-
-                if self.media_bridge.is_none() {
-                    if let Some(cancel) = self.caller_leg.dtmf_listener_cancel.take() {
-                        cancel.cancel();
-                        self.shared.set_dtmf_listener_cancel(None);
-                    }
-                    let default_codec = Self::explicit_audio_default_selection();
-                    let (codec_b, params_b, dtmf_pt_b) = self
-                        .select_best_audio_from_sdp(answer)
-                        .or_else(|| {
-                            self.caller_leg
-                                .answer_sdp
-                                .as_deref()
-                                .and_then(|s| self.select_best_audio_from_sdp(s))
-                        })
-                        .or_else(|| {
-                            self.caller_leg
-                                .offer_sdp
-                                .as_deref()
-                                .and_then(|s| self.select_best_audio_from_sdp(s))
-                        })
-                        .unwrap_or(default_codec.clone());
-                    let (codec_a, params_a, dtmf_pt_a) = self
-                        .caller_leg
-                        .negotiated_audio
-                        .clone()
-                        .or_else(|| {
-                            self.caller_leg
-                                .answer_sdp
-                                .as_deref()
-                                .and_then(|s| self.select_best_audio_from_sdp(s))
-                        })
-                        .or_else(|| {
-                            self.caller_leg
-                                .offer_sdp
-                                .as_deref()
-                                .and_then(|s| self.select_best_audio_from_sdp(s))
-                        })
-                        .unwrap_or(default_codec);
-
-                    let ssrc_a = self
-                        .caller_leg
-                        .answer_sdp
-                        .as_ref()
-                        .and_then(|s| MediaNegotiator::extract_ssrc(s));
-                    let ssrc_b = MediaNegotiator::extract_ssrc(answer);
-
-                    debug!(
-                        ?codec_a,
-                        ?params_a,
-                        ?codec_b,
-                        ?params_b,
-                        ssrc_a,
-                        ssrc_b,
-                        "Media bridge for call session"
-                    );
-
-                    let bridge = MediaBridge::new(
-                        self.caller_leg.peer.clone(),
-                        self.callee_leg.peer.clone(),
-                        params_a,
-                        params_b,
-                        dtmf_pt_a,
-                        dtmf_pt_b,
-                        codec_a,
-                        codec_b,
-                        ssrc_a,
-                        ssrc_b,
-                        self.recorder_option.clone(),
-                        self.context
-                            .dialplan
-                            .call_id
-                            .clone()
-                            .unwrap_or_else(|| self.context.session_id.clone()),
-                        self.server.sip_flow.as_ref().and_then(|sf| sf.backend()),
-                    );
-                    self.media_bridge = Some(bridge);
-                }
-            }
-
-            if let Some(ref bridge) = self.media_bridge {
-                if let Err(e) = bridge.start().await {
-                    warn!(session_id = %self.context.session_id, "Failed to start media bridge: {}", e);
-                }
-                let _ = bridge.resume_forwarding(&track_id).await;
-            }
-        } else {
-            if let Some(answer) = callee_answer {
-                self.set_answer(answer);
-            }
-            if let Some(ref bridge) = self.media_bridge {
-                bridge.stop();
-            }
-            self.caller_leg.peer.stop();
-            self.callee_leg.peer.stop();
-        }
-
-        let mut headers = if self.caller_leg.answer_sdp.is_some() {
-            vec![rsip::Header::ContentType("application/sdp".into())]
-        } else {
-            vec![]
-        };
-
-        {
-            let server_timer = self.server_timer.lock().unwrap();
-            if server_timer.active {
-                headers.push(rsip::Header::Supported(
-                    rsip::headers::Supported::from(TIMER_TAG).into(),
-                ));
-                headers.push(rsip::Header::Other(
-                    HEADER_SESSION_EXPIRES.into(),
-                    format!(
-                        "{};refresher={}",
-                        server_timer.session_interval.as_secs(),
-                        server_timer.refresher
-                    ),
-                ));
-            }
-        }
-
-        if let Err(e) = self.server_dialog.accept(
-            Some(headers),
-            self.caller_leg.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
-        ) {
-            return Err(anyhow!("Failed to send 200 OK: {}", e));
-        }
-        self.mark_active_call_answered();
-        if first_answer {
-            let callee = self
-                .connected_callee
-                .clone()
-                .or_else(|| self.routed_callee.clone());
-            self.shared
-                .emit_custom_event(ProxyCallEvent::TargetAnswered {
-                    session_id: self.shared.session_id(),
-                    callee,
-                });
-        }
-        self.sync_rwi_attached_leg().await;
-        Ok(())
-=======
         AnswerRuntime::accept_call(self, callee, callee_answer, dialog_id).await
->>>>>>> c8b7077 (refactore session.rs)
     }
 
     pub(crate) fn mark_active_call_answered(&self) {
@@ -1434,14 +1341,18 @@ impl CallSession {
                         self.transfer_to_uri(&target).await
                     }
                 }
-                SessionAction::HandleReInvite(method_str, sdp) => {
-                    let sdp_opt = if sdp.is_empty() { None } else { Some(sdp) };
-                    let method = match method_str.to_uppercase().as_str() {
+                SessionAction::HandleReInvite {
+                    leg,
+                    method,
+                    sdp,
+                    dialog_id,
+                } => {
+                    let method = match method.to_uppercase().as_str() {
                         "INVITE" => rsip::Method::Invite,
                         "UPDATE" => rsip::Method::Update,
                         _ => rsip::Method::Invite, // Default to Invite for now
                     };
-                    self.handle_reinvite(method, sdp_opt).await;
+                    self.handle_reinvite(leg, method, dialog_id, sdp).await;
                     Ok(())
                 }
                 SessionAction::HandleTrickleIce(payload) => {
@@ -1917,222 +1828,8 @@ impl CallSession {
         TargetRuntime::try_single_target(self, target).await
     }
 
-<<<<<<< HEAD
-    async fn execute_invite(
-        &mut self,
-        mut invite_option: InviteOption,
-        target: &Location,
-    ) -> Result<(), (StatusCode, Option<String>)> {
-        let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-        let _state_tx_keepalive = state_tx.clone();
-        let dialog_layer = self.dialog_layer.clone();
-        self.note_invite_details(&invite_option);
-
-        // Log client INVITE details
-        debug!(
-            session_id = %self.context.session_id,
-            callee = %invite_option.callee,
-            destination = ?invite_option.destination,
-            "Sending client INVITE to target"
-        );
-
-        let session_id = self.context.session_id.clone();
-        let mut retry_count = 0;
-        let mut invitation = dialog_layer
-            .do_invite(invite_option.clone(), state_tx.clone())
-            .boxed();
-        let dialog;
-        let response;
-        loop {
-            tokio::select! {
-                res = &mut invitation => {
-                    match res {
-                        Ok((dialog_id, resp)) => {
-                            if let Some(resp) = resp {
-                                if resp.status_code == StatusCode::SessionIntervalTooSmall {
-                                    if retry_count < 1 {
-                                        let min_se_value =
-                                            get_header_value(&resp.headers, HEADER_MIN_SE);
-                                        if let Some(value) = min_se_value {
-                                            if let Some(min_se) = parse_min_se(&value) {
-                                                info!(
-                                                    session_id = %session_id,
-                                                    min_se = ?min_se,
-                                                    "Received 422, retrying with new Session-Expires"
-                                                );
-                                                if let Some(headers) =
-                                                    &mut invite_option.headers
-                                                {
-                                                    headers.retain(|h| match h {
-                                                        rsip::Header::Other(n, _) => !n
-                                                            .eq_ignore_ascii_case(
-                                                                HEADER_SESSION_EXPIRES,
-                                                            ),
-                                                        _ => true,
-                                                    });
-                                                    headers.push(rsip::Header::Other(
-                                                        HEADER_SESSION_EXPIRES.into(),
-                                                        min_se.as_secs().to_string(),
-                                                    ));
-                                                }
-                                                retry_count += 1;
-                                                invitation = dialog_layer.do_invite(invite_option.clone(), state_tx.clone()).boxed();
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if resp.status_code.kind() != rsip::StatusCodeKind::Successful {
-                                    let reason = resp.reason_phrase().clone().map(Into::into);
-                                    return Err((resp.status_code, reason));
-                                } else {
-                                    dialog = dialog_id;
-                                    response = resp;
-                                    break;
-                                }
-                            } else {
-                                return Err((
-                                    StatusCode::RequestTerminated,
-                                    Some("Cancelled by callee".to_string()),
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            debug!(session_id = %session_id, "Invite failed: {:?}", e);
-                            return Err(match e {
-                                rsipstack::Error::DialogError(reason, _, code) => (code, Some(reason)),
-                                _ => (
-                                    StatusCode::ServerInternalError,
-                                    Some("Invite failed".to_string()),
-                                ),
-                            });
-                        }
-                    }
-                }
-                state = state_rx.recv() => {
-                    match state {
-                        Some(DialogState::Early(_, response)) => {
-                            let sdp = String::from_utf8_lossy(response.body()).to_string();
-                            let action = SessionAction::StartRinging{
-                                ringback: Some(sdp),
-                                passthrough: false
-                            };
-                            self.apply_session_action(action, None).await.ok();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let mut state_rx_guard = DialogStateReceiverGuard::new(dialog_layer.clone(), state_rx);
-        state_rx_guard.set_dialog_id(dialog.id());
-
-        if self.server.proxy_config.session_timer {
-            let default_expires = self.server.proxy_config.session_expires.unwrap_or(1800);
-            self.init_client_timer(&response, default_expires);
-        }
-
-        if response.status_code.kind() == rsip::StatusCodeKind::Successful {
-            // Extract SDP from response body, if present
-            let answer_body = response.body();
-            let sdp = if !answer_body.is_empty() {
-                Some(String::from_utf8_lossy(answer_body).to_string())
-            } else {
-                None
-            };
-
-            let dialog_id_val = dialog.id();
-
-            // Log client dialog details after successful answer
-            debug!(
-                session_id = %self.context.session_id,
-                dialog_id = %dialog_id_val,
-                "Client dialog established after 200 OK from callee"
-            );
-
-            self.add_callee_dialog(dialog_id_val.clone());
-            let _ = self
-                .apply_session_action(
-                    SessionAction::AcceptCall {
-                        callee: Some(target.aor.to_string()),
-                        sdp,
-                        dialog_id: Some(dialog_id_val.to_string()),
-                    },
-                    None,
-                )
-                .await;
-        }
-
-        self.add_callee_guard(state_rx_guard);
-        Ok(())
-    }
-
-    async fn handle_failure(&mut self, inbox: ActionInbox<'_>) -> Result<()> {
-        if self.failure_is_busy() {
-            if let Some(config) = self.forwarding_config().cloned() {
-                if matches!(config.mode, CallForwardingMode::WhenBusy) {
-                    info!(
-                        session_id = %self.context.session_id,
-                        endpoint = ?config.endpoint,
-                        "Call forwarding (busy) engaged"
-                    );
-                    return self.transfer_to_endpoint(&config.endpoint, inbox).await;
-                }
-            }
-            // Voicemail on busy (if no explicit busy forwarding configured)
-            if self.context.dialplan.voicemail_enabled {
-                info!(
-                    session_id = %self.context.session_id,
-                    callee = %self.context.original_callee,
-                    "busy: routing to voicemail"
-                );
-                let params = serde_json::json!({
-                    "extension": self.context.original_callee,
-                    "caller_id": self.context.original_caller,
-                });
-                return self.run_application("voicemail", Some(params), true).await;
-            }
-        } else if self.failure_is_no_answer() {
-            if let Some(config) = self.forwarding_config().cloned() {
-                if matches!(config.mode, CallForwardingMode::WhenNoAnswer) {
-                    info!(
-                        session_id = %self.context.session_id,
-                        endpoint = ?config.endpoint,
-                        "Call forwarding (no answer) engaged"
-                    );
-                    return self.transfer_to_endpoint(&config.endpoint, inbox).await;
-                }
-            }
-            // Voicemail on no-answer (if no explicit no-answer forwarding configured)
-            if self.context.dialplan.voicemail_enabled {
-                info!(
-                    session_id = %self.context.session_id,
-                    callee = %self.context.original_callee,
-                    "no-answer: routing to voicemail"
-                );
-                let params = serde_json::json!({
-                    "extension": self.context.original_callee,
-                    "caller_id": self.context.original_caller,
-                });
-                return self.run_application("voicemail", Some(params), true).await;
-            }
-        }
-
-        if let Some((code, reason)) = self.last_error.clone() {
-            self.report_failure(code, reason)?;
-        } else {
-            self.report_failure(
-                StatusCode::ServerInternalError,
-                Some("Unknown error".to_string()),
-            )?;
-        }
-        Err(anyhow!("Call failed"))
-=======
     pub(crate) async fn handle_failure(&mut self, inbox: ActionInbox<'_>) -> Result<()> {
         TargetRuntime::handle_failure(self, inbox).await
->>>>>>> c8b7077 (refactore session.rs)
     }
 
     /// Run a call application (voicemail, IVR, etc.) by looking up the addon,
@@ -2412,13 +2109,8 @@ impl CallSession {
                 }
             } => { Ok(()) },
             r = async {
-<<<<<<< HEAD
-                self.execute_dialplan(Some(&mut action_inbox)).await?;
-                debug!(session_id = %self.context.session_id, "Dialplan execution finished, waiting for call termination");
-=======
                 DialplanRuntime::execute_dialplan(&mut self, Some(&mut action_inbox)).await?;
                 info!(session_id = %self.context.session_id, "Dialplan execution finished, waiting for call termination");
->>>>>>> c8b7077 (refactore session.rs)
                 loop {
                     if let Some(action) = action_inbox.recv().await {
                         self.apply_session_action(action, Some(&mut action_inbox)).await?;

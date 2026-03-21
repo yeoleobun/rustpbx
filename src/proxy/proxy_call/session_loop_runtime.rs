@@ -3,7 +3,7 @@ use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, TIMER_TAG,
 };
 use crate::proxy::proxy_call::sip_leg::SipLeg;
-use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared, SessionAction};
+use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg, SessionAction};
 use crate::callrecord::CallRecordHangupReason;
 use anyhow::Result;
 use rsipstack::dialog::{DialogId, dialog::DialogState, dialog_layer::DialogLayer, server_dialog::ServerInviteDialog};
@@ -42,7 +42,7 @@ impl SessionLoopRuntime {
         handle: CallSessionHandle,
         cancel_token: CancellationToken,
         pending_hangup: Arc<Mutex<Option<PendingHangup>>>,
-        _shared: CallSessionShared,
+        shared: CallSessionShared,
     ) -> Result<()> {
         let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -81,14 +81,15 @@ impl SessionLoopRuntime {
                                     let is_reinvite = request.method == rsip::Method::Invite;
                                     let is_update = request.method == rsip::Method::Update;
 
-                                    if (is_reinvite || is_update) && has_sdp {
-                                        let sdp = String::from_utf8_lossy(&request.body).to_string();
-                                        let _ = handle.send_command(SessionAction::HandleReInvite(request.method.to_string(), sdp));
-
-                                        if is_update {
-                                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
-                                            debug!(session_id = %context.session_id, "Replied to UPDATE (200 OK)");
-                                        }
+                                    if is_reinvite || is_update {
+                                        let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
+                                        shared.store_mid_dialog_reply(MidDialogLeg::Caller, &dialog_id.to_string(), tx_handle);
+                                        let _ = handle.send_command(SessionAction::HandleReInvite {
+                                            leg: MidDialogLeg::Caller,
+                                            method: request.method.to_string(),
+                                            sdp,
+                                            dialog_id: dialog_id.to_string(),
+                                        });
                                     } else {
                                         SipLeg::refresh_timer_state(&server_timer, &request.headers);
                                         tx_handle.reply(rsip::StatusCode::OK).await.ok();
@@ -154,7 +155,7 @@ impl SessionLoopRuntime {
                                         debug!(session_id = %context.session_id, %dialog_id, "Inactive callee dialog terminated, ignoring");
                                     }
                                 }
-                                DialogState::Updated(dialog_id, _request, _) => {
+                                DialogState::Updated(dialog_id, request, tx_handle) => {
                                     debug!(session_id = %context.session_id, %dialog_id, "Received UPDATE/INVITE on callee dialog");
                                     {
                                         let mut timer = client_timer.lock().unwrap();
@@ -162,6 +163,19 @@ impl SessionLoopRuntime {
                                             timer.update_refresh();
                                             debug!(session_id = %context.session_id, "Client session timer refreshed by incoming request from callee");
                                         }
+                                    }
+                                    let has_sdp = !request.body.is_empty();
+                                    let is_reinvite = request.method == rsip::Method::Invite;
+                                    let is_update = request.method == rsip::Method::Update;
+                                    if is_reinvite || is_update {
+                                        let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
+                                        shared.store_mid_dialog_reply(MidDialogLeg::Callee, &dialog_id.to_string(), tx_handle);
+                                        let _ = handle.send_command(SessionAction::HandleReInvite {
+                                            leg: MidDialogLeg::Callee,
+                                            method: request.method.to_string(),
+                                            sdp,
+                                            dialog_id: dialog_id.to_string(),
+                                        });
                                     }
                                 }
                                 _ => {}
