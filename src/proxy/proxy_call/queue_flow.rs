@@ -84,11 +84,11 @@ impl QueueFlow {
     async fn prepare_immediate_accept(session: &mut CallSession) -> Result<()> {
         info!(session_id = %session.context.session_id, "Queue accepting immediately");
 
-        if session.caller_leg.answer_sdp.is_none() {
+        if session.caller_leg.media.answer_sdp.is_none() {
             let answer: String = session
                 .build_caller_answer(
                     caller_negotiation::build_passthrough_caller_answer_codec_info(
-                        session.caller_leg.offer_sdp.as_deref(),
+                        session.caller_leg.media.offer_sdp.as_deref(),
                     ),
                 )
                 .await
@@ -134,7 +134,7 @@ impl QueueFlow {
             .bridge_runtime
             .suppress_or_pause_callee_forwarding(
                 CallSession::CALLEE_TRACK_ID,
-                session.caller_leg.peer.clone(),
+                session.caller_leg.media.peer.clone(),
             )
             .await;
     }
@@ -146,7 +146,7 @@ impl QueueFlow {
             .bridge_runtime
             .resume_or_unpause_callee_forwarding(
                 CallSession::CALLEE_TRACK_ID,
-                session.caller_leg.peer.clone(),
+                session.caller_leg.media.peer.clone(),
             )
             .await;
     }

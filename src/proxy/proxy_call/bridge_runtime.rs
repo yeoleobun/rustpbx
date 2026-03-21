@@ -64,6 +64,10 @@ impl BridgeRuntime {
         Ok(())
     }
 
+    pub fn is_active(&self) -> bool {
+        self.media_bridge.is_some()
+    }
+
     pub fn stop_bridge(&self) {
         if let Some(ref bridge) = self.media_bridge {
             bridge.stop();

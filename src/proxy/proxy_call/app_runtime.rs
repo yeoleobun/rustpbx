@@ -244,11 +244,11 @@ impl AppRuntime {
             return Ok(());
         }
 
-        if session.caller_leg.answer_sdp.is_none() {
+        if session.caller_leg.media.answer_sdp.is_none() {
             match session
                 .build_caller_answer(
                     caller_negotiation::build_passthrough_caller_answer_codec_info(
-                        session.caller_leg.offer_sdp.as_deref(),
+                        session.caller_leg.media.offer_sdp.as_deref(),
                     ),
                 )
                 .await
@@ -323,7 +323,7 @@ impl AppRuntime {
     ) {
         let caller_dtmf_codecs = session
             .caller_leg
-            .offer_sdp
+            .media.offer_sdp
             .as_deref()
             .map(MediaNegotiator::extract_dtmf_codecs)
             .unwrap_or_default();
@@ -331,7 +331,7 @@ impl AppRuntime {
             return;
         }
 
-        let caller_peer = session.caller_leg.peer.clone();
+        let caller_peer = session.caller_leg.media.peer.clone();
         let dtmf_event_tx = event_tx.clone();
         let dtmf_cancel = cancel_token.child_token();
         session.caller_leg.media.set_dtmf_listener_cancel(dtmf_cancel.clone());

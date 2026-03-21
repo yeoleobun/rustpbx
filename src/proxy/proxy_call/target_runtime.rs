@@ -113,7 +113,7 @@ impl TargetRuntime {
             return Err(anyhow!("No targets provided for parallel dialing"));
         }
 
-        if !session.caller_leg.early_media_sent {
+        if !session.caller_leg.media.early_media_sent {
             let _ = session
                 .apply_session_action(
                     SessionAction::StartRinging {
@@ -318,7 +318,7 @@ impl TargetRuntime {
                                         None,
                                     )
                                     .await;
-                            } else if !session.caller_leg.early_media_sent {
+                            } else if !session.caller_leg.media.early_media_sent {
                                 let _ = session
                                     .apply_session_action(
                                         SessionAction::StartRinging {

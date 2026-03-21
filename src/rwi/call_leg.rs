@@ -4,7 +4,7 @@ use crate::proxy::proxy_call::media_peer::MediaPeer;
 use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, parse_session_expires,
 };
-use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction};
+use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction, SharedCallerMediaRef};
 use anyhow::{Result, anyhow};
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
@@ -71,78 +71,50 @@ impl Default for RwiCallLegRuntime {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum RwiLegCommand {
-    Hangup {
-        reason: Option<crate::callrecord::CallRecordHangupReason>,
-        code: Option<u16>,
-        initiator: Option<String>,
-    },
-    Hold {
-        music_source: Option<String>,
-    },
-    Unhold,
-    PlayPrompt {
-        audio_file: String,
-        track_id: Option<String>,
-        loop_playback: bool,
-        interrupt_on_dtmf: bool,
-    },
-    StopPlayback,
-    Transfer {
-        target: String,
-    },
-}
+pub(crate) use crate::proxy::proxy_call::leg_command::LegCommand;
 
 #[derive(Clone)]
 pub(crate) enum RwiLegCommandHandle {
     Session(CallSessionHandle),
-    Standalone(mpsc::UnboundedSender<RwiLegCommand>),
+    Standalone(mpsc::UnboundedSender<LegCommand>),
 }
 
 impl RwiLegCommandHandle {
     pub(crate) fn send_action(&self, action: SessionAction) -> Result<()> {
         match self {
             Self::Session(handle) => handle.send_command(action),
-            Self::Standalone(tx) => match action {
-                SessionAction::Hangup {
-                    reason,
-                    code,
-                    initiator,
-                } => tx
-                    .send(RwiLegCommand::Hangup {
+            Self::Standalone(tx) => {
+                let cmd = match action {
+                    SessionAction::Hangup {
                         reason,
                         code,
                         initiator,
-                    })
-                    .map_err(|e| anyhow!(e.to_string())),
-                SessionAction::Hold { music_source } => tx
-                    .send(RwiLegCommand::Hold { music_source })
-                    .map_err(|e| anyhow!(e.to_string())),
-                SessionAction::Unhold => tx
-                    .send(RwiLegCommand::Unhold)
-                    .map_err(|e| anyhow!(e.to_string())),
-                SessionAction::PlayPrompt {
-                    audio_file,
-                    track_id,
-                    loop_playback,
-                    interrupt_on_dtmf,
-                    ..
-                } => tx
-                    .send(RwiLegCommand::PlayPrompt {
+                    } => LegCommand::Hangup {
+                        reason,
+                        code,
+                        initiator,
+                    },
+                    SessionAction::Hold { music_source } => LegCommand::Hold { music_source },
+                    SessionAction::Unhold => LegCommand::Unhold,
+                    SessionAction::PlayPrompt {
                         audio_file,
                         track_id,
                         loop_playback,
-                        interrupt_on_dtmf,
-                    })
-                    .map_err(|e| anyhow!(e.to_string())),
-                SessionAction::StopPlayback => tx
-                    .send(RwiLegCommand::StopPlayback)
-                    .map_err(|e| anyhow!(e.to_string())),
-                _ => Err(anyhow!(
-                    "command unsupported for standalone originated RWI leg"
-                )),
-            },
+                        ..
+                    } => LegCommand::PlayAudio {
+                        file: audio_file,
+                        track_id: track_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        loop_playback,
+                    },
+                    SessionAction::StopPlayback => LegCommand::StopPlayback,
+                    _ => {
+                        return Err(anyhow!(
+                            "command unsupported for standalone originated RWI leg"
+                        ))
+                    }
+                };
+                tx.send(cmd).map_err(|e| anyhow!(e.to_string()))
+            }
         }
     }
 
@@ -157,7 +129,7 @@ impl RwiLegCommandHandle {
         match self {
             Self::Session(handle) => handle.send_command(SessionAction::from_transfer_target(&target)),
             Self::Standalone(tx) => tx
-                .send(RwiLegCommand::Transfer { target })
+                .send(LegCommand::Transfer { target })
                 .map_err(|e| anyhow!(e.to_string())),
         }
     }
@@ -183,6 +155,9 @@ pub(crate) struct RwiCallLeg {
     cancel_token: Option<CancellationToken>,
     info: RwLock<RwiCallLegInfo>,
     runtime: RwLock<RwiCallLegRuntime>,
+    /// For attached legs: shared media state published by the session's caller leg.
+    /// Reads come from here instead of `runtime` for media fields.
+    shared_media: Option<SharedCallerMediaRef>,
 }
 
 pub(crate) type RwiCallLegHandle = Arc<RwiCallLeg>;
@@ -192,6 +167,7 @@ impl RwiCallLeg {
         entry: &ActiveProxyCallEntry,
         owner_handle: CallSessionHandle,
     ) -> RwiCallLegHandle {
+        let shared_media = Some(owner_handle.shared_caller_media());
         Arc::new(Self {
             call_id: entry.session_id.clone(),
             origin: RwiCallLegOrigin::InboundAttached,
@@ -207,12 +183,13 @@ impl RwiCallLeg {
                 status: entry.status,
             }),
             runtime: RwLock::new(RwiCallLegRuntime::default()),
+            shared_media,
         })
     }
 
     pub(crate) fn new_outbound(
         call_id: String,
-        command_handle: mpsc::UnboundedSender<RwiLegCommand>,
+        command_handle: mpsc::UnboundedSender<LegCommand>,
         peer: Arc<dyn MediaPeer>,
         offer_sdp: Option<String>,
         cancel_token: CancellationToken,
@@ -246,6 +223,7 @@ impl RwiCallLeg {
                 negotiation_in_flight: false,
                 pending_method: None,
             }),
+            shared_media: None,
         })
     }
 
@@ -287,21 +265,35 @@ impl RwiCallLeg {
     }
 
     pub(crate) async fn set_peer(&self, peer: Arc<dyn MediaPeer>) {
+        if self.shared_media.is_some() {
+            return; // Attached legs read from shared state
+        }
         let mut runtime = self.runtime.write().await;
         runtime.peer = Some(peer);
     }
 
     pub(crate) async fn set_offer(&self, offer_sdp: Option<String>) {
+        if self.shared_media.is_some() {
+            return;
+        }
         let mut runtime = self.runtime.write().await;
         runtime.offer_sdp = offer_sdp;
     }
 
     pub(crate) async fn set_answer(&self, answer_sdp: String) {
+        if self.shared_media.is_some() {
+            return;
+        }
         let mut runtime = self.runtime.write().await;
         runtime.answer_sdp = Some(answer_sdp);
     }
 
     pub(crate) async fn offer_sdp(&self) -> Option<String> {
+        if let Some(shared) = &self.shared_media {
+            if let Ok(media) = shared.read() {
+                return media.offer_sdp.clone();
+            }
+        }
         self.runtime.read().await.offer_sdp.clone()
     }
 
@@ -318,6 +310,9 @@ impl RwiCallLeg {
         negotiated_audio: Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)>,
         ssrc: Option<u32>,
     ) {
+        if self.shared_media.is_some() {
+            return;
+        }
         let mut runtime = self.runtime.write().await;
         runtime.negotiated_audio = negotiated_audio;
         runtime.ssrc = ssrc;
@@ -412,6 +407,14 @@ impl RwiCallLeg {
     }
 
     pub(crate) async fn live_media(&self) -> Option<RwiLiveLegMedia> {
+        if let Some(shared) = &self.shared_media {
+            let media = shared.read().ok()?;
+            return Some(RwiLiveLegMedia {
+                peer: media.peer.clone()?,
+                negotiated_audio: media.negotiated_audio.clone()?,
+                ssrc: media.ssrc,
+            });
+        }
         let runtime = self.runtime.read().await;
         Some(RwiLiveLegMedia {
             peer: runtime.peer.clone()?,
@@ -472,14 +475,14 @@ mod tests {
             .expect("standalone leg should accept hangup");
 
         let cmd = rx.recv().await.expect("hangup command should be queued");
-        assert_eq!(
+        assert!(matches!(
             cmd,
-            RwiLegCommand::Hangup {
+            LegCommand::Hangup {
                 reason: None,
                 code: Some(16),
-                initiator: Some("test".to_string()),
-            }
-        );
+                ref initiator,
+            } if initiator.as_deref() == Some("test")
+        ));
     }
 
     #[tokio::test]
@@ -505,20 +508,17 @@ mod tests {
                 music_source: Some("hold.wav".to_string()),
             })
             .expect("standalone leg should accept hold");
-        assert_eq!(
-            rx.recv().await.expect("hold command should be queued"),
-            RwiLegCommand::Hold {
-                music_source: Some("hold.wav".to_string()),
-            }
-        );
+        let cmd = rx.recv().await.expect("hold command should be queued");
+        assert!(matches!(
+            cmd,
+            LegCommand::Hold { ref music_source } if music_source.as_deref() == Some("hold.wav")
+        ));
 
         leg.command_handle()
             .send_action(SessionAction::Unhold)
             .expect("standalone leg should accept unhold");
-        assert_eq!(
-            rx.recv().await.expect("unhold command should be queued"),
-            RwiLegCommand::Unhold
-        );
+        let cmd = rx.recv().await.expect("unhold command should be queued");
+        assert!(matches!(cmd, LegCommand::Unhold));
     }
 
     #[tokio::test]
@@ -549,23 +549,17 @@ mod tests {
                 interrupt_on_dtmf: true,
             })
             .expect("standalone leg should accept media play");
-        assert_eq!(
-            rx.recv().await.expect("play command should be queued"),
-            RwiLegCommand::PlayPrompt {
-                audio_file: "welcome.wav".to_string(),
-                track_id: Some("track-1".to_string()),
-                loop_playback: true,
-                interrupt_on_dtmf: true,
-            }
-        );
+        let cmd = rx.recv().await.expect("play command should be queued");
+        assert!(matches!(
+            cmd,
+            LegCommand::PlayAudio { ref file, loop_playback: true, .. } if file == "welcome.wav"
+        ));
 
         leg.command_handle()
             .send_action(SessionAction::StopPlayback)
             .expect("standalone leg should accept media stop");
-        assert_eq!(
-            rx.recv().await.expect("stop command should be queued"),
-            RwiLegCommand::StopPlayback
-        );
+        let cmd = rx.recv().await.expect("stop command should be queued");
+        assert!(matches!(cmd, LegCommand::StopPlayback));
     }
 
     #[tokio::test]

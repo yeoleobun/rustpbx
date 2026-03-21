@@ -1,3 +1,4 @@
+use crate::proxy::proxy_call::leg_event::{LegEvent, TerminationReason};
 use crate::proxy::proxy_call::session::{CallSession, PendingHangup};
 use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, TIMER_TAG,
@@ -16,25 +17,178 @@ use tracing::{debug, info, warn};
 
 pub(crate) struct SessionLoopRuntime;
 
-impl SessionLoopRuntime {
-    fn is_trickle_ice_info(request: &rsip::Request) -> bool {
-        request.headers.iter().any(|header| match header {
-            rsip::Header::ContentType(value) => value
-                .to_string()
-                .eq_ignore_ascii_case("application/trickle-ice-sdpfrag"),
-            rsip::Header::Other(name, value) if name.eq_ignore_ascii_case("Content-Type") => {
-                value.eq_ignore_ascii_case("application/trickle-ice-sdpfrag")
-            }
-            _ => false,
-        })
-    }
+fn is_trickle_ice_info(request: &rsip::Request) -> bool {
+    request.headers.iter().any(|header| match header {
+        rsip::Header::ContentType(value) => value
+            .to_string()
+            .eq_ignore_ascii_case("application/trickle-ice-sdpfrag"),
+        rsip::Header::Other(name, value) if name.eq_ignore_ascii_case("Content-Type") => {
+            value.eq_ignore_ascii_case("application/trickle-ice-sdpfrag")
+        }
+        _ => false,
+    })
+}
 
+/// Task that processes caller (server) dialog events and emits `LegEvent`s.
+async fn run_caller_event_task(
+    session_id: String,
+    mut state_rx: mpsc::UnboundedReceiver<DialogState>,
+    server_timer: Arc<Mutex<SessionTimerState>>,
+    shared: CallSessionShared,
+    leg_tx: mpsc::UnboundedSender<LegEvent>,
+    cancel_token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            state = state_rx.recv() => {
+                match state {
+                    Some(DialogState::Terminated(dialog_id, reason)) => {
+                        debug!(session_id = %session_id, reason = ?reason, %dialog_id, "Server dialog terminated");
+                        let _ = leg_tx.send(LegEvent::Terminated {
+                            reason: TerminationReason::ByCaller,
+                        });
+                        break;
+                    }
+                    Some(DialogState::Info(dialog_id, request, tx_handle)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Received INFO on server dialog");
+                        if is_trickle_ice_info(&request) && !request.body.is_empty() {
+                            let payload = String::from_utf8_lossy(&request.body).to_string();
+                            let _ = leg_tx.send(LegEvent::TrickleIce { payload });
+                        }
+                        tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                    }
+                    Some(DialogState::Updated(dialog_id, request, tx_handle)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Received UPDATE/INVITE on server dialog");
+
+                        let is_reinvite = request.method == rsip::Method::Invite;
+                        let is_update = request.method == rsip::Method::Update;
+
+                        if is_reinvite || is_update {
+                            let has_sdp = !request.body.is_empty();
+                            let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
+                            shared.store_mid_dialog_reply(MidDialogLeg::Caller, &dialog_id.to_string(), tx_handle);
+                            let _ = leg_tx.send(LegEvent::ReInvite {
+                                leg: MidDialogLeg::Caller,
+                                method: request.method,
+                                sdp,
+                                dialog_id: dialog_id.to_string(),
+                            });
+                        } else {
+                            SipLeg::refresh_timer_state(&server_timer, &request.headers);
+                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                        }
+                    }
+                    Some(DialogState::Notify(dialog_id, _request, tx_handle)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Received NOTIFY on server dialog");
+                        tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                    }
+                    Some(DialogState::Options(dialog_id, _request, tx_handle)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Received Option on server dialog");
+                        tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                    }
+                    Some(DialogState::Calling(dialog_id)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Server dialog in calling state");
+                    }
+                    Some(DialogState::Trying(dialog_id)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Server dialog in trying state");
+                    }
+                    Some(DialogState::Early(dialog_id, _)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Server dialog in early state");
+                    }
+                    Some(DialogState::WaitAck(dialog_id, _)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Server dialog in wait-ack state");
+                    }
+                    Some(DialogState::Confirmed(dialog_id, _)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Server dialog in confirmed state");
+                    }
+                    Some(other_state) => {
+                        debug!(
+                            session_id = %session_id,
+                            "Received other state on server dialog: {}", other_state
+                        );
+                    }
+                    None => {
+                        warn!(session_id = %session_id, "Server dialog state channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Task that processes callee (client) dialog events and emits `LegEvent`s.
+async fn run_callee_event_task(
+    session_id: String,
+    mut callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
+    client_timer: Arc<Mutex<SessionTimerState>>,
+    callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
+    shared: CallSessionShared,
+    leg_tx: mpsc::UnboundedSender<LegEvent>,
+    cancel_token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            state = callee_state_rx.recv() => {
+                match state {
+                    Some(DialogState::Terminated(dialog_id, reason)) => {
+                        let is_active = {
+                            let mut dialogs = callee_dialogs.lock().unwrap();
+                            dialogs.remove(&dialog_id)
+                        };
+                        if is_active {
+                            info!(session_id = %session_id, reason = ?reason, %dialog_id, "Callee dialog terminated");
+                            let _ = leg_tx.send(LegEvent::Terminated {
+                                reason: TerminationReason::ByCallee,
+                            });
+                            break;
+                        } else {
+                            debug!(session_id = %session_id, %dialog_id, "Inactive callee dialog terminated, ignoring");
+                        }
+                    }
+                    Some(DialogState::Updated(dialog_id, request, tx_handle)) => {
+                        debug!(session_id = %session_id, %dialog_id, "Received UPDATE/INVITE on callee dialog");
+                        {
+                            let mut timer = client_timer.lock().unwrap();
+                            if timer.active {
+                                timer.update_refresh();
+                                debug!(session_id = %session_id, "Client session timer refreshed by incoming request from callee");
+                            }
+                        }
+                        let is_reinvite = request.method == rsip::Method::Invite;
+                        let is_update = request.method == rsip::Method::Update;
+                        if is_reinvite || is_update {
+                            let has_sdp = !request.body.is_empty();
+                            let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
+                            shared.store_mid_dialog_reply(MidDialogLeg::Callee, &dialog_id.to_string(), tx_handle);
+                            let _ = leg_tx.send(LegEvent::ReInvite {
+                                leg: MidDialogLeg::Callee,
+                                method: request.method,
+                                sdp,
+                                dialog_id: dialog_id.to_string(),
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        warn!(session_id = %session_id, "Callee dialog state channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl SessionLoopRuntime {
     pub async fn run_server_events_loop(
         context: CallContext,
         proxy_config: Arc<crate::config::ProxyConfig>,
         dialog_layer: Arc<DialogLayer>,
-        mut state_rx: mpsc::UnboundedReceiver<DialogState>,
-        mut callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
+        state_rx: mpsc::UnboundedReceiver<DialogState>,
+        callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
         callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
@@ -44,145 +198,104 @@ impl SessionLoopRuntime {
         pending_hangup: Arc<Mutex<Option<PendingHangup>>>,
         shared: CallSessionShared,
     ) -> Result<()> {
+        let (leg_tx, mut leg_rx) = mpsc::unbounded_channel::<LegEvent>();
+
+        // Spawn per-leg dialog event tasks
+        crate::utils::spawn(run_caller_event_task(
+            context.session_id.clone(),
+            state_rx,
+            server_timer.clone(),
+            shared.clone(),
+            leg_tx.clone(),
+            cancel_token.child_token(),
+        ));
+        crate::utils::spawn(run_callee_event_task(
+            context.session_id.clone(),
+            callee_state_rx,
+            client_timer.clone(),
+            callee_dialogs.clone(),
+            shared,
+            leg_tx,
+            cancel_token.child_token(),
+        ));
+
         let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
+
+        // Termination sequencing: when first leg terminates, wait briefly
+        // for the other leg before cancelling the session token.
+        let mut terminating = false;
+        let termination_deadline = tokio::time::sleep(Duration::from_secs(86400));
+        tokio::pin!(termination_deadline);
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
                     debug!(session_id = %context.session_id, "Session loop cancelled via token");
                     break;
                 }
-                state = state_rx.recv() => {
-                    match state {
-                        Some(state) => {
-                            match state {
-                                DialogState::Terminated(dialog_id, reason) => {
-                                    debug!(session_id = %context.session_id, reason = ?reason, %dialog_id, "Server dialog terminated");
-                                    CallSession::store_pending_hangup(
-                                        &pending_hangup,
-                                        Some(CallRecordHangupReason::ByCaller),
-                                        Some(200),
-                                        Some("caller".to_string()),
-                                    ).ok();
-                                    cancel_token.cancel();
-                                    break;
-                                }
-                                DialogState::Info(dialog_id, request, tx_handle) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Received INFO on server dialog");
-                                    if Self::is_trickle_ice_info(&request) && !request.body.is_empty() {
-                                        let payload = String::from_utf8_lossy(&request.body).to_string();
-                                        let _ = handle.send_command(SessionAction::HandleTrickleIce(payload));
-                                    }
-                                    tx_handle.reply(rsip::StatusCode::OK).await.ok();
-                                }
-                                DialogState::Updated(dialog_id, request, tx_handle) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Received UPDATE/INVITE on server dialog");
-
-                                    let has_sdp = !request.body.is_empty();
-                                    let is_reinvite = request.method == rsip::Method::Invite;
-                                    let is_update = request.method == rsip::Method::Update;
-
-                                    if is_reinvite || is_update {
-                                        let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
-                                        shared.store_mid_dialog_reply(MidDialogLeg::Caller, &dialog_id.to_string(), tx_handle);
-                                        let _ = handle.send_command(SessionAction::HandleReInvite {
-                                            leg: MidDialogLeg::Caller,
-                                            method: request.method.to_string(),
-                                            sdp,
-                                            dialog_id: dialog_id.to_string(),
-                                        });
-                                    } else {
-                                        SipLeg::refresh_timer_state(&server_timer, &request.headers);
-                                        tx_handle.reply(rsip::StatusCode::OK).await.ok();
-                                    }
-                                }
-                                DialogState::Notify(dialog_id, _request, tx_handle) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Received NOTIFY on server dialog");
-                                    tx_handle.reply(rsip::StatusCode::OK).await.ok();
-                                }
-                                DialogState::Options(dialog_id, _request, tx_handle) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Received Option on server dialog");
-                                    tx_handle.reply(rsip::StatusCode::OK).await.ok();
-                                }
-                                DialogState::Calling(dialog_id) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Server dialog in calling state");
-                                }
-                                DialogState::Trying(dialog_id) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Server dialog in trying state");
-                                }
-                                DialogState::Early(dialog_id, _) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Server dialog in early state");
-                                }
-                                DialogState::WaitAck(dialog_id, _) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Server dialog in wait-ack state");
-                                }
-                                DialogState::Confirmed(dialog_id, _) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Server dialog in confirmed state");
-                                }
-                                other_state => {
-                                    debug!(
-                                        session_id = %context.session_id,
-                                        "Received other state on server dialog: {}", other_state
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            warn!(session_id = %context.session_id, "Server dialog state channel closed");
-                            break
-                        }
-                    }
+                _ = &mut termination_deadline, if terminating => {
+                    debug!(session_id = %context.session_id, "Termination grace period expired, cancelling session");
+                    cancel_token.cancel();
+                    break;
                 }
-                state = callee_state_rx.recv() => {
-                    match state {
-                        Some(state) => {
-                            match state {
-                                DialogState::Terminated(dialog_id, reason) => {
-                                    let is_active = {
-                                        let mut dialogs = callee_dialogs.lock().unwrap();
-                                        dialogs.remove(&dialog_id)
-                                    };
-                                    if is_active {
-                                        info!(session_id = %context.session_id, reason = ?reason, %dialog_id, "Callee dialog terminated");
-                                        CallSession::store_pending_hangup(
-                                            &pending_hangup,
-                                            Some(CallRecordHangupReason::ByCallee),
-                                            Some(200),
-                                            Some("callee".to_string()),
-                                        ).ok();
-                                        cancel_token.cancel();
-                                        break;
-                                    } else {
-                                        debug!(session_id = %context.session_id, %dialog_id, "Inactive callee dialog terminated, ignoring");
-                                    }
+                event = leg_rx.recv() => {
+                    match event {
+                        Some(LegEvent::Terminated { reason }) => {
+                            let (hangup_reason, code, initiator) = match reason {
+                                TerminationReason::ByCaller => {
+                                    debug!(session_id = %context.session_id, "Caller leg terminated");
+                                    (CallRecordHangupReason::ByCaller, 200, "caller")
                                 }
-                                DialogState::Updated(dialog_id, request, tx_handle) => {
-                                    debug!(session_id = %context.session_id, %dialog_id, "Received UPDATE/INVITE on callee dialog");
-                                    {
-                                        let mut timer = client_timer.lock().unwrap();
-                                        if timer.active {
-                                            timer.update_refresh();
-                                            debug!(session_id = %context.session_id, "Client session timer refreshed by incoming request from callee");
-                                        }
-                                    }
-                                    let has_sdp = !request.body.is_empty();
-                                    let is_reinvite = request.method == rsip::Method::Invite;
-                                    let is_update = request.method == rsip::Method::Update;
-                                    if is_reinvite || is_update {
-                                        let sdp = has_sdp.then(|| String::from_utf8_lossy(&request.body).to_string());
-                                        shared.store_mid_dialog_reply(MidDialogLeg::Callee, &dialog_id.to_string(), tx_handle);
-                                        let _ = handle.send_command(SessionAction::HandleReInvite {
-                                            leg: MidDialogLeg::Callee,
-                                            method: request.method.to_string(),
-                                            sdp,
-                                            dialog_id: dialog_id.to_string(),
-                                        });
-                                    }
+                                TerminationReason::ByCallee => {
+                                    info!(session_id = %context.session_id, "Callee leg terminated");
+                                    (CallRecordHangupReason::ByCallee, 200, "callee")
                                 }
-                                _ => {}
+                            };
+                            if !terminating {
+                                // First leg terminated: store hangup reason, start grace period
+                                CallSession::store_pending_hangup(
+                                    &pending_hangup,
+                                    Some(hangup_reason),
+                                    Some(code),
+                                    Some(initiator.to_string()),
+                                ).ok();
+                                terminating = true;
+                                termination_deadline.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
+                                debug!(
+                                    session_id = %context.session_id,
+                                    initiator,
+                                    "Entering termination grace period, waiting for other leg"
+                                );
+                            } else {
+                                // Second leg terminated: clean exit
+                                debug!(
+                                    session_id = %context.session_id,
+                                    initiator,
+                                    "Both legs terminated"
+                                );
+                                cancel_token.cancel();
+                                break;
+                            }
+                        }
+                        Some(LegEvent::ReInvite { leg, method, sdp, dialog_id }) => {
+                            if !terminating {
+                                let _ = handle.send_command(SessionAction::HandleReInvite {
+                                    leg,
+                                    method: method.to_string(),
+                                    sdp,
+                                    dialog_id,
+                                });
+                            }
+                        }
+                        Some(LegEvent::TrickleIce { payload }) => {
+                            if !terminating {
+                                let _ = handle.send_command(SessionAction::HandleTrickleIce(payload));
                             }
                         }
                         None => {
-                            warn!(session_id = %context.session_id, "Callee dialog state channel closed");
+                            debug!(session_id = %context.session_id, "All leg event senders dropped");
                             break;
                         }
                     }
