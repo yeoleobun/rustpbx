@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) mod call_leg;
 pub(crate) mod bridge_runtime;
+pub(crate) mod leg_command;
+pub(crate) mod leg_event;
 pub(crate) mod dialplan_runtime;
 pub(crate) mod dtmf_listener;
 pub(crate) mod app_runtime;

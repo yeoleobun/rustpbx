@@ -10,7 +10,7 @@ use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, TIMER_TAG, SessionRefresher, SessionTimerState, parse_session_expires,
 };
 use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction};
-use crate::rwi::call_leg::RwiLegCommand;
+use crate::rwi::call_leg::LegCommand;
 use crate::proxy::server::SipServerRef;
 use crate::rwi::call_leg::{RwiCallLeg, RwiCallLegHandle, RwiCallLegOrigin, RwiCallLegState};
 use crate::rwi::gateway::RwiGateway;
@@ -1058,7 +1058,7 @@ impl RwiCommandProcessor {
                     }
                     cmd = leg_cmd_rx.recv() => {
                         match cmd {
-                            Some(RwiLegCommand::Hangup {
+                            Some(LegCommand::Hangup {
                                 reason,
                                 code,
                                 initiator,
@@ -1069,7 +1069,7 @@ impl RwiCommandProcessor {
                                 }
                                 break;
                             }
-                            Some(RwiLegCommand::Hold { music_source }) => {
+                            Some(LegCommand::Hold { music_source }) => {
                                 if let Some(dialog) = client_dialog.as_ref() {
                                     if let Err(error) = Self::send_standalone_local_reinvite(
                                         gateway.clone(),
@@ -1107,7 +1107,7 @@ impl RwiCommandProcessor {
                                     }
                                 }
                             }
-                            Some(RwiLegCommand::Unhold) => {
+                            Some(LegCommand::Unhold) => {
                                 if let Some(dialog) = client_dialog.as_ref() {
                                     if let Err(error) = Self::send_standalone_local_reinvite(
                                         gateway.clone(),
@@ -1128,11 +1128,10 @@ impl RwiCommandProcessor {
                                 peer.remove_track("hold_music", true).await;
                                 peer.resume_forwarding(&track_id).await;
                             }
-                            Some(RwiLegCommand::PlayPrompt {
-                                audio_file,
+                            Some(LegCommand::PlayAudio {
+                                file: audio_file,
                                 track_id: _,
                                 loop_playback,
-                                interrupt_on_dtmf: _,
                             }) => {
                                 if let Err(error) = Self::start_file_playback_on_peer(
                                     peer.clone(),
@@ -1151,10 +1150,10 @@ impl RwiCommandProcessor {
                                     );
                                 }
                             }
-                            Some(RwiLegCommand::StopPlayback) => {
+                            Some(LegCommand::StopPlayback) => {
                                 peer.remove_track("prompt", true).await;
                             }
-                            Some(RwiLegCommand::Transfer { target }) => {
+                            Some(LegCommand::Transfer { target }) => {
                                 let pending = leg.pending_negotiation_method().await;
                                 let result = if let Some(dialog) = client_dialog.as_ref() {
                                     match rsip::Uri::try_from(target.as_str()) {
@@ -1212,6 +1211,15 @@ impl RwiCommandProcessor {
                                     }
                                 }
                                 leg.finish_negotiation().await;
+                            }
+                            Some(LegCommand::SendBye { .. } | LegCommand::SendCancel) => {
+                                if let Some(dialog) = client_dialog.as_ref() {
+                                    let _ = dialog.hangup().await;
+                                }
+                                break;
+                            }
+                            Some(_) => {
+                                // Other leg commands not applicable to standalone originate
                             }
                             None => break,
                         }
@@ -3278,16 +3286,37 @@ mod tests {
         handle
     }
 
+    fn publish_test_media_to_handle(handle: &CallSessionHandle, call_id: &str) {
+        let peer: Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(
+            MediaStreamBuilder::new()
+                .with_id(format!("{}-rwi-test-leg", call_id))
+                .build(),
+        )));
+        use crate::proxy::proxy_call::state::CallSessionShared;
+        handle.publish_caller_media(
+            peer,
+            None,
+            None,
+            Some((
+                CodecType::PCMU,
+                rustrtc::RtpCodecParameters {
+                    payload_type: CodecType::PCMU.payload_type(),
+                    clock_rate: CodecType::PCMU.clock_rate(),
+                    channels: CodecType::PCMU.channels() as u8,
+                },
+                Vec::new(),
+            )),
+            Some(1234),
+            false,
+        );
+    }
+
     async fn register_test_media_ready_rwi_leg(
         processor: &Arc<RwiCommandProcessor>,
         call_id: &str,
         handle: CallSessionHandle,
     ) {
-        let peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id(format!("{}-rwi-test-leg", call_id))
-                .build(),
-        )));
+        publish_test_media_to_handle(&handle, call_id);
         let leg = RwiCallLeg::new_attached(
             &crate::proxy::active_call_registry::ActiveProxyCallEntry {
                 session_id: call_id.to_string(),
@@ -3300,20 +3329,6 @@ mod tests {
             },
             handle,
         );
-        leg.set_peer(peer).await;
-        leg.set_negotiated_media(
-            Some((
-                CodecType::PCMU,
-                rustrtc::RtpCodecParameters {
-                    payload_type: CodecType::PCMU.payload_type(),
-                    clock_rate: CodecType::PCMU.clock_rate(),
-                    channels: CodecType::PCMU.channels() as u8,
-                },
-                Vec::new(),
-            )),
-            Some(1234),
-        )
-        .await;
         processor
             .gateway
             .write()
@@ -4070,11 +4085,7 @@ mod tests {
             "2001",
             DialDirection::Inbound,
         );
-        let peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id("attached-leg-rwi".to_string())
-                .build(),
-        )));
+        publish_test_media_to_handle(&handle, "attached-leg");
         let leg = RwiCallLeg::new_attached(
             &crate::proxy::active_call_registry::ActiveProxyCallEntry {
                 session_id: "attached-leg".to_string(),
@@ -4087,20 +4098,6 @@ mod tests {
             },
             handle,
         );
-        leg.set_peer(peer).await;
-        leg.set_negotiated_media(
-            Some((
-                CodecType::PCMU,
-                rustrtc::RtpCodecParameters {
-                    payload_type: CodecType::PCMU.payload_type(),
-                    clock_rate: CodecType::PCMU.clock_rate(),
-                    channels: CodecType::PCMU.channels() as u8,
-                },
-                Vec::new(),
-            )),
-            Some(1234),
-        )
-        .await;
         processor
             .gateway
             .write()
@@ -4232,11 +4229,11 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Ok(CommandResult::Success)));
-        assert_eq!(
-            rx.recv().await.expect("transfer command should be queued"),
-            RwiLegCommand::Transfer {
-                target: "sip:target@local".to_string(),
-            }
+        let cmd = rx.recv().await.expect("transfer command should be queued");
+        assert!(
+            matches!(cmd, LegCommand::Transfer { ref target } if target == "sip:target@local"),
+            "expected Transfer command, got {:?}",
+            cmd
         );
     }
 

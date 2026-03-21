@@ -1,11 +1,14 @@
 use crate::call::{DialDirection, Dialplan, MediaConfig, TransactionCookie};
 use crate::callrecord::CallRecordHangupReason;
+use crate::media::negotiate::CodecInfo;
 use crate::proxy::active_call_registry::{
     ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
 };
+use crate::proxy::proxy_call::media_peer::MediaPeer;
 use crate::rwi::proto::RwiEvent;
 use crate::rwi::SupervisorMode;
 use anyhow::Result;
+use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
 use rsip::StatusCode;
 use rsipstack::dialog::dialog::TransactionHandle;
@@ -138,6 +141,48 @@ pub enum ProxyCallPhase {
     Ended,
 }
 
+impl ProxyCallPhase {
+    /// Returns `true` if the transition from the current phase to `target` is valid.
+    pub fn can_transition_to(self, target: ProxyCallPhase) -> bool {
+        use ProxyCallPhase::*;
+        matches!(
+            (self, target),
+            // From Initializing
+            (Initializing, Ringing)
+            | (Initializing, EarlyMedia)
+            | (Initializing, Bridged)
+            | (Initializing, Terminating)
+            | (Initializing, Failed)
+            | (Initializing, Ended)
+            // From Ringing
+            | (Ringing, EarlyMedia)
+            | (Ringing, Bridged)
+            | (Ringing, Terminating)
+            | (Ringing, Failed)
+            | (Ringing, Ended)
+            // From EarlyMedia
+            | (EarlyMedia, Bridged)
+            | (EarlyMedia, Terminating)
+            | (EarlyMedia, Failed)
+            | (EarlyMedia, Ended)
+            // From Bridged
+            | (Bridged, Terminating)
+            | (Bridged, Failed)
+            | (Bridged, Ended)
+            // From Terminating
+            | (Terminating, Ended)
+            | (Terminating, Failed)
+            // From Failed
+            | (Failed, Terminating)
+            | (Failed, Ended)
+        )
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ProxyCallPhase::Ended)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CallSessionSnapshot {
     session_id: String,
@@ -156,6 +201,22 @@ pub struct CallSessionSnapshot {
     pub answer_sdp: Option<String>,
 }
 
+/// Shared media state for the caller leg, readable by RWI attached legs.
+///
+/// Updated by `CallSession` when caller media state changes;
+/// read by `RwiCallLeg` in attached mode to avoid manual sync.
+#[derive(Default)]
+pub struct SharedCallerMedia {
+    pub peer: Option<Arc<dyn MediaPeer>>,
+    pub offer_sdp: Option<String>,
+    pub answer_sdp: Option<String>,
+    pub negotiated_audio: Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)>,
+    pub ssrc: Option<u32>,
+    pub is_bridged: bool,
+}
+
+pub type SharedCallerMediaRef = Arc<RwLock<SharedCallerMedia>>;
+
 #[derive(Clone)]
 pub struct CallSessionShared {
     inner: Arc<RwLock<CallSessionSnapshot>>,
@@ -164,6 +225,7 @@ pub struct CallSessionShared {
     app_event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<crate::call::app::ControllerEvent>>>>,
     dtmf_listener_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pending_mid_dialog_replies: Arc<Mutex<HashMap<String, TransactionHandle>>>,
+    shared_caller_media: SharedCallerMediaRef,
 }
 
 impl CallSessionShared {
@@ -198,6 +260,7 @@ impl CallSessionShared {
             app_event_tx: Arc::new(RwLock::new(None)),
             dtmf_listener_cancel: Arc::new(RwLock::new(None)),
             pending_mid_dialog_replies: Arc::new(Mutex::new(HashMap::new())),
+            shared_caller_media: Arc::new(RwLock::new(SharedCallerMedia::default())),
         }
     }
 
@@ -240,6 +303,31 @@ impl CallSessionShared {
             .and_then(|mut slot| slot.take());
         if let Some(cancel) = cancel {
             cancel.cancel();
+        }
+    }
+
+    /// Get a reference to the shared caller media for RWI attached legs.
+    pub fn shared_caller_media(&self) -> SharedCallerMediaRef {
+        self.shared_caller_media.clone()
+    }
+
+    /// Update the shared caller media from current leg state.
+    pub fn publish_caller_media(
+        &self,
+        peer: Arc<dyn MediaPeer>,
+        offer_sdp: Option<String>,
+        answer_sdp: Option<String>,
+        negotiated_audio: Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)>,
+        ssrc: Option<u32>,
+        is_bridged: bool,
+    ) {
+        if let Ok(mut media) = self.shared_caller_media.write() {
+            media.peer = Some(peer);
+            media.offer_sdp = offer_sdp;
+            media.answer_sdp = answer_sdp;
+            media.negotiated_audio = negotiated_audio;
+            media.ssrc = ssrc;
+            media.is_bridged = is_bridged;
         }
     }
 
@@ -409,6 +497,16 @@ impl CallSessionShared {
             }
             true
         });
+    }
+
+    pub fn transition_to_terminating(&self) -> bool {
+        self.update(|inner| {
+            if matches!(inner.phase, ProxyCallPhase::Ended | ProxyCallPhase::Terminating) {
+                return false;
+            }
+            inner.phase = ProxyCallPhase::Terminating;
+            true
+        })
     }
 
     pub fn mark_hangup(&self, reason: CallRecordHangupReason) {
@@ -629,6 +727,21 @@ impl CallSessionHandle {
         self.shared.cancel_dtmf_listener();
     }
 
+    pub fn shared_caller_media(&self) -> SharedCallerMediaRef {
+        self.shared.shared_caller_media()
+    }
+
+    pub fn publish_caller_media(
+        &self,
+        peer: Arc<dyn MediaPeer>,
+        offer_sdp: Option<String>,
+        answer_sdp: Option<String>,
+        negotiated_audio: Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)>,
+        ssrc: Option<u32>,
+        is_bridged: bool,
+    ) {
+        self.shared.publish_caller_media(peer, offer_sdp, answer_sdp, negotiated_audio, ssrc, is_bridged);
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +758,51 @@ mod tests {
             None,
         );
         CallSessionHandle::with_shared(shared)
+    }
+
+    // ── ProxyCallPhase transition validation ────────────────────────────────
+
+    #[test]
+    fn test_phase_valid_transitions() {
+        use super::ProxyCallPhase::*;
+        // Normal call flow
+        assert!(Initializing.can_transition_to(Ringing));
+        assert!(Ringing.can_transition_to(EarlyMedia));
+        assert!(EarlyMedia.can_transition_to(Bridged));
+        assert!(Bridged.can_transition_to(Terminating));
+        assert!(Terminating.can_transition_to(Ended));
+    }
+
+    #[test]
+    fn test_phase_invalid_transitions() {
+        use super::ProxyCallPhase::*;
+        assert!(!Ended.can_transition_to(Initializing));
+        assert!(!Ended.can_transition_to(Bridged));
+        assert!(!Bridged.can_transition_to(Ringing));
+        assert!(!Terminating.can_transition_to(Bridged));
+    }
+
+    #[test]
+    fn test_phase_is_terminal() {
+        use super::ProxyCallPhase::*;
+        assert!(Ended.is_terminal());
+        assert!(!Bridged.is_terminal());
+        assert!(!Terminating.is_terminal());
+    }
+
+    #[test]
+    fn test_transition_to_terminating() {
+        let shared = CallSessionShared::new(
+            "term-test".to_string(),
+            DialDirection::Inbound,
+            Some("caller".to_string()),
+            Some("callee".to_string()),
+            None,
+        );
+        // Initially Initializing → can transition to Terminating
+        assert!(shared.transition_to_terminating());
+        // Already Terminating → returns false
+        assert!(!shared.transition_to_terminating());
     }
 
     // ── SessionAction serialization / equality ─────────────────────────────

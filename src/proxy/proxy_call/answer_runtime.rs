@@ -17,7 +17,7 @@ impl AnswerRuntime {
         session.caller_leg.sip.supports_trickle_ice
             && session
                 .caller_leg
-                .offer_sdp
+                .media.offer_sdp
                 .as_deref()
                 .map(CallSession::is_webrtc_sdp)
                 .unwrap_or(false)
@@ -88,7 +88,7 @@ impl AnswerRuntime {
             return;
         }
 
-        if session.caller_leg.early_media_sent && dialog_id.is_none() {
+        if session.caller_leg.media.early_media_sent && dialog_id.is_none() {
             debug!("Early media already sent, skipping ringing");
             return;
         }
@@ -117,7 +117,7 @@ impl AnswerRuntime {
         };
 
         if has_early_media {
-            session.caller_leg.early_media_sent = true;
+            session.caller_leg.media.early_media_sent = true;
 
             if session.use_media_proxy {
                 if should_passthrough {
@@ -130,7 +130,7 @@ impl AnswerRuntime {
                 }
 
                 let caller_codec_info = caller_negotiation::build_final_caller_codec_info(
-                    session.caller_leg.offer_sdp.as_deref(),
+                    session.caller_leg.media.offer_sdp.as_deref(),
                     &answer,
                     &session.context.dialplan.allow_codecs,
                     session.use_media_proxy,
@@ -186,7 +186,7 @@ impl AnswerRuntime {
                                     } else {
                                         CallSession::CALLEE_TRACK_ID.to_string()
                                     };
-                                    session.caller_leg.peer.suppress_forwarding(&track_id).await;
+                                    session.caller_leg.media.peer.suppress_forwarding(&track_id).await;
                                 }
                             }
                         }
@@ -277,15 +277,15 @@ impl AnswerRuntime {
         info!(
             server_dialog_id = %session.server_dialog.id(),
             use_media_proxy = session.use_media_proxy,
-            has_answer = session.caller_leg.answer_sdp.is_some(),
+            has_answer = session.caller_leg.media.answer_sdp.is_some(),
             dialog_id = ?dialog_id,
             "Call answered"
         );
 
-        if first_answer && !session.caller_leg.early_media_sent {
+        if first_answer && !session.caller_leg.media.early_media_sent {
             if let Some(ref callee_sdp) = callee_answer {
                 if let Some(codec_info) = caller_negotiation::build_optimized_caller_codec_info(
-                    session.caller_leg.offer_sdp.as_deref(),
+                    session.caller_leg.media.offer_sdp.as_deref(),
                     callee_sdp,
                     &session.context.dialplan.allow_codecs,
                     session.use_media_proxy,
@@ -307,12 +307,12 @@ impl AnswerRuntime {
             }
         }
 
-        if session.caller_leg.answer_sdp.is_none() {
+        if session.caller_leg.media.answer_sdp.is_none() {
             let answer_for_caller = if Self::trickle_ice_enabled(session) {
                 session
                     .build_caller_answer_trickle(
                         caller_negotiation::build_passthrough_caller_answer_codec_info(
-                            session.caller_leg.offer_sdp.as_deref(),
+                            session.caller_leg.media.offer_sdp.as_deref(),
                         ),
                     )
                     .await?
@@ -320,7 +320,7 @@ impl AnswerRuntime {
                 session
                     .build_caller_answer(
                         caller_negotiation::build_passthrough_caller_answer_codec_info(
-                            session.caller_leg.offer_sdp.as_deref(),
+                            session.caller_leg.media.offer_sdp.as_deref(),
                         ),
                     )
                     .await?
@@ -360,11 +360,11 @@ impl AnswerRuntime {
                 session.set_answer(answer);
             }
             session.bridge_runtime.stop_bridge();
-            session.caller_leg.peer.stop();
-            session.callee_leg.peer.stop();
+            session.caller_leg.media.peer.stop();
+            session.callee_leg.media.peer.stop();
         }
 
-        let mut headers = if session.caller_leg.answer_sdp.is_some() {
+        let mut headers = if session.caller_leg.media.answer_sdp.is_some() {
             vec![rsip::Header::ContentType("application/sdp".into())]
         } else {
             vec![]
@@ -394,7 +394,7 @@ impl AnswerRuntime {
 
         if let Err(e) = session.server_dialog.accept(
             Some(headers),
-            session.caller_leg.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
+            session.caller_leg.media.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
         ) {
             return Err(anyhow!("Failed to send 200 OK: {}", e));
         }
@@ -412,7 +412,7 @@ impl AnswerRuntime {
                 callee,
             });
         }
-        session.sync_rwi_attached_leg().await;
+        session.publish_caller_media();
         Ok(())
     }
 }
