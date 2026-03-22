@@ -4,7 +4,7 @@ use crate::proxy::proxy_call::media_peer::MediaPeer;
 use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, parse_session_expires,
 };
-use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction, SharedCallerMediaRef};
+use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction, SharedExportedLegMediaRef};
 use anyhow::{Result, anyhow};
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
@@ -17,6 +17,23 @@ use tokio_util::sync::CancellationToken;
 pub(crate) enum RwiCallLegOrigin {
     InboundAttached,
     OutboundOriginated,
+}
+
+/// Explicit capability model for RWI-controlled calls.
+/// Replaces the loose "has session handle" check with per-command rules
+/// based on call origin, direction, and session kind.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct RwiLegCapabilities {
+    pub can_answer: bool,
+    pub can_ring: bool,
+    pub can_hangup: bool,
+    pub can_hold: bool,
+    pub can_unhold: bool,
+    pub can_transfer: bool,
+    pub can_play_media: bool,
+    pub can_record: bool,
+    pub can_queue: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,9 +55,9 @@ pub(crate) struct RwiLiveLegMedia {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // Fields used by standalone legs (tests) and shared_media fallback path
 pub(crate) struct RwiCallLegRuntime {
     pub peer: Option<Arc<dyn MediaPeer>>,
-    #[allow(dead_code)]
     pub offer_sdp: Option<String>,
     pub answer_sdp: Option<String>,
     pub negotiated_audio: Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)>,
@@ -76,6 +93,7 @@ pub(crate) use crate::proxy::proxy_call::leg_command::LegCommand;
 #[derive(Clone)]
 pub(crate) enum RwiLegCommandHandle {
     Session(CallSessionHandle),
+    #[allow(dead_code)] // Used only in tests via new_outbound()
     Standalone(mpsc::UnboundedSender<LegCommand>),
 }
 
@@ -125,6 +143,7 @@ impl RwiLegCommandHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn send_transfer(&self, target: String) -> Result<()> {
         match self {
             Self::Session(handle) => handle.send_command(SessionAction::from_transfer_target(&target)),
@@ -157,17 +176,18 @@ pub(crate) struct RwiCallLeg {
     runtime: RwLock<RwiCallLegRuntime>,
     /// For attached legs: shared media state published by the session's caller leg.
     /// Reads come from here instead of `runtime` for media fields.
-    shared_media: Option<SharedCallerMediaRef>,
+    shared_media: Option<SharedExportedLegMediaRef>,
 }
 
 pub(crate) type RwiCallLegHandle = Arc<RwiCallLeg>;
 
+#[allow(dead_code)] // Many methods are used only by standalone legs in tests
 impl RwiCallLeg {
     pub(crate) fn new_attached(
         entry: &ActiveProxyCallEntry,
         owner_handle: CallSessionHandle,
     ) -> RwiCallLegHandle {
-        let shared_media = Some(owner_handle.shared_caller_media());
+        let shared_media = Some(owner_handle.shared_exported_leg_media());
         Arc::new(Self {
             call_id: entry.session_id.clone(),
             origin: RwiCallLegOrigin::InboundAttached,
@@ -229,6 +249,7 @@ impl RwiCallLeg {
 
     /// Create an originated leg backed by a CallSessionHandle.
     /// Commands route through the session rather than a standalone command channel.
+    /// Media truth is read from `shared_media` (published by the session).
     pub(crate) fn new_session_originated(
         call_id: String,
         handle: CallSessionHandle,
@@ -237,6 +258,7 @@ impl RwiCallLeg {
         cancel_token: CancellationToken,
         caller: Option<String>,
         callee: Option<String>,
+        shared_media: Option<SharedExportedLegMediaRef>,
     ) -> RwiCallLegHandle {
         Arc::new(Self {
             call_id: call_id.clone(),
@@ -253,8 +275,10 @@ impl RwiCallLeg {
                 status: ActiveProxyCallStatus::Ringing,
             }),
             runtime: RwLock::new(RwiCallLegRuntime {
-                peer: Some(peer),
-                offer_sdp,
+                // For session-backed originated legs, media truth comes from shared_media.
+                // Runtime fields are only used as fallback if shared_media is None.
+                peer: if shared_media.is_some() { None } else { Some(peer) },
+                offer_sdp: if shared_media.is_some() { None } else { offer_sdp },
                 answer_sdp: None,
                 negotiated_audio: None,
                 dialog_ids: HashSet::new(),
@@ -265,7 +289,7 @@ impl RwiCallLeg {
                 negotiation_in_flight: false,
                 pending_method: None,
             }),
-            shared_media: None,
+            shared_media,
         })
     }
 
@@ -284,6 +308,52 @@ impl RwiCallLeg {
 
     pub(crate) fn supports_session_features(&self) -> bool {
         matches!(self.command_handle, RwiLegCommandHandle::Session(_))
+    }
+
+    /// Returns explicit capability rules based on call origin and command handle.
+    pub(crate) fn capabilities(&self) -> RwiLegCapabilities {
+        match (&self.origin, &self.command_handle) {
+            // Inbound attached legs: full capability
+            (RwiCallLegOrigin::InboundAttached, RwiLegCommandHandle::Session(_)) => {
+                RwiLegCapabilities {
+                    can_answer: true,
+                    can_ring: true,
+                    can_hangup: true,
+                    can_hold: true,
+                    can_unhold: true,
+                    can_transfer: true,
+                    can_play_media: true,
+                    can_record: true,
+                    can_queue: true,
+                }
+            }
+            // Session-backed originated outbound legs
+            (RwiCallLegOrigin::OutboundOriginated, RwiLegCommandHandle::Session(_)) => {
+                RwiLegCapabilities {
+                    can_answer: false,
+                    can_ring: false,
+                    can_hangup: true,
+                    can_hold: true,
+                    can_unhold: true,
+                    can_transfer: true,
+                    can_play_media: true,
+                    can_record: true,
+                    can_queue: false,
+                }
+            }
+            // Standalone originated legs: limited to what the standalone channel supports
+            (_, RwiLegCommandHandle::Standalone(_)) => RwiLegCapabilities {
+                can_answer: false,
+                can_ring: false,
+                can_hangup: true,
+                can_hold: true,
+                can_unhold: true,
+                can_transfer: true,
+                can_play_media: true,
+                can_record: false,
+                can_queue: false,
+            },
+        }
     }
 
     pub(crate) async fn set_state(&self, state: RwiCallLegState) {

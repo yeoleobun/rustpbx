@@ -1,8 +1,7 @@
 use crate::callrecord::CallRecordHangupReason;
 use crate::media;
 use crate::media::mixer_registry::MixerParticipantRole;
-use crate::media::negotiate::{CodecInfo, MediaNegotiator};
-use crate::media::{FileTrack, MediaStreamBuilder, RtpTrackBuilder, Track};
+use crate::media::{MediaStreamBuilder, RtpTrackBuilder, Track};
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use crate::proxy::proxy_call::media_peer::{MediaPeer, VoiceEnginePeer};
@@ -17,10 +16,7 @@ use crate::rwi::session::{
     ConferenceCreateRequest, OriginateRequest, QueueEnqueueRequest, RecordStartRequest,
     RwiCommandPayload, SupervisorMode,
 };
-use audio_codec::CodecType;
-use rustrtc;
 use std::collections::HashMap;
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -329,70 +325,6 @@ impl RwiCommandProcessor {
         }
     }
 
-    fn select_best_audio_from_sdp(
-        sdp: &str,
-    ) -> Option<(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)> {
-        let extracted = MediaNegotiator::extract_codec_params(sdp);
-        let dtmf = extracted.dtmf.clone();
-        MediaNegotiator::select_best_codec(&extracted.audio, &[])
-            .map(|codec| (codec.codec, codec.to_params(), dtmf))
-    }
-
-    async fn start_file_playback_on_peer(
-        peer: Arc<dyn MediaPeer>,
-        file_path: &str,
-        internal_track_id: &str,
-        loop_playback: bool,
-        cancel_token: &CancellationToken,
-    ) -> anyhow::Result<()> {
-        if file_path.is_empty() {
-            return Ok(());
-        }
-
-        let is_remote = file_path.starts_with("http://") || file_path.starts_with("https://");
-        if !is_remote && !Path::new(file_path).exists() {
-            return Err(anyhow::anyhow!("Audio file not found: {}", file_path));
-        }
-
-        peer.remove_track(internal_track_id, true).await;
-
-        let peer_tracks = peer.get_tracks().await;
-        let mut codec_info = None;
-        let mut target_pc = None;
-        for track in &peer_tracks {
-            let guard = track.lock().await;
-            if guard.id() == internal_track_id {
-                continue;
-            }
-            if target_pc.is_none() {
-                target_pc = guard.get_peer_connection().await;
-            }
-            codec_info = guard.preferred_codec_info();
-            if codec_info.is_some() {
-                break;
-            }
-        }
-
-        let preferred_codec = codec_info
-            .as_ref()
-            .map(|info| info.codec)
-            .unwrap_or(CodecType::PCMU);
-
-        let mut track = FileTrack::new(internal_track_id.to_string())
-            .with_path(file_path.to_string())
-            .with_loop(loop_playback)
-            .with_cancel_token(cancel_token.child_token())
-            .with_codec_preference(vec![preferred_codec]);
-        if let Some(info) = codec_info {
-            track = track.with_codec_info(info);
-        }
-
-        track.start_playback_on(target_pc).await?;
-        peer.update_track(Box::new(track), Some(internal_track_id.to_string()))
-            .await;
-        Ok(())
-    }
-
     async fn bridge_id_for_legs(&self, leg_a: &str, leg_b: &str) -> String {
         if leg_a <= leg_b {
             format!("{}:{}", leg_a, leg_b)
@@ -556,54 +488,6 @@ impl RwiCommandProcessor {
         Ok(())
     }
 
-    async fn rebuild_direct_bridge_for_leg(
-        gateway: Arc<RwLock<RwiGateway>>,
-        sip_server: Option<SipServerRef>,
-        call_id: &str,
-    ) -> Result<(), CommandError> {
-        let removed_bridge = {
-            let mut gw = gateway.write().await;
-            let Some(bridge_id) = gw.bridge_id_for_leg(&call_id.to_string()) else {
-                return Ok(());
-            };
-            gw.remove_bridge_by_id(&bridge_id).map(|state| (bridge_id, state))
-        };
-
-        let Some((bridge_id, bridge_state)) = removed_bridge else {
-            return Ok(());
-        };
-
-        bridge_state.bridge.stop();
-        let rebuild_result = Self::create_direct_bridge_with_gateway(
-                gateway.clone(),
-                sip_server,
-                &bridge_state.leg_a,
-                &bridge_state.leg_b,
-                bridge_id,
-                false,
-            )
-            .await;
-
-        if rebuild_result.is_err() {
-            let leg_a = {
-                let gw = gateway.read().await;
-                gw.get_leg(&bridge_state.leg_a)
-            };
-            if let Some(leg_a) = leg_a {
-                leg_a.set_state(RwiCallLegState::Answered).await;
-            }
-            let leg_b = {
-                let gw = gateway.read().await;
-                gw.get_leg(&bridge_state.leg_b)
-            };
-            if let Some(leg_b) = leg_b {
-                leg_b.set_state(RwiCallLegState::Answered).await;
-            }
-        }
-
-        rebuild_result
-    }
-
     pub async fn originate_call(
         &self,
         req: OriginateRequest,
@@ -705,23 +589,14 @@ impl RwiCommandProcessor {
         let timeout_secs = req.timeout_secs.unwrap_or(60);
         let caller_display = req.caller_id.unwrap_or_else(|| caller_str.clone());
         let callee_display = req.destination.clone();
-        // Create a second peer for the callee side of the session
-        let callee_peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id(format!("{}-rwi-callee", req.call_id))
-                .with_cancel_token(cancel_token.child_token())
-                .build(),
-        )));
-
         // Create event channel for originated session lifecycle events
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let (handle, _shared) = CallSession::serve_originated(
+        let (handle, shared) = CallSession::serve_originated(
             server.clone(),
             call_id.clone(),
             invite_option,
             peer.clone(),
-            callee_peer,
             cancel_token.clone(),
             timeout_secs as u64,
             Some(caller_display.clone()),
@@ -730,6 +605,7 @@ impl RwiCommandProcessor {
         )
         .await;
 
+        let shared_media = Some(shared.shared_exported_leg_media());
         let leg = RwiCallLeg::new_session_originated(
             call_id.clone(),
             handle.clone(),
@@ -738,6 +614,7 @@ impl RwiCommandProcessor {
             cancel_token.clone(),
             Some(caller_display.clone()),
             Some(callee_display.clone()),
+            shared_media,
         );
         {
             let mut gw = self.gateway.write().await;
@@ -872,6 +749,26 @@ impl RwiCommandProcessor {
         })
     }
 
+    /// Get session handle with explicit capability check.
+    async fn require_capability(
+        &self,
+        call_id: &str,
+        check: impl FnOnce(&crate::rwi::call_leg::RwiLegCapabilities) -> bool,
+        capability_name: &str,
+    ) -> Result<CallSessionHandle, CommandError> {
+        let leg = self.get_leg(call_id).await?;
+        let caps = leg.capabilities();
+        if !check(&caps) {
+            return Err(CommandError::CommandFailed(format!(
+                "{} is not supported for this call leg",
+                capability_name,
+            )));
+        }
+        leg.session_handle().ok_or_else(|| {
+            CommandError::CommandFailed("no session handle available".to_string())
+        })
+    }
+
     async fn send_leg_action(
         &self,
         call_id: &str,
@@ -884,7 +781,9 @@ impl RwiCommandProcessor {
     }
 
     async fn answer_call(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_answer, "answer")
+            .await?;
         handle
             .send_command(SessionAction::AcceptCall {
                 callee: None,
@@ -946,7 +845,9 @@ impl RwiCommandProcessor {
     }
 
     async fn ring_call(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_ring, "ring")
+            .await?;
         handle
             .send_command(SessionAction::StartRinging {
                 ringback: None,
@@ -997,7 +898,9 @@ impl RwiCommandProcessor {
         call_id: &str,
         target: &str,
     ) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_transfer, "transfer")
+            .await?;
         handle
             .send_command(SessionAction::from_transfer_target(target))
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
@@ -1103,6 +1006,8 @@ impl RwiCommandProcessor {
         source: &crate::rwi::session::MediaSource,
         interrupt_on_dtmf: bool,
     ) -> Result<CommandResult, CommandError> {
+        self.require_capability(call_id, |c| c.can_play_media, "media_play")
+            .await?;
         // Resolve the audio file (or special source type) from the MediaSource.
         let source_type = source.source_type.as_str();
         let audio_file = match source_type {
@@ -1189,13 +1094,17 @@ impl RwiCommandProcessor {
     }
 
     async fn media_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+        self.require_capability(call_id, |c| c.can_play_media, "media_stop")
+            .await?;
         self.send_leg_action(call_id, SessionAction::StopPlayback)
             .await?;
         Ok(CommandResult::Success)
     }
 
     async fn queue_enqueue(&self, req: QueueEnqueueRequest) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(&req.call_id).await?;
+        let handle = self
+            .require_capability(&req.call_id, |c| c.can_queue, "queue")
+            .await?;
         handle.set_queue_name(Some(req.queue_id.clone()));
         let queue_state = QueueState {
             queue_id: req.queue_id.clone(),
@@ -1216,7 +1125,9 @@ impl RwiCommandProcessor {
     }
 
     async fn queue_dequeue(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
         let queue_id = {
             let states = self.queue_states.read().await;
             states.get(call_id).map(|s| s.queue_id.clone())
@@ -1237,7 +1148,9 @@ impl RwiCommandProcessor {
     }
 
     async fn queue_hold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
         {
             let mut states = self.queue_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1265,7 +1178,9 @@ impl RwiCommandProcessor {
     }
 
     async fn queue_unhold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
         {
             let mut states = self.queue_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1291,8 +1206,8 @@ impl RwiCommandProcessor {
         call_id: &str,
         priority: u32,
     ) -> Result<CommandResult, CommandError> {
-        // Verify call exists
-        self.get_handle(call_id).await?;
+        self.require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
 
         // Check if call is in queue
         {
@@ -1320,8 +1235,8 @@ impl RwiCommandProcessor {
         call_id: &str,
         agent_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        // Verify call exists
-        self.get_handle(call_id).await?;
+        self.require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
 
         // Check if call is in queue
         let queue_id = {
@@ -1353,8 +1268,8 @@ impl RwiCommandProcessor {
         queue_id: &str,
         priority: Option<u32>,
     ) -> Result<CommandResult, CommandError> {
-        // Verify call exists
-        self.get_handle(call_id).await?;
+        self.require_capability(call_id, |c| c.can_queue, "queue")
+            .await?;
 
         // Check if call is in queue
         let old_queue_id = {
@@ -1396,6 +1311,8 @@ impl RwiCommandProcessor {
         call_id: &str,
         music: Option<&str>,
     ) -> Result<CommandResult, CommandError> {
+        self.require_capability(call_id, |c| c.can_hold, "hold")
+            .await?;
         let audio_file = music.unwrap_or("").to_string();
         self.send_leg_action(
             call_id,
@@ -1414,6 +1331,8 @@ impl RwiCommandProcessor {
 
     /// Release a call from hold.
     async fn call_unhold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+        self.require_capability(call_id, |c| c.can_unhold, "unhold")
+            .await?;
         self.send_leg_action(call_id, SessionAction::Unhold).await?;
         let event = RwiEvent::MediaHoldStopped {
             call_id: call_id.to_string(),
@@ -1424,7 +1343,9 @@ impl RwiCommandProcessor {
     }
 
     async fn record_start(&self, req: RecordStartRequest) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(&req.call_id).await?;
+        let handle = self
+            .require_capability(&req.call_id, |c| c.can_record, "record")
+            .await?;
         let recording_id = Uuid::new_v4().to_string();
         let path = req.storage.path.clone();
         handle
@@ -1454,7 +1375,9 @@ impl RwiCommandProcessor {
     }
 
     async fn record_pause(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_record, "record")
+            .await?;
         {
             let mut states = self.record_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1484,7 +1407,9 @@ impl RwiCommandProcessor {
     }
 
     async fn record_resume(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_record, "record")
+            .await?;
         {
             let mut states = self.record_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1514,7 +1439,9 @@ impl RwiCommandProcessor {
     }
 
     async fn record_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let handle = self.get_handle(call_id).await?;
+        let handle = self
+            .require_capability(call_id, |c| c.can_record, "record")
+            .await?;
         let (recording_id, duration) = {
             let mut states = self.record_states.write().await;
             if let Some(state) = states.remove(call_id) {
@@ -2638,7 +2565,7 @@ mod tests {
                 .with_id(format!("{}-rwi-test-leg", call_id))
                 .build(),
         )));
-        handle.publish_caller_media(
+        handle.publish_exported_leg_media(
             peer,
             None,
             None,

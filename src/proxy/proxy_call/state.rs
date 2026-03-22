@@ -238,12 +238,12 @@ pub struct CallSessionSnapshot {
     pub answer_sdp: Option<String>,
 }
 
-/// Shared media state for the caller leg, readable by RWI attached legs.
+/// Shared media state for the session's exported control/view leg.
 ///
-/// Updated by `CallSession` when caller media state changes;
-/// read by `RwiCallLeg` in attached mode to avoid manual sync.
+/// Updated by `CallSession` when exported leg media state changes;
+/// read by `RwiCallLeg` to avoid manual sync and duplicate ownership.
 #[derive(Default)]
-pub struct SharedCallerMedia {
+pub struct SharedExportedLegMedia {
     pub peer: Option<Arc<dyn MediaPeer>>,
     pub offer_sdp: Option<String>,
     pub answer_sdp: Option<String>,
@@ -252,7 +252,7 @@ pub struct SharedCallerMedia {
     pub is_bridged: bool,
 }
 
-pub type SharedCallerMediaRef = Arc<RwLock<SharedCallerMedia>>;
+pub type SharedExportedLegMediaRef = Arc<RwLock<SharedExportedLegMedia>>;
 
 #[derive(Clone)]
 pub struct CallSessionShared {
@@ -262,7 +262,7 @@ pub struct CallSessionShared {
     app_event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<crate::call::app::ControllerEvent>>>>,
     dtmf_listener_cancel: Arc<RwLock<Option<CancellationToken>>>,
     pending_mid_dialog_replies: Arc<Mutex<HashMap<String, TransactionHandle>>>,
-    shared_caller_media: SharedCallerMediaRef,
+    shared_exported_leg_media: SharedExportedLegMediaRef,
 }
 
 impl CallSessionShared {
@@ -297,7 +297,7 @@ impl CallSessionShared {
             app_event_tx: Arc::new(RwLock::new(None)),
             dtmf_listener_cancel: Arc::new(RwLock::new(None)),
             pending_mid_dialog_replies: Arc::new(Mutex::new(HashMap::new())),
-            shared_caller_media: Arc::new(RwLock::new(SharedCallerMedia::default())),
+            shared_exported_leg_media: Arc::new(RwLock::new(SharedExportedLegMedia::default())),
         }
     }
 
@@ -343,13 +343,13 @@ impl CallSessionShared {
         }
     }
 
-    /// Get a reference to the shared caller media for RWI attached legs.
-    pub fn shared_caller_media(&self) -> SharedCallerMediaRef {
-        self.shared_caller_media.clone()
+    /// Get a reference to the shared exported leg media for RWI consumers.
+    pub fn shared_exported_leg_media(&self) -> SharedExportedLegMediaRef {
+        self.shared_exported_leg_media.clone()
     }
 
-    /// Update the shared caller media from current leg state.
-    pub fn publish_caller_media(
+    /// Update the shared exported leg media from current leg state.
+    pub fn publish_exported_leg_media(
         &self,
         peer: Arc<dyn MediaPeer>,
         offer_sdp: Option<String>,
@@ -358,7 +358,7 @@ impl CallSessionShared {
         ssrc: Option<u32>,
         is_bridged: bool,
     ) {
-        if let Ok(mut media) = self.shared_caller_media.write() {
+        if let Ok(mut media) = self.shared_exported_leg_media.write() {
             media.peer = Some(peer);
             media.offer_sdp = offer_sdp;
             media.answer_sdp = answer_sdp;
@@ -806,11 +806,11 @@ impl CallSessionHandle {
         self.shared.cancel_dtmf_listener();
     }
 
-    pub fn shared_caller_media(&self) -> SharedCallerMediaRef {
-        self.shared.shared_caller_media()
+    pub fn shared_exported_leg_media(&self) -> SharedExportedLegMediaRef {
+        self.shared.shared_exported_leg_media()
     }
 
-    pub fn publish_caller_media(
+    pub fn publish_exported_leg_media(
         &self,
         peer: Arc<dyn MediaPeer>,
         offer_sdp: Option<String>,
@@ -819,7 +819,7 @@ impl CallSessionHandle {
         ssrc: Option<u32>,
         is_bridged: bool,
     ) {
-        self.shared.publish_caller_media(peer, offer_sdp, answer_sdp, negotiated_audio, ssrc, is_bridged);
+        self.shared.publish_exported_leg_media(peer, offer_sdp, answer_sdp, negotiated_audio, ssrc, is_bridged);
     }
 }
 

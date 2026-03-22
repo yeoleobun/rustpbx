@@ -188,7 +188,7 @@ impl SessionLoopRuntime {
         proxy_config: Arc<crate::config::ProxyConfig>,
         dialog_layer: Arc<DialogLayer>,
         state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
-        callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
+        callee_state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
         callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
@@ -211,15 +211,17 @@ impl SessionLoopRuntime {
                 cancel_token.child_token(),
             ));
         }
-        crate::utils::spawn(run_callee_event_task(
-            context.session_id.clone(),
-            callee_state_rx,
-            client_timer.clone(),
-            callee_dialogs.clone(),
-            shared,
-            leg_tx,
-            cancel_token.child_token(),
-        ));
+        if let Some(callee_rx) = callee_state_rx {
+            crate::utils::spawn(run_callee_event_task(
+                context.session_id.clone(),
+                callee_rx,
+                client_timer.clone(),
+                callee_dialogs.clone(),
+                shared,
+                leg_tx,
+                cancel_token.child_token(),
+            ));
+        }
 
         let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
 
