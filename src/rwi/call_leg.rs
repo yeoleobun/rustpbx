@@ -227,6 +227,48 @@ impl RwiCallLeg {
         })
     }
 
+    /// Create an originated leg backed by a CallSessionHandle.
+    /// Commands route through the session rather than a standalone command channel.
+    pub(crate) fn new_session_originated(
+        call_id: String,
+        handle: CallSessionHandle,
+        peer: Arc<dyn MediaPeer>,
+        offer_sdp: Option<String>,
+        cancel_token: CancellationToken,
+        caller: Option<String>,
+        callee: Option<String>,
+    ) -> RwiCallLegHandle {
+        Arc::new(Self {
+            call_id: call_id.clone(),
+            origin: RwiCallLegOrigin::OutboundOriginated,
+            command_handle: RwiLegCommandHandle::Session(handle),
+            cancel_token: Some(cancel_token),
+            info: RwLock::new(RwiCallLegInfo {
+                call_id,
+                caller,
+                callee,
+                direction: "outbound".to_string(),
+                started_at: Utc::now(),
+                answered_at: None,
+                status: ActiveProxyCallStatus::Ringing,
+            }),
+            runtime: RwLock::new(RwiCallLegRuntime {
+                peer: Some(peer),
+                offer_sdp,
+                answer_sdp: None,
+                negotiated_audio: None,
+                dialog_ids: HashSet::new(),
+                connected_dialog_id: None,
+                ssrc: None,
+                state: RwiCallLegState::Initializing,
+                session_timer: None,
+                negotiation_in_flight: false,
+                pending_method: None,
+            }),
+            shared_media: None,
+        })
+    }
+
     pub(crate) fn origin(&self) -> RwiCallLegOrigin {
         self.origin
     }

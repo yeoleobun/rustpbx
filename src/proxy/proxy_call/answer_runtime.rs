@@ -24,7 +24,10 @@ impl AnswerRuntime {
     }
 
     async fn spawn_inbound_trickle_ice_sender(session: &CallSession) {
-        let server_dialog = session.server_dialog.clone();
+        let Some(server_dialog) = session.caller_leg.clone_server_dialog() else {
+            warn!("No server dialog on caller leg, cannot send trickle ICE");
+            return;
+        };
         let cancel_token = session.cancel_token.child_token();
         let session_id = session.context.session_id.clone();
         let Some((_pc, mut candidate_rx, mut gathering_rx)) =
@@ -242,7 +245,7 @@ impl AnswerRuntime {
             (None, None)
         };
 
-        if let Err(e) = session.server_dialog.ringing(headers, body) {
+        if let Err(e) = session.caller_leg.send_provisional(headers, body) {
             warn!("Failed to send {} response: {}", status_code, e);
             return;
         }
@@ -275,7 +278,7 @@ impl AnswerRuntime {
             session.answer_time = Some(Instant::now());
         }
         info!(
-            server_dialog_id = %session.server_dialog.id(),
+            server_dialog_id = ?session.caller_leg.server_dialog_id(),
             use_media_proxy = session.use_media_proxy,
             has_answer = session.caller_leg.media.answer_sdp.is_some(),
             dialog_id = ?dialog_id,
@@ -392,7 +395,7 @@ impl AnswerRuntime {
             ));
         }
 
-        if let Err(e) = session.server_dialog.accept(
+        if let Err(e) = session.caller_leg.accept_inbound(
             Some(headers),
             session.caller_leg.media.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
         ) {

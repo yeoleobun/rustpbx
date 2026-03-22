@@ -119,17 +119,16 @@ impl CallReporter {
             destination: snapshot.routed_destination.clone(),
         };
 
-        let server_dialog_id = snapshot.server_dialog_id.clone();
         let mut call_ids: HashSet<String> = HashSet::new();
-        call_ids.insert(server_dialog_id.call_id.clone());
+        let mut sip_leg_roles = HashMap::new();
+
+        if let Some(ref server_dialog_id) = snapshot.server_dialog_id {
+            call_ids.insert(server_dialog_id.call_id.clone());
+            sip_leg_roles.insert(server_dialog_id.call_id.clone(), "caller".to_string());
+        }
 
         for dialog_id in &snapshot.callee_dialogs {
             call_ids.insert(dialog_id.call_id.clone());
-        }
-
-        let mut sip_leg_roles = HashMap::new();
-        sip_leg_roles.insert(server_dialog_id.call_id.clone(), "caller".to_string());
-        for dialog_id in &snapshot.callee_dialogs {
             sip_leg_roles.insert(dialog_id.call_id.clone(), "callee".to_string());
         }
 

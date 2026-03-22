@@ -187,12 +187,12 @@ impl SessionLoopRuntime {
         context: CallContext,
         proxy_config: Arc<crate::config::ProxyConfig>,
         dialog_layer: Arc<DialogLayer>,
-        state_rx: mpsc::UnboundedReceiver<DialogState>,
+        state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
         callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
         callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
-        server_dialog: ServerInviteDialog,
+        server_dialog: Option<ServerInviteDialog>,  // caller leg's server dialog clone for timer refresh (None for non-proxy sessions)
         handle: CallSessionHandle,
         cancel_token: CancellationToken,
         pending_hangup: Arc<Mutex<Option<PendingHangup>>>,
@@ -200,15 +200,17 @@ impl SessionLoopRuntime {
     ) -> Result<()> {
         let (leg_tx, mut leg_rx) = mpsc::unbounded_channel::<LegEvent>();
 
-        // Spawn per-leg dialog event tasks
-        crate::utils::spawn(run_caller_event_task(
-            context.session_id.clone(),
-            state_rx,
-            server_timer.clone(),
-            shared.clone(),
-            leg_tx.clone(),
-            cancel_token.child_token(),
-        ));
+        // Spawn caller event task only when an inbound server dialog exists (proxy sessions)
+        if let Some(state_rx) = state_rx {
+            crate::utils::spawn(run_caller_event_task(
+                context.session_id.clone(),
+                state_rx,
+                server_timer.clone(),
+                shared.clone(),
+                leg_tx.clone(),
+                cancel_token.child_token(),
+            ));
+        }
         crate::utils::spawn(run_callee_event_task(
             context.session_id.clone(),
             callee_state_rx,
@@ -335,53 +337,57 @@ impl SessionLoopRuntime {
                     }
 
                     if should_refresh_server {
-                        debug!(session_id = %context.session_id, "Server session timer: sending refresh (UAS)");
+                        if let Some(ref server_dialog) = server_dialog {
+                            debug!(session_id = %context.session_id, "Server session timer: sending refresh (UAS)");
 
-                        let session_interval = {
-                            let mut timer = server_timer.lock().unwrap();
-                            timer.refreshing = true;
-                            timer.session_interval
-                        };
+                            let session_interval = {
+                                let mut timer = server_timer.lock().unwrap();
+                                timer.refreshing = true;
+                                timer.session_interval
+                            };
 
-                        let headers = vec![
-                            rsip::Header::Supported(rsip::headers::Supported::from(TIMER_TAG).into()),
-                            rsip::Header::Other(
-                                HEADER_SESSION_EXPIRES.into(),
-                                format!("{};refresher=uas", session_interval.as_secs()),
-                            ),
-                        ];
+                            let headers = vec![
+                                rsip::Header::Supported(rsip::headers::Supported::from(TIMER_TAG).into()),
+                                rsip::Header::Other(
+                                    HEADER_SESSION_EXPIRES.into(),
+                                    format!("{};refresher=uas", session_interval.as_secs()),
+                                ),
+                            ];
 
-                        let server_dialog = server_dialog.clone();
-                        let server_timer = server_timer.clone();
-                        let session_id = context.session_id.clone();
-                        let cancel_token_clone = cancel_token.clone();
+                            let server_dialog = server_dialog.clone();
+                            let server_timer = server_timer.clone();
+                            let session_id = context.session_id.clone();
+                            let cancel_token_clone = cancel_token.clone();
 
-                        crate::utils::spawn(async move {
-                            tokio::select!{
-                                _ = cancel_token_clone.cancelled() => {
-                                    debug!(session_id = %session_id, "Not sending UPDATE for session refresh, session cancelled");
-                                },
-                                result = server_dialog.update(Some(headers), None) => {
-                                    let mut timer = server_timer.lock().unwrap();
-                                    timer.refreshing = false;
-                                    match result {
-                                        Err(e) => {
-                                            warn!(session_id = %session_id, "Failed to send UPDATE for session refresh: {}", e);
-                                        }
-                                        Ok(None) => {
-                                            warn!(session_id = %session_id, "UPDATE for session refresh returned no response");
-                                        }
-                                        Ok(Some(resp)) => {
-                                            if matches!(resp.status_code.kind(), rsip::status_code::StatusCodeKind::Successful) {
-                                                timer.update_refresh();
-                                            } else {
-                                                warn!(session_id = %session_id, status = %resp.status_code, "UPDATE for session refresh failed");
+                            crate::utils::spawn(async move {
+                                tokio::select!{
+                                    _ = cancel_token_clone.cancelled() => {
+                                        debug!(session_id = %session_id, "Not sending UPDATE for session refresh, session cancelled");
+                                    },
+                                    result = server_dialog.update(Some(headers), None) => {
+                                        let mut timer = server_timer.lock().unwrap();
+                                        timer.refreshing = false;
+                                        match result {
+                                            Err(e) => {
+                                                warn!(session_id = %session_id, "Failed to send UPDATE for session refresh: {}", e);
+                                            }
+                                            Ok(None) => {
+                                                warn!(session_id = %session_id, "UPDATE for session refresh returned no response");
+                                            }
+                                            Ok(Some(resp)) => {
+                                                if matches!(resp.status_code.kind(), rsip::status_code::StatusCodeKind::Successful) {
+                                                    timer.update_refresh();
+                                                } else {
+                                                    warn!(session_id = %session_id, status = %resp.status_code, "UPDATE for session refresh failed");
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        } else {
+                            debug!(session_id = %context.session_id, "Server session timer refresh skipped: no server dialog");
+                        }
                     }
 
                     if should_refresh_client {

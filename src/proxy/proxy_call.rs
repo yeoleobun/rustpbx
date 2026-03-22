@@ -4,11 +4,13 @@ use crate::{
     call::{Dialplan, TransactionCookie},
     callrecord::CallRecordSender,
     proxy::proxy_call::session::CallSession,
-    proxy::proxy_call::state::CallContext,
+    proxy::proxy_call::state::{CallContext, SessionKind},
     proxy::server::SipServerRef,
 };
 use anyhow::Result;
 use rsip::prelude::{HeadersExt, UntypedHeader};
+use rsipstack::dialog::DialogId;
+use rsipstack::transaction::key::TransactionRole;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -115,6 +117,7 @@ impl CallSessionBuilder {
 
         let context = CallContext {
             session_id,
+            kind: SessionKind::Proxy,
             dialplan: dialplan.clone(),
             cookie: self.cookie,
             start_time: Instant::now(),
@@ -164,6 +167,7 @@ impl CallSessionBuilder {
 
         let context = CallContext {
             session_id,
+            kind: SessionKind::Proxy,
             dialplan: dialplan.clone(),
             cookie: self.cookie,
             start_time: Instant::now(),
@@ -204,11 +208,10 @@ impl CallSessionBuilder {
             routed_destination: None,
             last_queue_name: None,
             callee_dialogs: vec![],
-            server_dialog_id: rsipstack::dialog::DialogId {
-                call_id: "".into(),
-                local_tag: "".into(),
-                remote_tag: "".into(),
-            },
+            server_dialog_id: DialogId::try_from((
+                dialplan.original.as_ref(),
+                TransactionRole::Server,
+            )).ok(),
             extensions: dialplan.extensions.clone(),
         };
 

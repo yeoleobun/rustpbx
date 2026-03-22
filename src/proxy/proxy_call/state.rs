@@ -19,10 +19,23 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// The kind of session driving this call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// Normal B2BUA proxied call (inbound INVITE -> outbound INVITE).
+    Proxy,
+    /// RWI-originated single-leg call (no inbound server dialog).
+    RwiSingleLeg,
+    /// App-driven session (IVR, voicemail -- single leg + app).
+    AppDriven,
+}
+
 /// Immutable context for the entire duration of a call
 #[derive(Clone)]
 pub struct CallContext {
     pub session_id: String,
+    pub kind: SessionKind,
     pub dialplan: Arc<Dialplan>,
     pub cookie: TransactionCookie,
     pub start_time: Instant,
@@ -133,6 +146,9 @@ impl SessionAction {
 #[serde(rename_all = "snake_case")]
 pub enum ProxyCallPhase {
     Initializing,
+    Routing,
+    App,
+    Dialing,
     Ringing,
     EarlyMedia,
     Bridged,
@@ -148,12 +164,33 @@ impl ProxyCallPhase {
         matches!(
             (self, target),
             // From Initializing
-            (Initializing, Ringing)
+            (Initializing, Routing)
+            | (Initializing, App)
+            | (Initializing, Dialing)
+            | (Initializing, Ringing)
             | (Initializing, EarlyMedia)
             | (Initializing, Bridged)
             | (Initializing, Terminating)
             | (Initializing, Failed)
             | (Initializing, Ended)
+            // From Routing
+            | (Routing, App)
+            | (Routing, Dialing)
+            | (Routing, Ringing)
+            | (Routing, Terminating)
+            | (Routing, Failed)
+            // From App
+            | (App, Dialing)
+            | (App, Routing)
+            | (App, Terminating)
+            | (App, Failed)
+            | (App, Ended)
+            // From Dialing
+            | (Dialing, Ringing)
+            | (Dialing, EarlyMedia)
+            | (Dialing, Bridged)
+            | (Dialing, Terminating)
+            | (Dialing, Failed)
             // From Ringing
             | (Ringing, EarlyMedia)
             | (Ringing, Bridged)
@@ -457,9 +494,46 @@ impl CallSessionShared {
         });
     }
 
+    pub fn transition_to_routing(&self) -> bool {
+        self.update(|inner| {
+            if inner.phase.can_transition_to(ProxyCallPhase::Routing) {
+                inner.phase = ProxyCallPhase::Routing;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn transition_to_app(&self) -> bool {
+        self.update(|inner| {
+            if inner.phase.can_transition_to(ProxyCallPhase::App) {
+                inner.phase = ProxyCallPhase::App;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn transition_to_dialing(&self) -> bool {
+        self.update(|inner| {
+            if inner.phase.can_transition_to(ProxyCallPhase::Dialing) {
+                inner.phase = ProxyCallPhase::Dialing;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     pub fn transition_to_ringing(&self, has_early_media: bool) -> bool {
         let changed = self.update(|inner| match inner.phase {
-            ProxyCallPhase::Initializing | ProxyCallPhase::Ringing | ProxyCallPhase::EarlyMedia => {
+            ProxyCallPhase::Initializing
+            | ProxyCallPhase::Routing
+            | ProxyCallPhase::Dialing
+            | ProxyCallPhase::Ringing
+            | ProxyCallPhase::EarlyMedia => {
                 if inner.ring_time.is_none() {
                     inner.ring_time = Some(Utc::now());
                 }
@@ -470,7 +544,8 @@ impl CallSessionShared {
                 };
                 true
             }
-            ProxyCallPhase::Bridged
+            ProxyCallPhase::App
+            | ProxyCallPhase::Bridged
             | ProxyCallPhase::Terminating
             | ProxyCallPhase::Failed
             | ProxyCallPhase::Ended => false,
@@ -512,6 +587,10 @@ impl CallSessionShared {
     pub fn mark_hangup(&self, reason: CallRecordHangupReason) {
         self.update(|inner| {
             inner.hangup_reason = Some(reason);
+            // Ensure we transition through Terminating before Ended
+            if !matches!(inner.phase, ProxyCallPhase::Terminating | ProxyCallPhase::Ended) {
+                inner.phase = ProxyCallPhase::Terminating;
+            }
             inner.phase = ProxyCallPhase::Ended;
             true
         });
