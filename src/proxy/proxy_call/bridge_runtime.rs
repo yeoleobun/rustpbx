@@ -86,28 +86,28 @@ impl BridgeRuntime {
         Ok(())
     }
 
-    pub async fn suppress_or_pause_callee_forwarding(
+    pub async fn suppress_or_pause_target_forwarding(
         &self,
         track_id: &str,
-        caller_peer: Arc<dyn MediaPeer>,
+        exported_peer: Arc<dyn MediaPeer>,
     ) -> Result<()> {
         if let Some(ref bridge) = self.media_bridge {
             bridge.suppress_forwarding(track_id).await?;
         } else {
-            caller_peer.suppress_forwarding(track_id).await;
+            exported_peer.suppress_forwarding(track_id).await;
         }
         Ok(())
     }
 
-    pub async fn resume_or_unpause_callee_forwarding(
+    pub async fn resume_or_unpause_target_forwarding(
         &self,
         track_id: &str,
-        caller_peer: Arc<dyn MediaPeer>,
+        exported_peer: Arc<dyn MediaPeer>,
     ) -> Result<()> {
         if let Some(ref bridge) = self.media_bridge {
             bridge.resume_forwarding(track_id).await?;
         } else {
-            caller_peer.resume_forwarding(track_id).await;
+            exported_peer.resume_forwarding(track_id).await;
         }
         Ok(())
     }

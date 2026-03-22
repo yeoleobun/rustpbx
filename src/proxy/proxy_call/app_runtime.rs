@@ -331,7 +331,7 @@ impl AppRuntime {
             return;
         }
 
-        let caller_peer = session.exported_leg.media.peer.clone();
+        let exported_peer = session.exported_leg.media.peer.clone();
         let dtmf_event_tx = event_tx.clone();
         let dtmf_cancel = cancel_token.child_token();
         session.exported_leg.media.set_dtmf_listener_cancel(dtmf_cancel.clone());
@@ -340,7 +340,7 @@ impl AppRuntime {
             .set_dtmf_listener_cancel(Some(dtmf_cancel.clone()));
         crate::utils::spawn(async move {
             spawn_caller_dtmf_listener(
-                caller_peer,
+                exported_peer,
                 dtmf_event_tx,
                 caller_dtmf_codecs,
                 dtmf_cancel,

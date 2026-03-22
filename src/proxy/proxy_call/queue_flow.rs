@@ -132,7 +132,7 @@ impl QueueFlow {
 
         let _ = session
             .bridge_runtime
-            .suppress_or_pause_callee_forwarding(
+            .suppress_or_pause_target_forwarding(
                 CallSession::CALLEE_TRACK_ID,
                 session.exported_leg.media.peer.clone(),
             )
@@ -144,7 +144,7 @@ impl QueueFlow {
         session.exported_leg.media.remove_track("queue-hold-music").await;
         let _ = session
             .bridge_runtime
-            .resume_or_unpause_callee_forwarding(
+            .resume_or_unpause_target_forwarding(
                 CallSession::CALLEE_TRACK_ID,
                 session.exported_leg.media.peer.clone(),
             )
