@@ -23,6 +23,7 @@ pub(crate) mod dialplan_runtime;
 pub(crate) mod dtmf_listener;
 pub(crate) mod app_runtime;
 pub(crate) mod answer_runtime;
+pub(crate) mod originated_runtime;
 pub(crate) mod media_endpoint;
 pub(crate) mod media_bridge;
 pub(crate) mod media_peer;

@@ -7,6 +7,7 @@ use crate::proxy::proxy_call::app_runtime::AppRuntime;
 use crate::proxy::proxy_call::bridge_runtime::BridgeRuntime;
 use crate::proxy::proxy_call::call_leg::{CallLeg, CallLegDirection};
 use crate::proxy::proxy_call::dialplan_runtime::DialplanRuntime;
+use crate::proxy::proxy_call::originated_runtime::OriginatedRuntime;
 use crate::proxy::proxy_call::media_endpoint::{BridgeSelection, MediaEndpoint};
 use crate::proxy::proxy_call::queue_flow::QueueFlow;
 use crate::proxy::proxy_call::recording_runtime::RecordingState;
@@ -1360,7 +1361,7 @@ impl CallSession {
                     match self.context.kind {
                         crate::proxy::proxy_call::state::SessionKind::RwiSingleLeg
                         | crate::proxy::proxy_call::state::SessionKind::AppDriven => {
-                            self.refer_originated_callee(&target).await
+                            OriginatedRuntime::refer_callee(self, &target).await
                         }
                         _ => {
                             if let Some(endpoint) = TransferEndpoint::parse(&target) {
@@ -1445,7 +1446,7 @@ impl CallSession {
                     match self.context.kind {
                         crate::proxy::proxy_call::state::SessionKind::RwiSingleLeg
                         | crate::proxy::proxy_call::state::SessionKind::AppDriven => {
-                            self.hold_originated_callee(music_source.as_deref()).await
+                            OriginatedRuntime::hold_callee(self, music_source.as_deref()).await
                         }
                         _ => {
                             let audio_file = music_source.clone().unwrap_or_default();
@@ -1470,7 +1471,7 @@ impl CallSession {
                     match self.context.kind {
                         crate::proxy::proxy_call::state::SessionKind::RwiSingleLeg
                         | crate::proxy::proxy_call::state::SessionKind::AppDriven => {
-                            self.unhold_originated_callee().await
+                            OriginatedRuntime::unhold_callee(self).await
                         }
                         _ => {
                             self.caller_leg.unhold().await;
@@ -1988,11 +1989,11 @@ impl CallSession {
             None => return true, // no termination tracking → finalize immediately
         };
 
-        // Caller side: must be terminated if cleanup was sent AND a server dialog exists
+        // Caller side: OK if no cleanup needed, no server dialog exists, or dialog is terminated
         let caller_ok = if ts.caller_cleanup_sent {
-            self.caller_leg.is_server_dialog_terminated()
+            self.caller_leg.server_dialog_ref().is_none()
+                || self.caller_leg.is_server_dialog_terminated()
         } else {
-            // No cleanup sent → either no server dialog or already terminated before cleanup
             true
         };
 
@@ -2003,16 +2004,7 @@ impl CallSession {
             true
         };
 
-        match self.context.kind {
-            crate::proxy::proxy_call::state::SessionKind::Proxy => {
-                caller_ok && callee_ok
-            }
-            crate::proxy::proxy_call::state::SessionKind::RwiSingleLeg
-            | crate::proxy::proxy_call::state::SessionKind::AppDriven => {
-                // Single-leg: only the owned leg(s) matter
-                callee_ok && (caller_ok || self.caller_leg.server_dialog_ref().is_none())
-            }
-        }
+        caller_ok && callee_ok
     }
 
     /// Wait until all SIP dialogs are confirmed terminated or the grace
@@ -2068,234 +2060,6 @@ impl CallSession {
 
     /// Originated dial flow: sends a single outbound INVITE and handles
     /// the dialog state transitions using session phases and shared state.
-    async fn run_originated_dial(
-        &mut self,
-        action_inbox: &mut SessionActionInbox,
-    ) -> Result<()> {
-        let params = self
-            .originated_dial_params
-            .take()
-            .ok_or_else(|| anyhow!("originated_dial_params missing"))?;
-
-        self.shared.transition_to_dialing();
-
-        // Create the callee leg now that we're about to dial
-        let offer_sdp = params.invite_option.offer.as_ref()
-            .map(|b| String::from_utf8_lossy(b).to_string());
-        let callee_media_builder = crate::media::MediaStreamBuilder::new()
-            .with_id(format!("{}-callee", self.context.session_id))
-            .with_cancel_token(self.cancel_token.child_token());
-        let callee_peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(callee_media_builder.build())));
-        self.callee_leg = Some(CallLeg::new(
-            self.context.session_id.clone(),
-            crate::proxy::proxy_call::call_leg::LegRole::Callee,
-            CallLegDirection::Outbound,
-            callee_peer,
-            offer_sdp,
-        ));
-        // Set dialog event channel from stored tx
-        if let Some(tx) = self.callee_dialog_event_tx.take() {
-            self.callee_leg_mut().sip.dialog_event_tx = Some(tx);
-        }
-
-        let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-        let dialog_layer = self.dialog_layer.clone();
-        let invite_future = dialog_layer
-            .do_invite(params.invite_option, state_tx);
-        tokio::pin!(invite_future);
-
-        let mut timeout = tokio::time::sleep(Duration::from_secs(params.timeout_secs)).boxed();
-        let mut invite_completed = false;
-        let mut client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog> = None;
-
-        loop {
-            // Process any pending session actions
-            while let Ok(action) = action_inbox.try_recv() {
-                self.apply_session_action(action, None).await?;
-            }
-
-            tokio::select! {
-                // Timeout before answer
-                _ = &mut timeout, if !invite_completed => {
-                    self.set_error(StatusCode::RequestTimeout, Some("No answer".to_string()), None);
-                    self.hangup_reason = Some(CallRecordHangupReason::NoAnswer);
-                    Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Failed {
-                        reason: "no_answer".to_string(),
-                        sip_status: Some(408),
-                    });
-                    self.cancel_token.cancel();
-                    return Err(anyhow!("Originate timeout"));
-                }
-
-                // Dialog state transitions from the callee
-                state = state_rx.recv() => {
-                    match state {
-                        Some(DialogState::Calling(_)) => {
-                            self.shared.transition_to_ringing(false);
-                            self.ring_time = Some(Instant::now());
-                            Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Ringing);
-                        }
-                        Some(DialogState::Early(_, _)) => {
-                            self.shared.transition_to_ringing(true);
-                            if self.ring_time.is_none() {
-                                self.ring_time = Some(Instant::now());
-                            }
-                            Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::EarlyMedia);
-                        }
-                        Some(DialogState::Confirmed(dialog_id, _)) => {
-                            // Answer processing happens in the INVITE future result branch below.
-                            // Confirmed state on callee side is expected after the INVITE succeeds.
-                            debug!(session_id = %self.context.session_id, %dialog_id, "Originated callee dialog confirmed");
-                        }
-                        Some(DialogState::Terminated(_, _)) => {
-                            info!(session_id = %self.context.session_id, "Originated callee dialog terminated");
-                            if self.answer_time.is_some() {
-                                self.hangup_reason = Some(CallRecordHangupReason::ByCallee);
-                                Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Hangup {
-                                    reason: "terminated".to_string(),
-                                });
-                            } else {
-                                self.hangup_reason = Some(CallRecordHangupReason::Failed);
-                                Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Failed {
-                                    reason: "terminated".to_string(),
-                                    sip_status: None,
-                                });
-                            }
-                            self.cancel_token.cancel();
-                            return Ok(());
-                        }
-                        Some(DialogState::Updated(dialog_id, request, tx_handle)) => {
-                            // Route through canonical mid-dialog handling path
-                            debug!(session_id = %self.context.session_id, %dialog_id, "Originated call received mid-dialog update");
-                            let is_reinvite = *request.method() == rsip::Method::Invite;
-                            let is_update = *request.method() == rsip::Method::Update;
-                            if is_reinvite || is_update {
-                                let has_sdp = !request.body().is_empty();
-                                let sdp = has_sdp.then(|| String::from_utf8_lossy(request.body()).to_string());
-                                let method = request.method().clone();
-                                self.shared.store_mid_dialog_reply(
-                                    MidDialogLeg::Callee,
-                                    &dialog_id.to_string(),
-                                    tx_handle,
-                                );
-                                self.handle_reinvite(
-                                    MidDialogLeg::Callee,
-                                    method,
-                                    dialog_id.to_string(),
-                                    sdp,
-                                ).await;
-                            }
-                        }
-                        Some(_) => {
-                            // Other dialog states (Trying, WaitAck, etc.) — ignore
-                        }
-                        None => {
-                            debug!(session_id = %self.context.session_id, "Originated callee state channel closed");
-                            break;
-                        }
-                    }
-                }
-
-                // INVITE future completion (initial response)
-                result = &mut invite_future, if !invite_completed => {
-                    invite_completed = true;
-                    match result {
-                        Ok((dialog, Some(resp))) if resp.status_code.kind() == rsip::StatusCodeKind::Successful => {
-                            info!(session_id = %self.context.session_id, dialog_id = %dialog.id(), "Originated call answered (200 OK)");
-                            self.answer_time = Some(Instant::now());
-                            self.connected_callee = Some(self.context.original_callee.clone());
-
-                            // Register callee dialog
-                            let dialog_id = dialog.id();
-                            {
-                                let mut active = self.callee_leg_mut().sip.active_dialog_ids.lock().unwrap();
-                                active.insert(dialog_id.clone());
-                            }
-                            self.callee_leg_mut().sip.connected_dialog_id = Some(dialog_id.clone());
-                            if let Some(ref handle) = self.handle {
-                                self.shared.register_dialog(dialog_id.to_string(), handle.clone());
-                            }
-
-                            // Store answer SDP from the remote on both legs
-                            if !resp.body().is_empty() {
-                                let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                                self.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                                self.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                                // Extract negotiated codec from the answer SDP
-                                self.caller_leg.media.select_or_store_negotiated_audio(
-                                    MediaEndpoint::select_best_audio_from_sdp(
-                                        &answer_sdp,
-                                        &self.context.dialplan.allow_codecs,
-                                    ),
-                                );
-                            }
-
-                            // Publish caller media (stable identity) to shared state
-                            self.publish_exported_leg_media();
-
-                            self.shared.transition_to_answered();
-                            Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Answered);
-                            client_dialog = Some(dialog);
-                        }
-                        Ok((_dialog, resp_opt)) => {
-                            let sip_status = resp_opt.as_ref().map(|r| r.status_code.code());
-                            let is_busy = sip_status == Some(486) || sip_status == Some(600);
-                            self.hangup_reason = Some(CallRecordHangupReason::Failed);
-
-                            if is_busy {
-                                Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Busy);
-                            } else {
-                                Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Failed {
-                                    reason: "originate_failed".to_string(),
-                                    sip_status,
-                                });
-                            }
-
-                            let code = sip_status
-                                .and_then(|c| StatusCode::try_from(c).ok())
-                                .unwrap_or(StatusCode::ServerInternalError);
-                            self.set_error(code, Some("Originate failed".to_string()), None);
-                            self.cancel_token.cancel();
-                            return Err(anyhow!("Originate failed"));
-                        }
-                        Err(error) => {
-                            self.hangup_reason = Some(CallRecordHangupReason::Failed);
-                            Self::emit_originated_event(&params.event_tx, OriginatedSessionEvent::Failed {
-                                reason: error.to_string(),
-                                sip_status: None,
-                            });
-                            self.set_error(StatusCode::ServerInternalError, Some(error.to_string()), None);
-                            self.cancel_token.cancel();
-                            return Err(error.into());
-                        }
-                    }
-                }
-
-                // Cancellation
-                _ = self.cancel_token.cancelled() => {
-                    debug!(session_id = %self.context.session_id, "Originated call cancelled");
-                    if let Some(ref dialog) = client_dialog {
-                        let _ = dialog.hangup().await;
-                    }
-                    if self.hangup_reason.is_none() {
-                        self.hangup_reason = Some(CallRecordHangupReason::Canceled);
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper to emit an originated session event if a sender is available.
-    fn emit_originated_event(
-        tx: &Option<mpsc::UnboundedSender<OriginatedSessionEvent>>,
-        event: OriginatedSessionEvent,
-    ) {
-        if let Some(tx) = tx {
-            let _ = tx.send(event);
-        }
-    }
 
     pub async fn serve(
         server: SipServerRef,
@@ -2475,199 +2239,6 @@ impl CallSession {
             }
         }
         Ok(())
-    }
-
-    /// Hold the callee side for originated/app-driven sessions.
-    /// Sends a re-INVITE with `sendonly` to the remote party and optionally
-    /// plays hold music on the caller peer.
-    async fn hold_originated_callee(&mut self, music_source: Option<&str>) -> Result<()> {
-        use rsipstack::dialog::dialog::Dialog;
-
-        let callee_dialog_id = self.callee_leg().sip.connected_dialog_id.as_ref()
-            .ok_or_else(|| anyhow!("no connected callee dialog for hold"))?
-            .clone();
-
-        let dialog = self.dialog_layer.get_dialog(&callee_dialog_id)
-            .ok_or_else(|| anyhow!("callee dialog not found for hold"))?;
-
-        let Dialog::ClientInvite(client_dialog) = dialog else {
-            return Err(anyhow!("callee dialog is not a client invite dialog"));
-        };
-
-        // Build a sendonly SDP offer from the caller peer's track
-        let offer_sdp = self.build_local_offer_with_direction("sendonly").await?;
-        self.caller_leg.media.offer_sdp = Some(offer_sdp.clone());
-
-        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-        let response = client_dialog
-            .reinvite(Some(headers), Some(offer_sdp.into_bytes()))
-            .await
-            .map_err(|e| anyhow!("hold re-INVITE failed: {}", e))?;
-
-        if let Some(resp) = response {
-            if !resp.body().is_empty() {
-                let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                self.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                self.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                self.caller_leg.media.select_or_store_negotiated_audio(
-                    MediaEndpoint::select_best_audio_from_sdp(
-                        &answer_sdp,
-                        &self.context.dialplan.allow_codecs,
-                    ),
-                );
-            }
-        }
-
-        // Re-publish caller media state after hold (stable identity)
-        self.publish_exported_leg_media();
-
-        // Suppress media forwarding on the caller peer
-        let tracks = self.caller_leg.media.peer.get_tracks().await;
-        if let Some(track) = tracks.first() {
-            let guard = track.lock().await;
-            self.caller_leg.media.peer.suppress_forwarding(guard.id()).await;
-        }
-
-        // Play hold music if provided
-        if let Some(audio_file) = music_source.filter(|s| !s.is_empty()) {
-            self.caller_leg
-                .play_audio(
-                    &self.context.session_id,
-                    audio_file,
-                    true,
-                    "hold_music",
-                    true,
-                    self.cancel_token.clone(),
-                    self.app_event_tx.clone(),
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Unhold the callee side for originated/app-driven sessions.
-    /// Sends a re-INVITE with `sendrecv` to the remote party.
-    async fn unhold_originated_callee(&mut self) -> Result<()> {
-        use rsipstack::dialog::dialog::Dialog;
-
-        let callee_dialog_id = self.callee_leg().sip.connected_dialog_id.as_ref()
-            .ok_or_else(|| anyhow!("no connected callee dialog for unhold"))?
-            .clone();
-
-        let dialog = self.dialog_layer.get_dialog(&callee_dialog_id)
-            .ok_or_else(|| anyhow!("callee dialog not found for unhold"))?;
-
-        let Dialog::ClientInvite(client_dialog) = dialog else {
-            return Err(anyhow!("callee dialog is not a client invite dialog"));
-        };
-
-        let offer_sdp = self.build_local_offer_with_direction("sendrecv").await?;
-        self.caller_leg.media.offer_sdp = Some(offer_sdp.clone());
-
-        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-        let response = client_dialog
-            .reinvite(Some(headers), Some(offer_sdp.into_bytes()))
-            .await
-            .map_err(|e| anyhow!("unhold re-INVITE failed: {}", e))?;
-
-        if let Some(resp) = response {
-            if !resp.body().is_empty() {
-                let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                self.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                self.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                self.caller_leg.media.select_or_store_negotiated_audio(
-                    MediaEndpoint::select_best_audio_from_sdp(
-                        &answer_sdp,
-                        &self.context.dialplan.allow_codecs,
-                    ),
-                );
-            }
-        }
-
-        // Re-publish caller media state after unhold (stable identity)
-        self.publish_exported_leg_media();
-
-        // Remove hold music and resume forwarding
-        self.caller_leg.media.peer.remove_track("hold_music", true).await;
-        let tracks = self.caller_leg.media.peer.get_tracks().await;
-        if let Some(track) = tracks.first() {
-            let guard = track.lock().await;
-            self.caller_leg.media.peer.resume_forwarding(guard.id()).await;
-        }
-
-        Ok(())
-    }
-
-    /// Transfer via SIP REFER for originated/app-driven sessions.
-    async fn refer_originated_callee(&mut self, target: &str) -> Result<()> {
-        use rsipstack::dialog::dialog::Dialog;
-
-        let target_uri = Uri::try_from(target)
-            .map_err(|e| anyhow!("invalid transfer target '{}': {}", target, e))?;
-
-        let callee_dialog_id = self.callee_leg().sip.connected_dialog_id.as_ref()
-            .ok_or_else(|| anyhow!("no connected callee dialog for transfer"))?
-            .clone();
-
-        let dialog = self.dialog_layer.get_dialog(&callee_dialog_id)
-            .ok_or_else(|| anyhow!("callee dialog not found for transfer"))?;
-
-        let Dialog::ClientInvite(client_dialog) = dialog else {
-            return Err(anyhow!("callee dialog is not a client invite dialog"));
-        };
-
-        let result = client_dialog
-            .refer(target_uri, None, None)
-            .await
-            .map_err(|e| anyhow!("REFER failed: {}", e))?;
-
-        match result {
-            Some(resp) if resp.status_code.kind() == rsip::StatusCodeKind::Successful => {
-                info!(
-                    session_id = %self.context.session_id,
-                    target = %target,
-                    "Originated call transferred successfully"
-                );
-                Ok(())
-            }
-            Some(resp) => {
-                Err(anyhow!(
-                    "REFER rejected with status {}",
-                    resp.status_code
-                ))
-            }
-            None => Err(anyhow!("REFER returned no response")),
-        }
-    }
-
-    /// Build a local SDP offer from the caller peer's first track with
-    /// the specified media direction.
-    async fn build_local_offer_with_direction(&self, direction: &str) -> Result<String> {
-        let tracks = self.caller_leg.media.peer.get_tracks().await;
-        let track = tracks.first()
-            .ok_or_else(|| anyhow!("no track on caller peer for SDP offer"))?;
-        let guard = track.lock().await;
-        let offer = guard.local_description().await
-            .map_err(|e| anyhow!("failed to get local description: {}", e))?;
-
-        let dir = match direction {
-            "sendonly" => rustrtc::Direction::SendOnly,
-            "recvonly" => rustrtc::Direction::RecvOnly,
-            "inactive" => rustrtc::Direction::Inactive,
-            _ => rustrtc::Direction::SendRecv,
-        };
-
-        let mut desc = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer)
-            .map_err(|e| anyhow!("failed to parse local SDP: {:?}", e))?;
-
-        for section in &mut desc.media_sections {
-            if section.kind == rustrtc::MediaKind::Audio {
-                section.direction = dir;
-            }
-        }
-
-        Ok(desc.to_sdp_string())
     }
 
     /// Bootstrap an RWI-originated session: no inbound server dialog,
@@ -2905,25 +2476,18 @@ impl CallSession {
                     crate::proxy::proxy_call::state::SessionKind::Proxy => {
                         DialplanRuntime::execute_dialplan(&mut self, Some(&mut action_inbox)).await?;
                         info!(session_id = %self.context.session_id, "Dialplan execution finished, waiting for call termination");
-                        loop {
-                            if let Some(action) = action_inbox.recv().await {
-                                self.apply_session_action(action, Some(&mut action_inbox)).await?;
-                            } else {
-                                break;
-                            }
-                        }
                     }
                     crate::proxy::proxy_call::state::SessionKind::RwiSingleLeg
                     | crate::proxy::proxy_call::state::SessionKind::AppDriven => {
-                        self.run_originated_dial(&mut action_inbox).await?;
+                        OriginatedRuntime::run_dial(&mut self, &mut action_inbox).await?;
                         info!(session_id = %self.context.session_id, "Originated dial finished, waiting for call termination");
-                        loop {
-                            if let Some(action) = action_inbox.recv().await {
-                                self.apply_session_action(action, Some(&mut action_inbox)).await?;
-                            } else {
-                                break;
-                            }
-                        }
+                    }
+                }
+                loop {
+                    if let Some(action) = action_inbox.recv().await {
+                        self.apply_session_action(action, Some(&mut action_inbox)).await?;
+                    } else {
+                        break;
                     }
                 }
                 Ok::<(), anyhow::Error>(())
