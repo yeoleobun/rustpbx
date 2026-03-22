@@ -6,11 +6,9 @@ use crate::media::{FileTrack, MediaStreamBuilder, RtpTrackBuilder, Track};
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use crate::proxy::proxy_call::media_peer::{MediaPeer, VoiceEnginePeer};
-use crate::proxy::proxy_call::session_timer::{
-    HEADER_SESSION_EXPIRES, TIMER_TAG, SessionRefresher, SessionTimerState, parse_session_expires,
-};
+use crate::proxy::proxy_call::session_timer::{HEADER_SESSION_EXPIRES, TIMER_TAG};
+use crate::proxy::proxy_call::session::{CallSession, OriginatedSessionEvent};
 use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction};
-use crate::rwi::call_leg::LegCommand;
 use crate::proxy::server::SipServerRef;
 use crate::rwi::call_leg::{RwiCallLeg, RwiCallLegHandle, RwiCallLegOrigin, RwiCallLegState};
 use crate::rwi::gateway::RwiGateway;
@@ -20,16 +18,14 @@ use crate::rwi::session::{
     RwiCommandPayload, SupervisorMode,
 };
 use audio_codec::CodecType;
-use futures::FutureExt;
-use rustrtc::{Direction, MediaKind, SdpType, SessionDescription};
+use rustrtc;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -115,16 +111,6 @@ pub struct RwiCommandProcessor {
 impl RwiCommandProcessor {
     fn local_contact_uri(server: &crate::proxy::server::SipServerInner) -> Option<rsip::Uri> {
         server.default_contact_uri()
-    }
-
-    fn standalone_negotiation_pending_error(pending: Option<String>) -> CommandError {
-        let suffix = pending
-            .map(|method| format!(" ({})", method))
-            .unwrap_or_default();
-        CommandError::CommandFailed(format!(
-            "standalone renegotiation already in progress{}",
-            suffix
-        ))
     }
 
     pub fn new(
@@ -618,303 +604,6 @@ impl RwiCommandProcessor {
         rebuild_result
     }
 
-    async fn apply_standalone_remote_answer(
-        gateway: Arc<RwLock<RwiGateway>>,
-        sip_server: Option<SipServerRef>,
-        call_id: &str,
-        leg: &RwiCallLegHandle,
-        peer: Arc<dyn MediaPeer>,
-        track_id: &str,
-        answer_sdp: &str,
-    ) -> Result<(), CommandError> {
-        peer.update_remote_description(track_id, answer_sdp)
-            .await
-            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        leg.set_answer(answer_sdp.to_string()).await;
-        leg.set_negotiated_media(
-            Self::select_best_audio_from_sdp(answer_sdp),
-            MediaNegotiator::extract_ssrc(answer_sdp),
-        )
-        .await;
-        if leg.state().await != RwiCallLegState::Bridged {
-            leg.set_state(RwiCallLegState::Answered).await;
-        }
-        Self::rebuild_direct_bridge_for_leg(gateway, sip_server, call_id).await?;
-        Ok(())
-    }
-
-    fn build_standalone_session_timer(
-        enabled: bool,
-        response: &rsip::Response,
-        default_expires: u64,
-    ) -> Option<SessionTimerState> {
-        if !enabled {
-            return None;
-        }
-
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.last_refresh = Instant::now();
-
-        let session_expires = response.headers.iter().find_map(|header| match header {
-            rsip::Header::Other(name, value) if name.eq_ignore_ascii_case(HEADER_SESSION_EXPIRES) => {
-                Some(value.clone())
-            }
-            _ => None,
-        });
-
-        if let Some(value) = session_expires {
-            if let Some((interval, refresher)) = parse_session_expires(&value) {
-                timer.session_interval = interval;
-                timer.refresher = refresher.unwrap_or(SessionRefresher::Uac);
-                return Some(timer);
-            }
-        }
-
-        timer.session_interval = std::time::Duration::from_secs(default_expires);
-        timer.refresher = SessionRefresher::Uac;
-        Some(timer)
-    }
-
-    async fn handle_standalone_session_timer_tick(
-        call_id: &str,
-        leg: &RwiCallLegHandle,
-        client_dialog: Option<&rsipstack::dialog::client_dialog::ClientInviteDialog>,
-        gateway: Arc<RwLock<RwiGateway>>,
-    ) -> Result<bool, CommandError> {
-        let Some(timer) = leg.session_timer().await else {
-            return Ok(false);
-        };
-
-        if !timer.enabled || !timer.active {
-            return Ok(false);
-        }
-
-        if leg.is_negotiating().await {
-            return Ok(false);
-        }
-
-        if timer.is_expired() {
-            warn!(call_id = %call_id, "Standalone RWI leg session timer expired");
-            leg.set_state(RwiCallLegState::Terminated).await;
-            {
-                let gw = gateway.read().await;
-                gw.send_event_to_call_owner(
-                    &call_id.to_string(),
-                    &RwiEvent::CallHangup {
-                        call_id: call_id.to_string(),
-                        reason: Some("session_timer_expired".to_string()),
-                        sip_status: None,
-                    },
-                );
-            }
-            if let Some(dialog) = client_dialog {
-                let _ = dialog.hangup().await;
-            }
-            return Ok(true);
-        }
-
-        if timer.refresher != SessionRefresher::Uac || !timer.should_refresh() {
-            return Ok(false);
-        }
-
-        let Some(dialog) = client_dialog else {
-            return Ok(false);
-        };
-
-        if leg.try_begin_negotiation("UPDATE").await.is_err() {
-            return Ok(false);
-        }
-        leg.set_session_timer_refreshing(true).await;
-        let headers = vec![
-            rsip::Header::Supported(rsip::headers::Supported::from(TIMER_TAG).into()),
-            rsip::Header::Other(
-                HEADER_SESSION_EXPIRES.into(),
-                format!("{};refresher=uac", timer.session_interval.as_secs()),
-            ),
-        ];
-
-        match dialog.update(Some(headers), None).await {
-            Err(error) => {
-                warn!(call_id = %call_id, error = %error, "Standalone session refresh UPDATE failed");
-                leg.update_session_timer_after_refresh(false).await;
-            }
-            Ok(None) => {
-                warn!(call_id = %call_id, "Standalone session refresh UPDATE returned no response");
-                leg.update_session_timer_after_refresh(false).await;
-            }
-            Ok(Some(response)) => {
-                if matches!(response.status_code.kind(), rsip::status_code::StatusCodeKind::Successful)
-                {
-                    leg.update_session_timer_after_refresh(true).await;
-                } else {
-                    warn!(call_id = %call_id, status = %response.status_code, "Standalone session refresh UPDATE failed");
-                    leg.update_session_timer_after_refresh(false).await;
-                }
-            }
-        }
-        leg.finish_negotiation().await;
-
-        Ok(false)
-    }
-
-    fn rewrite_audio_direction_in_sdp(
-        offer_sdp: &str,
-        direction: &str,
-    ) -> Result<String, CommandError> {
-        let mut desc = SessionDescription::parse(SdpType::Offer, offer_sdp)
-            .map_err(|e| CommandError::CommandFailed(format!("failed to parse local SDP offer: {e:?}")))?;
-        let direction = match direction {
-            "sendonly" => Direction::SendOnly,
-            "recvonly" => Direction::RecvOnly,
-            "inactive" => Direction::Inactive,
-            _ => Direction::SendRecv,
-        };
-
-        let mut updated = false;
-        for section in &mut desc.media_sections {
-            if section.kind != MediaKind::Audio {
-                continue;
-            }
-            section.direction = direction;
-            updated = true;
-        }
-
-        if !updated {
-            return Err(CommandError::CommandFailed(
-                "local offer missing audio media section".to_string(),
-            ));
-        }
-
-        Ok(desc.to_sdp_string())
-    }
-
-    async fn build_standalone_local_offer(
-        peer: Arc<dyn MediaPeer>,
-        track_id: &str,
-        direction: Option<&str>,
-    ) -> Result<String, CommandError> {
-        let tracks = peer.get_tracks().await;
-        for track in tracks {
-            let guard = track.lock().await;
-            if guard.id() != track_id {
-                continue;
-            }
-            let offer = guard
-                .local_description()
-                .await
-                .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-            return match direction {
-                Some(direction) => Self::rewrite_audio_direction_in_sdp(&offer, direction),
-                None => Ok(offer),
-            };
-        }
-
-        Err(CommandError::CommandFailed(format!(
-            "standalone track not found: {}",
-            track_id
-        )))
-    }
-
-    async fn send_standalone_local_reinvite(
-        gateway: Arc<RwLock<RwiGateway>>,
-        sip_server: Option<SipServerRef>,
-        call_id: &str,
-        leg: &RwiCallLegHandle,
-        peer: Arc<dyn MediaPeer>,
-        track_id: &str,
-        dialog: &rsipstack::dialog::client_dialog::ClientInviteDialog,
-        direction: Option<&str>,
-    ) -> Result<(), CommandError> {
-        leg.try_begin_negotiation("INVITE")
-            .await
-            .map_err(Self::standalone_negotiation_pending_error)?;
-        let local_offer = match Self::build_standalone_local_offer(peer.clone(), track_id, direction).await {
-            Ok(offer) => offer,
-            Err(error) => {
-                leg.finish_negotiation().await;
-                return Err(error);
-            }
-        };
-        leg.set_offer(Some(local_offer.clone())).await;
-
-        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-        let response = match dialog
-            .reinvite(Some(headers), Some(local_offer.into_bytes()))
-            .await
-        {
-            Ok(Some(response)) => response,
-            Ok(None) => {
-                leg.finish_negotiation().await;
-                return Err(CommandError::CommandFailed(
-                    "standalone re-INVITE returned no response".to_string(),
-                ));
-            }
-            Err(error) => {
-                leg.finish_negotiation().await;
-                return Err(CommandError::CommandFailed(error.to_string()));
-            }
-        };
-
-        leg.refresh_session_timer_from_headers(&response.headers).await;
-        if !matches!(response.status_code.kind(), rsip::status_code::StatusCodeKind::Successful) {
-            leg.finish_negotiation().await;
-            return Err(CommandError::CommandFailed(format!(
-                "standalone re-INVITE failed: {}",
-                response.status_code
-            )));
-        }
-
-        if response.body().is_empty() {
-            leg.finish_negotiation().await;
-            return Err(CommandError::CommandFailed(
-                "standalone re-INVITE missing SDP answer".to_string(),
-            ));
-        }
-
-        let answer_sdp = String::from_utf8_lossy(response.body()).to_string();
-        let result = Self::apply_standalone_remote_answer(
-            gateway,
-            sip_server,
-            call_id,
-            leg,
-            peer,
-            track_id,
-            &answer_sdp,
-        )
-        .await;
-        leg.finish_negotiation().await;
-        result
-    }
-
-    async fn apply_standalone_remote_offer(
-        gateway: Arc<RwLock<RwiGateway>>,
-        sip_server: Option<SipServerRef>,
-        call_id: &str,
-        leg: &RwiCallLegHandle,
-        peer: Arc<dyn MediaPeer>,
-        track_id: &str,
-        offer_sdp: &str,
-    ) -> Result<String, CommandError> {
-        let local_answer = peer
-            .renegotiate_track(track_id, offer_sdp)
-            .await
-            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        leg.set_offer(Some(local_answer.clone())).await;
-        leg.set_answer(offer_sdp.to_string()).await;
-        leg.set_negotiated_media(
-            Self::select_best_audio_from_sdp(offer_sdp),
-            MediaNegotiator::extract_ssrc(offer_sdp),
-        )
-        .await;
-        if leg.state().await != RwiCallLegState::Bridged {
-            leg.set_state(RwiCallLegState::Answered).await;
-        }
-        Self::rebuild_direct_bridge_for_leg(gateway, sip_server, call_id).await?;
-        Ok(local_answer)
-    }
-
     pub async fn originate_call(
         &self,
         req: OriginateRequest,
@@ -1013,17 +702,37 @@ impl RwiCommandProcessor {
 
         let call_id = req.call_id.clone();
         let gateway = self.gateway.clone();
-        let sip_server = self.sip_server.clone();
         let timeout_secs = req.timeout_secs.unwrap_or(60);
-        let dialog_layer = server.dialog_layer.clone();
-        let session_timer_enabled = server.proxy_config.session_timer;
-        let default_session_expires = server.proxy_config.session_expires.unwrap_or(1800);
         let caller_display = req.caller_id.unwrap_or_else(|| caller_str.clone());
         let callee_display = req.destination.clone();
-        let (leg_cmd_tx, mut leg_cmd_rx) = mpsc::unbounded_channel();
-        let leg = RwiCallLeg::new_outbound(
+        // Create a second peer for the callee side of the session
+        let callee_peer = Arc::new(VoiceEnginePeer::new(Arc::new(
+            MediaStreamBuilder::new()
+                .with_id(format!("{}-rwi-callee", req.call_id))
+                .with_cancel_token(cancel_token.child_token())
+                .build(),
+        )));
+
+        // Create event channel for originated session lifecycle events
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let (handle, _shared) = CallSession::serve_originated(
+            server.clone(),
             call_id.clone(),
-            leg_cmd_tx,
+            invite_option,
+            peer.clone(),
+            callee_peer,
+            cancel_token.clone(),
+            timeout_secs as u64,
+            Some(caller_display.clone()),
+            Some(callee_display.clone()),
+            Some(event_tx),
+        )
+        .await;
+
+        let leg = RwiCallLeg::new_session_originated(
+            call_id.clone(),
+            handle.clone(),
             peer.clone(),
             offer_sdp.clone(),
             cancel_token.clone(),
@@ -1035,396 +744,72 @@ impl RwiCommandProcessor {
             gw.register_leg(call_id.clone(), leg.clone());
         }
 
+        // Spawn event bridge: forward OriginatedSessionEvent to RwiEvent via gateway
+        let event_call_id = call_id.clone();
+        let event_gateway = gateway.clone();
+        let event_leg = leg.clone();
         tokio::spawn(async move {
-            let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-            let mut invitation = dialog_layer.do_invite(invite_option, state_tx).boxed();
-            let mut timeout =
-                tokio::time::sleep(std::time::Duration::from_secs(timeout_secs as u64)).boxed();
-            let mut invite_completed = false;
-            let mut client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog> =
-                None;
-            let mut timer_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-
-            loop {
-                tokio::select! {
-                    _ = &mut timeout, if !invite_completed => {
-                        leg.set_state(RwiCallLegState::Failed).await;
-                        let gw = gateway.read().await;
-                        gw.send_event_to_call_owner(
-                            &call_id,
-                            &RwiEvent::CallNoAnswer { call_id: call_id.clone() },
-                        );
-                        break;
-                    }
-                    cmd = leg_cmd_rx.recv() => {
-                        match cmd {
-                            Some(LegCommand::Hangup {
-                                reason,
-                                code,
-                                initiator,
-                            }) => {
-                                let _ = (reason, code, initiator);
-                                if let Some(dialog) = client_dialog.as_ref() {
-                                    let _ = dialog.hangup().await;
-                                }
-                                break;
-                            }
-                            Some(LegCommand::Hold { music_source }) => {
-                                if let Some(dialog) = client_dialog.as_ref() {
-                                    if let Err(error) = Self::send_standalone_local_reinvite(
-                                        gateway.clone(),
-                                        sip_server.clone(),
-                                        &call_id,
-                                        &leg,
-                                        peer.clone(),
-                                        &track_id,
-                                        dialog,
-                                        Some("sendonly"),
-                                    )
-                                    .await
-                                    {
-                                        warn!(call_id = %call_id, error = %error, "Failed to send standalone hold re-INVITE");
-                                        continue;
-                                    }
-                                }
-                                peer.suppress_forwarding(&track_id).await;
-                                if let Some(audio_file) = music_source.as_deref().filter(|s| !s.is_empty()) {
-                                    if let Err(error) = Self::start_file_playback_on_peer(
-                                        peer.clone(),
-                                        audio_file,
-                                        "hold_music",
-                                        true,
-                                        &cancel_token,
-                                    )
-                                    .await
-                                    {
-                                        warn!(
-                                            call_id = %call_id,
-                                            file = %audio_file,
-                                            error = %error,
-                                            "Failed to start standalone hold playback"
-                                        );
-                                    }
-                                }
-                            }
-                            Some(LegCommand::Unhold) => {
-                                if let Some(dialog) = client_dialog.as_ref() {
-                                    if let Err(error) = Self::send_standalone_local_reinvite(
-                                        gateway.clone(),
-                                        sip_server.clone(),
-                                        &call_id,
-                                        &leg,
-                                        peer.clone(),
-                                        &track_id,
-                                        dialog,
-                                        Some("sendrecv"),
-                                    )
-                                    .await
-                                    {
-                                        warn!(call_id = %call_id, error = %error, "Failed to send standalone unhold re-INVITE");
-                                        continue;
-                                    }
-                                }
-                                peer.remove_track("hold_music", true).await;
-                                peer.resume_forwarding(&track_id).await;
-                            }
-                            Some(LegCommand::PlayAudio {
-                                file: audio_file,
-                                track_id: _,
-                                loop_playback,
-                            }) => {
-                                if let Err(error) = Self::start_file_playback_on_peer(
-                                    peer.clone(),
-                                    &audio_file,
-                                    "prompt",
-                                    loop_playback,
-                                    &cancel_token,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        call_id = %call_id,
-                                        file = %audio_file,
-                                        error = %error,
-                                        "Failed to start standalone prompt playback"
-                                    );
-                                }
-                            }
-                            Some(LegCommand::StopPlayback) => {
-                                peer.remove_track("prompt", true).await;
-                            }
-                            Some(LegCommand::Transfer { target }) => {
-                                let pending = leg.pending_negotiation_method().await;
-                                let result = if let Some(dialog) = client_dialog.as_ref() {
-                                    match rsip::Uri::try_from(target.as_str()) {
-                                        Ok(target_uri) => dialog
-                                            .refer(target_uri, None, None)
-                                            .await
-                                            .map_err(|error| error.to_string()),
-                                        Err(error) => Err(format!(
-                                            "invalid transfer target {}: {}",
-                                            target, error
-                                        )),
-                                    }
-                                } else {
-                                    Err("standalone leg has no confirmed dialog for transfer".to_string())
-                                };
-
-                                match result {
-                                    Ok(Some(response)) if response.status_code.kind() == rsip::StatusCodeKind::Successful => {
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallTransferred { call_id: call_id.clone() },
-                                        );
-                                    }
-                                    Ok(Some(response)) => {
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallTransferFailed {
-                                                call_id: call_id.clone(),
-                                                sip_status: Some(response.status_code.code()),
-                                            },
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallTransferFailed {
-                                                call_id: call_id.clone(),
-                                                sip_status: None,
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        warn!(call_id = %call_id, target = %target, error = %error, pending_method = ?pending, "Failed to transfer standalone leg");
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallTransferFailed {
-                                                call_id: call_id.clone(),
-                                                sip_status: None,
-                                            },
-                                        );
-                                    }
-                                }
-                                leg.finish_negotiation().await;
-                            }
-                            Some(LegCommand::SendBye { .. } | LegCommand::SendCancel) => {
-                                if let Some(dialog) = client_dialog.as_ref() {
-                                    let _ = dialog.hangup().await;
-                                }
-                                break;
-                            }
-                            Some(_) => {
-                                // Other leg commands not applicable to standalone originate
-                            }
-                            None => break,
+            while let Some(event) = event_rx.recv().await {
+                let rwi_event = match event {
+                    OriginatedSessionEvent::Ringing => {
+                        event_leg.set_state(RwiCallLegState::Ringing).await;
+                        RwiEvent::CallRinging {
+                            call_id: event_call_id.clone(),
                         }
                     }
-                    state = state_rx.recv() => {
-                        match state {
-                            Some(rsipstack::dialog::dialog::DialogState::Calling(_)) => {
-                                leg.set_state(RwiCallLegState::Ringing).await;
-                                let gw = gateway.read().await;
-                                gw.send_event_to_call_owner(
-                                    &call_id,
-                                    &RwiEvent::CallRinging { call_id: call_id.clone() },
-                                );
-                            }
-                            Some(rsipstack::dialog::dialog::DialogState::Early(_, _)) => {
-                                leg.set_state(RwiCallLegState::EarlyMedia).await;
-                                let gw = gateway.read().await;
-                                gw.send_event_to_call_owner(
-                                    &call_id,
-                                    &RwiEvent::CallEarlyMedia { call_id: call_id.clone() },
-                                );
-                            }
-                            Some(rsipstack::dialog::dialog::DialogState::Terminated(_, _)) => {
-                                leg.set_state(RwiCallLegState::Terminated).await;
-                                let gw = gateway.read().await;
-                                gw.send_event_to_call_owner(
-                                    &call_id,
-                                    &RwiEvent::CallHangup {
-                                        call_id: call_id.clone(),
-                                        reason: Some("terminated".to_string()),
-                                        sip_status: None,
-                                    },
-                                );
-                                break;
-                            }
-                            Some(rsipstack::dialog::dialog::DialogState::Updated(dialog_id, request, tx_handle)) => {
-                                let connected_dialog_id = leg.connected_dialog_id().await;
-                                let dialog_id_string = dialog_id.to_string();
-                                if connected_dialog_id.as_deref() != Some(dialog_id_string.as_str()) {
-                                    debug!(call_id = %call_id, %dialog_id, "Ignoring update for stale standalone dialog");
-                                    let _ = tx_handle.reply(rsip::StatusCode::CallTransactionDoesNotExist).await;
-                                    continue;
-                                }
-
-                                let request_method = request.method.to_string();
-                                if let Err(pending) = leg.try_begin_negotiation(&request_method).await {
-                                    debug!(call_id = %call_id, %dialog_id, pending_method = ?pending, "Rejecting overlapping standalone mid-dialog negotiation");
-                                    let _ = tx_handle.reply(rsip::StatusCode::RequestPending).await;
-                                    continue;
-                                }
-
-                                let has_sdp = !request.body().is_empty();
-                                leg.refresh_session_timer_from_headers(&request.headers).await;
-                                if has_sdp {
-                                    let remote_sdp = String::from_utf8_lossy(request.body()).to_string();
-                                    let result = Self::apply_standalone_remote_offer(
-                                        gateway.clone(),
-                                        sip_server.clone(),
-                                        &call_id,
-                                        &leg,
-                                        peer.clone(),
-                                        &track_id,
-                                        &remote_sdp,
-                                    )
-                                    .await;
-
-                                    match result {
-                                        Ok(local_answer) => {
-                                            let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-                                            if let Err(error) = tx_handle.respond(
-                                                rsip::StatusCode::OK,
-                                                Some(headers),
-                                                Some(local_answer.into_bytes()),
-                                            ).await {
-                                                warn!(call_id = %call_id, %dialog_id, error = %error, "Failed to reply to standalone mid-dialog offer");
-                                            }
-                                            leg.finish_negotiation().await;
-                                        }
-                                        Err(error) => {
-                                            warn!(call_id = %call_id, %dialog_id, error = %error, "Failed to apply standalone mid-dialog offer");
-                                            let _ = tx_handle.reply(rsip::StatusCode::NotAcceptableHere).await;
-                                            leg.finish_negotiation().await;
-                                        }
-                                    }
-                                } else {
-                                    if let Some(local_sdp) = leg.offer_sdp().await {
-                                        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-                                        if let Err(error) = tx_handle.respond(
-                                            rsip::StatusCode::OK,
-                                            Some(headers),
-                                            Some(local_sdp.into_bytes()),
-                                        ).await {
-                                            warn!(call_id = %call_id, %dialog_id, error = %error, "Failed to reply to standalone mid-dialog request without SDP");
-                                        }
-                                        leg.finish_negotiation().await;
-                                    } else {
-                                        let _ = tx_handle.reply(rsip::StatusCode::OK).await;
-                                        leg.finish_negotiation().await;
-                                    }
-                                }
-                            }
-                            _ => {}
+                    OriginatedSessionEvent::EarlyMedia => {
+                        event_leg.set_state(RwiCallLegState::EarlyMedia).await;
+                        RwiEvent::CallEarlyMedia {
+                            call_id: event_call_id.clone(),
                         }
                     }
-                    _ = timer_tick.tick() => {
-                        match Self::handle_standalone_session_timer_tick(
-                            &call_id,
-                            &leg,
-                            client_dialog.as_ref(),
-                            gateway.clone(),
-                        )
-                        .await {
-                            Ok(true) => break,
-                            Ok(false) => {}
-                            Err(error) => {
-                                warn!(call_id = %call_id, error = %error, "Standalone session timer handling failed");
-                            }
+                    OriginatedSessionEvent::Answered => {
+                        event_leg.set_state(RwiCallLegState::Answered).await;
+                        RwiEvent::CallAnswered {
+                            call_id: event_call_id.clone(),
                         }
                     }
-                    result = &mut invitation, if !invite_completed => {
-                        invite_completed = true;
-                        match result {
-                            Ok((new_dialog_id, Some(resp))) if resp.status_code.kind() == rsip::StatusCodeKind::Successful => {
-                                leg.set_connected_dialog_id(new_dialog_id.id().to_string()).await;
-                                client_dialog = Some(new_dialog_id);
-                                if let Some(timer) = Self::build_standalone_session_timer(
-                                    session_timer_enabled,
-                                    &resp,
-                                    default_session_expires,
-                                ) {
-                                    leg.set_session_timer(Some(timer)).await;
-                                }
-                                if !resp.body().is_empty() {
-                                    let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                                    if let Err(error) = Self::apply_standalone_remote_answer(
-                                        gateway.clone(),
-                                        sip_server.clone(),
-                                        &call_id,
-                                        &leg,
-                                        peer.clone(),
-                                        &track_id,
-                                        &answer_sdp,
-                                    )
-                                    .await {
-                                        warn!(call_id = %call_id, error = %error, "Failed to apply remote answer to standalone RWI leg");
-                                    }
-                                }
-                                leg.set_state(RwiCallLegState::Answered).await;
-                                let gw = gateway.read().await;
-                                gw.send_event_to_call_owner(
-                                    &call_id,
-                                    &RwiEvent::CallAnswered { call_id: call_id.clone() },
-                                );
-                            }
-                            Ok((_dialog_id, resp_opt)) => {
-                                leg.set_state(RwiCallLegState::Failed).await;
-                                let sip_status = resp_opt.as_ref().map(|r| r.status_code.code());
-                                let gw = gateway.read().await;
-                                if sip_status == Some(486) || sip_status == Some(600) {
-                                    gw.send_event_to_call_owner(
-                                        &call_id,
-                                        &RwiEvent::CallBusy { call_id: call_id.clone() },
-                                    );
-                                } else {
-                                    gw.send_event_to_call_owner(
-                                        &call_id,
-                                        &RwiEvent::CallHangup {
-                                            call_id: call_id.clone(),
-                                            reason: Some("originate_failed".to_string()),
-                                            sip_status,
-                                        },
-                                    );
-                                }
-                                break;
-                            }
-                            Err(error) => {
-                                leg.set_state(RwiCallLegState::Failed).await;
-                                let gw = gateway.read().await;
-                                gw.send_event_to_call_owner(
-                                    &call_id,
-                                    &RwiEvent::CallHangup {
-                                        call_id: call_id.clone(),
-                                        reason: Some(error.to_string()),
-                                        sip_status: None,
-                                    },
-                                );
-                                break;
-                            }
+                    OriginatedSessionEvent::Busy => {
+                        event_leg.set_state(RwiCallLegState::Failed).await;
+                        RwiEvent::CallBusy {
+                            call_id: event_call_id.clone(),
                         }
                     }
-                }
+                    OriginatedSessionEvent::Failed { reason, sip_status } => {
+                        event_leg.set_state(RwiCallLegState::Failed).await;
+                        RwiEvent::CallHangup {
+                            call_id: event_call_id.clone(),
+                            reason: Some(reason),
+                            sip_status,
+                        }
+                    }
+                    OriginatedSessionEvent::Hangup { reason } => {
+                        event_leg.set_state(RwiCallLegState::Terminated).await;
+                        RwiEvent::CallHangup {
+                            call_id: event_call_id.clone(),
+                            reason: Some(reason),
+                            sip_status: None,
+                        }
+                    }
+                };
+                let gw = event_gateway.read().await;
+                gw.send_event_to_call_owner(&event_call_id, &rwi_event);
             }
 
+            // Session ended — clean up gateway
             let bridge_id = {
-                let gw = gateway.read().await;
-                gw.bridge_id_for_leg(&call_id)
+                let gw = event_gateway.read().await;
+                gw.bridge_id_for_leg(&event_call_id)
             };
             if let Some(bridge_id) = bridge_id {
-                if let Some(bridge_state) = gateway.write().await.remove_bridge_by_id(&bridge_id) {
+                if let Some(bridge_state) =
+                    event_gateway.write().await.remove_bridge_by_id(&bridge_id)
+                {
                     bridge_state.bridge.stop();
                 }
             }
-            leg.clear_runtime().await;
-            gateway.write().await.remove_leg(&call_id);
-            peer.stop();
+            event_leg.clear_runtime().await;
+            event_gateway.write().await.remove_leg(&event_call_id);
         });
 
         Ok(CommandResult::Originated {
@@ -1496,19 +881,6 @@ impl RwiCommandProcessor {
         leg.command_handle()
             .send_action(action)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))
-    }
-
-    async fn ensure_standalone_leg_not_negotiating(
-        &self,
-        call_id: &str,
-    ) -> Result<(), CommandError> {
-        let leg = self.get_leg(call_id).await?;
-        if leg.origin() == RwiCallLegOrigin::OutboundOriginated && leg.is_negotiating().await {
-            return Err(Self::standalone_negotiation_pending_error(
-                leg.pending_negotiation_method().await,
-            ));
-        }
-        Ok(())
     }
 
     async fn answer_call(&self, call_id: &str) -> Result<CommandResult, CommandError> {
@@ -1625,33 +997,10 @@ impl RwiCommandProcessor {
         call_id: &str,
         target: &str,
     ) -> Result<CommandResult, CommandError> {
-        let leg = self.get_leg(call_id).await?;
-        if leg.supports_session_features() {
-            let handle = self.get_handle(call_id).await?;
-            handle
-                .send_command(SessionAction::from_transfer_target(target))
-                .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-            return Ok(CommandResult::Success);
-        }
-
-        if leg.origin() == RwiCallLegOrigin::OutboundOriginated {
-            if let Err(pending) = leg.try_begin_negotiation("REFER").await {
-                return Err(Self::standalone_negotiation_pending_error(pending));
-            }
-            let bridged = {
-                let gw = self.gateway.read().await;
-                gw.bridge_id_for_leg(&call_id.to_string()).is_some()
-            };
-            if bridged {
-                self.clear_bridge(call_id).await;
-            }
-            if let Err(error) = leg.command_handle().send_transfer(target.to_string()) {
-                leg.finish_negotiation().await;
-                return Err(CommandError::CommandFailed(error.to_string()));
-            }
-            return Ok(CommandResult::Success);
-        }
-
+        let handle = self.get_handle(call_id).await?;
+        handle
+            .send_command(SessionAction::from_transfer_target(target))
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
         Ok(CommandResult::Success)
     }
 
@@ -2047,7 +1396,6 @@ impl RwiCommandProcessor {
         call_id: &str,
         music: Option<&str>,
     ) -> Result<CommandResult, CommandError> {
-        self.ensure_standalone_leg_not_negotiating(call_id).await?;
         let audio_file = music.unwrap_or("").to_string();
         self.send_leg_action(
             call_id,
@@ -2066,7 +1414,6 @@ impl RwiCommandProcessor {
 
     /// Release a call from hold.
     async fn call_unhold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        self.ensure_standalone_leg_not_negotiating(call_id).await?;
         self.send_leg_action(call_id, SessionAction::Unhold).await?;
         let event = RwiEvent::MediaHoldStopped {
             call_id: call_id.to_string(),
@@ -3163,8 +2510,7 @@ mod tests {
     use crate::rwi::session::RwiCommandPayload;
     use audio_codec::CodecType;
     use std::sync::Arc;
-    use tokio::sync::{RwLock, mpsc};
-    use tokio_util::sync::CancellationToken;
+    use tokio::sync::RwLock;
 
     fn create_test_processor() -> Arc<RwiCommandProcessor> {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
@@ -3292,7 +2638,6 @@ mod tests {
                 .with_id(format!("{}-rwi-test-leg", call_id))
                 .build(),
         )));
-        use crate::proxy::proxy_call::state::CallSessionShared;
         handle.publish_caller_media(
             peer,
             None,
@@ -3334,123 +2679,6 @@ mod tests {
             .write()
             .await
             .register_leg(call_id.to_string(), leg);
-    }
-
-    async fn register_test_standalone_media_ready_rwi_leg(
-        processor: &Arc<RwiCommandProcessor>,
-        call_id: &str,
-    ) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
-        let peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id(format!("{}-standalone-rwi-test-leg", call_id))
-                .build(),
-        )));
-        let leg = RwiCallLeg::new_outbound(
-            call_id.to_string(),
-            tx,
-            peer,
-            Some("v=0".to_string()),
-            CancellationToken::new(),
-            Some("1001".to_string()),
-            Some("2001".to_string()),
-        );
-        leg.set_negotiated_media(
-            Some((
-                CodecType::PCMU,
-                rustrtc::RtpCodecParameters {
-                    payload_type: CodecType::PCMU.payload_type(),
-                    clock_rate: CodecType::PCMU.clock_rate(),
-                    channels: CodecType::PCMU.channels() as u8,
-                },
-                Vec::new(),
-            )),
-            Some(1234),
-        )
-        .await;
-        leg.set_state(crate::rwi::call_leg::RwiCallLegState::Answered)
-            .await;
-        processor
-            .gateway
-            .write()
-            .await
-            .register_leg(call_id.to_string(), leg);
-    }
-
-    async fn register_test_standalone_rwi_leg_with_real_track(
-        processor: &Arc<RwiCommandProcessor>,
-        call_id: &str,
-        local_codecs: Vec<CodecType>,
-        remote_codecs: Vec<CodecType>,
-    ) -> (RwiCallLegHandle, Arc<dyn MediaPeer>, String) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
-
-        let peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id(format!("{}-standalone-real-stream", call_id))
-                .build(),
-        )));
-        let track_id = format!("{}-real-track", call_id);
-        let local_track = RtpTrackBuilder::new(track_id.clone())
-            .with_codec_preference(local_codecs)
-            .build();
-        let local_offer = local_track
-            .local_description()
-            .await
-            .expect("local offer should be created");
-        peer.update_track(Box::new(local_track), None).await;
-
-        let remote_answer_track = RtpTrackBuilder::new(format!("{}-remote-answer", call_id))
-            .with_codec_preference(remote_codecs)
-            .build();
-        let remote_answer = remote_answer_track
-            .handshake(local_offer.clone())
-            .await
-            .expect("remote answer should be created");
-        peer.update_remote_description(&track_id, &remote_answer)
-            .await
-            .expect("initial remote answer should apply");
-
-        let leg = RwiCallLeg::new_outbound(
-            call_id.to_string(),
-            tx,
-            peer.clone(),
-            Some(local_offer),
-            CancellationToken::new(),
-            Some("1001".to_string()),
-            Some("2001".to_string()),
-        );
-        leg.set_answer(remote_answer.clone()).await;
-        leg.set_negotiated_media(
-            RwiCommandProcessor::select_best_audio_from_sdp(&remote_answer),
-            MediaNegotiator::extract_ssrc(&remote_answer),
-        )
-        .await;
-        leg.set_connected_dialog_id(format!("dlg-{}", call_id)).await;
-        leg.set_state(crate::rwi::call_leg::RwiCallLegState::Answered)
-            .await;
-        processor
-            .gateway
-            .write()
-            .await
-            .register_leg(call_id.to_string(), leg.clone());
-
-        (leg, peer, track_id)
-    }
-
-    async fn build_test_remote_offer(track_id: &str, codecs: Vec<CodecType>) -> String {
-        RtpTrackBuilder::new(track_id.to_string())
-            .with_codec_preference(codecs)
-            .build()
-            .local_description()
-            .await
-            .expect("remote offer should be created")
     }
 
     #[tokio::test]
@@ -3626,39 +2854,6 @@ mod tests {
             })
             .await;
         assert!(result.is_ok(), "bridge should succeed for media-ready legs");
-    }
-
-    #[tokio::test]
-    async fn test_bridge_attached_and_standalone_media_ready_legs_succeeds() {
-        let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
-        let attached =
-            create_test_media_ready_call(&registry, "leg-attached", "1001", "2001", DialDirection::Inbound);
-        register_test_media_ready_rwi_leg(&processor, "leg-attached", attached).await;
-        register_test_standalone_media_ready_rwi_leg(&processor, "leg-standalone").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::Bridge {
-                leg_a: "leg-attached".into(),
-                leg_b: "leg-standalone".into(),
-            })
-            .await;
-        assert!(result.is_ok(), "bridge should succeed for attached + standalone legs");
-    }
-
-    #[tokio::test]
-    async fn test_bridge_standalone_media_ready_legs_succeeds() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "leg-standalone-a").await;
-        register_test_standalone_media_ready_rwi_leg(&processor, "leg-standalone-b").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::Bridge {
-                leg_a: "leg-standalone-a".into(),
-                leg_b: "leg-standalone-b".into(),
-            })
-            .await;
-        assert!(result.is_ok(), "bridge should succeed for standalone legs");
     }
 
     #[tokio::test]
@@ -3846,43 +3041,6 @@ mod tests {
             assert!(ids.contains(&"call-1".to_string()));
             assert!(ids.contains(&"call-2".to_string()));
             assert!(ids.contains(&"call-3".to_string()));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_list_calls_includes_gateway_only_originated_leg() {
-        let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id("standalone-list-leg".to_string())
-                .build(),
-        )));
-        let leg = RwiCallLeg::new_outbound(
-            "standalone-leg".to_string(),
-            tx,
-            peer,
-            Some("offer".to_string()),
-            CancellationToken::new(),
-            Some("1001".to_string()),
-            Some("2000".to_string()),
-        );
-        processor
-            .gateway
-            .write()
-            .await
-            .register_leg("standalone-leg".to_string(), leg);
-
-        let result = processor
-            .process_command(RwiCommandPayload::ListCalls)
-            .await;
-        assert!(result.is_ok());
-        if let Ok(CommandResult::ListCalls(calls)) = result {
-            assert!(
-                calls.iter().any(|call| call.session_id == "standalone-leg"),
-                "standalone originated leg should be listed without a proxy session handle"
-            );
         }
     }
 
@@ -4126,285 +3284,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_answer_standalone_originated_leg_returns_unsupported() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-answer").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::Answer {
-                call_id: "standalone-answer".into(),
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported for standalone originated RWI leg"));
-    }
-
-    #[tokio::test]
-    async fn test_ring_standalone_originated_leg_returns_unsupported() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-ring").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::Ring {
-                call_id: "standalone-ring".into(),
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported for standalone originated RWI leg"));
-    }
-
-    #[tokio::test]
-    async fn test_media_play_standalone_originated_leg_returns_track_id() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-media-play").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::MediaPlay(
-                crate::rwi::session::MediaPlayRequest {
-                    call_id: "standalone-media-play".into(),
-                    source: crate::rwi::session::MediaSource {
-                        source_type: "silence".into(),
-                        uri: None,
-                        looped: None,
-                    },
-                    interrupt_on_dtmf: false,
-                },
-            ))
-            .await;
-        match result {
-            Ok(CommandResult::MediaPlay { track_id }) => assert!(!track_id.is_empty()),
-            other => panic!("unexpected result: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_transfer_standalone_originated_leg_queues_transfer_command() {
-        let processor = create_test_processor();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let peer = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id("standalone-transfer-stream".to_string())
-                .build(),
-        )));
-        let leg = RwiCallLeg::new_outbound(
-            "standalone-transfer".to_string(),
-            tx,
-            peer,
-            Some("v=0".to_string()),
-            CancellationToken::new(),
-            Some("1001".to_string()),
-            Some("2001".to_string()),
-        );
-        leg.set_negotiated_media(
-            Some((
-                CodecType::PCMU,
-                rustrtc::RtpCodecParameters {
-                    payload_type: CodecType::PCMU.payload_type(),
-                    clock_rate: CodecType::PCMU.clock_rate(),
-                    channels: CodecType::PCMU.channels() as u8,
-                },
-                Vec::new(),
-            )),
-            Some(1234),
-        )
-        .await;
-        leg.set_state(crate::rwi::call_leg::RwiCallLegState::Answered)
-            .await;
-        processor
-            .gateway
-            .write()
-            .await
-            .register_leg("standalone-transfer".to_string(), leg);
-
-        let result = processor
-            .process_command(RwiCommandPayload::Transfer {
-                call_id: "standalone-transfer".into(),
-                target: "sip:target@local".into(),
-            })
-            .await;
-        assert!(matches!(result, Ok(CommandResult::Success)));
-        let cmd = rx.recv().await.expect("transfer command should be queued");
-        assert!(
-            matches!(cmd, LegCommand::Transfer { ref target } if target == "sip:target@local"),
-            "expected Transfer command, got {:?}",
-            cmd
-        );
-    }
-
-    #[tokio::test]
-    async fn test_transfer_standalone_originated_leg_returns_error_when_negotiation_in_progress() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-transfer-pending")
-            .await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-transfer-pending".to_string())
-            .expect("standalone leg should be registered");
-        leg.try_begin_negotiation("INVITE")
-            .await
-            .expect("negotiation should start");
-
-        let result = processor
-            .process_command(RwiCommandPayload::Transfer {
-                call_id: "standalone-transfer-pending".into(),
-                target: "sip:target@local".into(),
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("standalone renegotiation already in progress"));
-    }
-
-    #[tokio::test]
-    async fn test_hold_standalone_originated_leg_succeeds() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-hold").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::CallHold {
-                call_id: "standalone-hold".into(),
-                music: None,
-            })
-            .await;
-        assert!(matches!(result, Ok(CommandResult::Success)));
-    }
-
-    #[tokio::test]
-    async fn test_hold_standalone_originated_leg_returns_error_when_negotiation_in_progress() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-hold-pending").await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-hold-pending".to_string())
-            .expect("leg should exist");
-        leg.try_begin_negotiation("INVITE")
-            .await
-            .expect("negotiation should start");
-
-        let result = processor
-            .process_command(RwiCommandPayload::CallHold {
-                call_id: "standalone-hold-pending".into(),
-                music: None,
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("standalone renegotiation already in progress"));
-    }
-
-    #[tokio::test]
-    async fn test_unhold_standalone_originated_leg_succeeds() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-unhold").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::CallUnhold {
-                call_id: "standalone-unhold".into(),
-            })
-            .await;
-        assert!(matches!(result, Ok(CommandResult::Success)));
-    }
-
-    #[tokio::test]
-    async fn test_unhold_standalone_originated_leg_returns_error_when_negotiation_in_progress() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-unhold-pending")
-            .await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-unhold-pending".to_string())
-            .expect("leg should exist");
-        leg.try_begin_negotiation("UPDATE")
-            .await
-            .expect("negotiation should start");
-
-        let result = processor
-            .process_command(RwiCommandPayload::CallUnhold {
-                call_id: "standalone-unhold-pending".into(),
-            })
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("standalone renegotiation already in progress"));
-    }
-
-    #[tokio::test]
-    async fn test_media_stop_standalone_originated_leg_succeeds() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-media-stop").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::MediaStop {
-                call_id: "standalone-media-stop".into(),
-            })
-            .await;
-        assert!(matches!(result, Ok(CommandResult::Success)));
-    }
-
-    #[tokio::test]
-    async fn test_record_start_standalone_originated_leg_returns_unsupported() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-record").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::RecordStart(RecordStartRequest {
-                call_id: "standalone-record".into(),
-                mode: "mixed".into(),
-                storage: crate::rwi::session::RecordStorage {
-                    path: "/recordings/test.wav".into(),
-                    backend: "file".into(),
-                },
-                max_duration_secs: None,
-                beep: None,
-            }))
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported for standalone originated RWI leg"));
-    }
-
-    #[tokio::test]
-    async fn test_queue_enqueue_standalone_originated_leg_returns_unsupported() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-queue").await;
-
-        let result = processor
-            .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
-                call_id: "standalone-queue".into(),
-                queue_id: "support".into(),
-                priority: None,
-                skills: Some(vec![]),
-                max_wait_secs: None,
-            }))
-            .await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported for standalone originated RWI leg"));
-    }
-
-    #[tokio::test]
     async fn test_unbridge_direct_bridge_clears_rwi_bridge_registry() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let processor = create_test_processor_with_registry(registry.clone());
@@ -4433,338 +3312,6 @@ mod tests {
         assert!(gw.bridge_id_for_leg(&"leg-a3".to_string()).is_none());
         assert!(gw.bridge_id_for_leg(&"leg-b3".to_string()).is_none());
         assert_eq!(gw.bridge_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_standalone_remote_update_with_sdp_updates_negotiated_media() {
-        let processor = create_test_processor();
-        let (leg, peer, track_id) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-update",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-        let remote_offer =
-            build_test_remote_offer("remote-update-offer", vec![CodecType::G722]).await;
-
-        RwiCommandProcessor::apply_standalone_remote_offer(
-            processor.gateway.clone(),
-            processor.sip_server.clone(),
-            "standalone-update",
-            &leg,
-            peer,
-            &track_id,
-            &remote_offer,
-        )
-        .await
-        .expect("standalone update should succeed");
-
-        let live_media = leg.live_media().await.expect("leg should still be live");
-        assert_eq!(live_media.negotiated_audio.0, CodecType::G722);
-    }
-
-    #[tokio::test]
-    async fn test_standalone_remote_reinvite_with_sdp_updates_negotiated_media() {
-        let processor = create_test_processor();
-        let (leg, peer, track_id) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-reinvite",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-        let remote_offer =
-            build_test_remote_offer("remote-reinvite-offer", vec![CodecType::G722]).await;
-
-        let local_answer = RwiCommandProcessor::apply_standalone_remote_offer(
-            processor.gateway.clone(),
-            processor.sip_server.clone(),
-            "standalone-reinvite",
-            &leg,
-            peer,
-            &track_id,
-            &remote_offer,
-        )
-        .await
-        .expect("standalone re-invite should succeed");
-
-        assert!(local_answer.contains("m=audio"));
-        let live_media = leg.live_media().await.expect("leg should still be live");
-        assert_eq!(live_media.negotiated_audio.0, CodecType::G722);
-    }
-
-    #[tokio::test]
-    async fn test_invalid_remote_sdp_on_standalone_leg_preserves_prior_media_state() {
-        let processor = create_test_processor();
-        let (leg, peer, track_id) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-invalid-update",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-        let before = leg.live_media().await.expect("leg should be live before failure");
-
-        let result = RwiCommandProcessor::apply_standalone_remote_offer(
-            processor.gateway.clone(),
-            processor.sip_server.clone(),
-            "standalone-invalid-update",
-            &leg,
-            peer,
-            &track_id,
-            "invalid sdp",
-        )
-        .await;
-
-        assert!(result.is_err());
-        let after = leg.live_media().await.expect("leg should still be live after failure");
-        assert_eq!(after.negotiated_audio.0, before.negotiated_audio.0);
-        assert_eq!(after.ssrc, before.ssrc);
-    }
-
-    #[tokio::test]
-    async fn test_bridged_standalone_media_update_rebuilds_direct_bridge() {
-        let processor = create_test_processor();
-        let (leg_a, peer_a, track_id_a) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-bridge-a",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-        let (_leg_b, _peer_b, _track_id_b) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-bridge-b",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-
-        processor
-            .process_command(RwiCommandPayload::Bridge {
-                leg_a: "standalone-bridge-a".into(),
-                leg_b: "standalone-bridge-b".into(),
-            })
-            .await
-            .expect("initial bridge should succeed");
-
-        let remote_offer =
-            build_test_remote_offer("remote-bridge-offer", vec![CodecType::G722]).await;
-        RwiCommandProcessor::apply_standalone_remote_offer(
-            processor.gateway.clone(),
-            processor.sip_server.clone(),
-            "standalone-bridge-a",
-            &leg_a,
-            peer_a,
-            &track_id_a,
-            &remote_offer,
-        )
-        .await
-        .expect("media refresh should rebuild bridge");
-
-        let gw = processor.gateway.read().await;
-        assert_eq!(gw.bridge_count(), 1);
-        assert!(gw.bridge_id_for_leg(&"standalone-bridge-a".to_string()).is_some());
-        assert!(gw.bridge_id_for_leg(&"standalone-bridge-b".to_string()).is_some());
-        let live_media = leg_a.live_media().await.expect("leg should remain bridged");
-        assert_eq!(live_media.negotiated_audio.0, CodecType::G722);
-    }
-
-    #[tokio::test]
-    async fn test_unbridged_standalone_media_update_does_not_create_bridge_state() {
-        let processor = create_test_processor();
-        let (leg, peer, track_id) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-unbridged-update",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-        let remote_offer =
-            build_test_remote_offer("remote-unbridged-offer", vec![CodecType::G722]).await;
-
-        RwiCommandProcessor::apply_standalone_remote_offer(
-            processor.gateway.clone(),
-            processor.sip_server.clone(),
-            "standalone-unbridged-update",
-            &leg,
-            peer,
-            &track_id,
-            &remote_offer,
-        )
-        .await
-        .expect("media refresh should succeed without bridge");
-
-        let gw = processor.gateway.read().await;
-        assert_eq!(gw.bridge_count(), 0);
-        assert!(gw.bridge_id_for_leg(&"standalone-unbridged-update".to_string()).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_rewrite_audio_direction_in_sdp_for_hold() {
-        let offer = build_test_remote_offer("local-hold-offer", vec![CodecType::PCMU]).await;
-
-        let rewritten =
-            RwiCommandProcessor::rewrite_audio_direction_in_sdp(&offer, "sendonly").unwrap();
-        let parsed = SessionDescription::parse(SdpType::Offer, &rewritten).unwrap();
-        let audio = parsed
-            .media_sections
-            .iter()
-            .find(|section| section.kind == MediaKind::Audio)
-            .unwrap();
-        assert_eq!(audio.direction, Direction::SendOnly);
-    }
-
-    #[tokio::test]
-    async fn test_build_standalone_local_offer_rewrites_direction() {
-        let processor = create_test_processor();
-        let (_leg, peer, track_id) = register_test_standalone_rwi_leg_with_real_track(
-            &processor,
-            "standalone-local-offer",
-            vec![CodecType::PCMU, CodecType::G722],
-            vec![CodecType::PCMU],
-        )
-        .await;
-
-        let offer = RwiCommandProcessor::build_standalone_local_offer(
-            peer,
-            &track_id,
-            Some("sendonly"),
-        )
-        .await
-        .expect("offer should be built");
-
-        assert!(offer.contains("a=sendonly"));
-        assert!(!offer.contains("a=inactive"));
-    }
-
-    #[tokio::test]
-    async fn test_standalone_session_timer_initializes_from_200_ok() {
-        let response = rsip::Response::try_from(
-            "SIP/2.0 200 OK\r\nSession-Expires: 180;refresher=uas\r\n\r\n",
-        )
-        .expect("response should parse");
-
-        let timer = RwiCommandProcessor::build_standalone_session_timer(true, &response, 90)
-            .expect("timer should be initialized");
-
-        assert!(timer.enabled);
-        assert!(timer.active);
-        assert_eq!(timer.session_interval.as_secs(), 180);
-        assert_eq!(timer.refresher, SessionRefresher::Uas);
-    }
-
-    #[tokio::test]
-    async fn test_standalone_session_timer_uses_default_when_header_missing() {
-        let response = rsip::Response::try_from("SIP/2.0 200 OK\r\n\r\n")
-            .expect("response should parse");
-
-        let timer = RwiCommandProcessor::build_standalone_session_timer(true, &response, 600)
-            .expect("timer should be initialized");
-
-        assert_eq!(timer.session_interval.as_secs(), 600);
-        assert_eq!(timer.refresher, SessionRefresher::Uac);
-    }
-
-    #[tokio::test]
-    async fn test_standalone_session_timer_tick_does_not_refresh_when_not_refresher() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-timer-uas").await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-timer-uas".to_string())
-            .expect("leg should exist");
-
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refresher = SessionRefresher::Uas;
-        timer.last_refresh = Instant::now() - (timer.session_interval / 2);
-        leg.set_session_timer(Some(timer)).await;
-
-        let should_break = RwiCommandProcessor::handle_standalone_session_timer_tick(
-            "standalone-timer-uas",
-            &leg,
-            None,
-            processor.gateway.clone(),
-        )
-        .await
-        .expect("tick should succeed");
-
-        assert!(!should_break);
-        let timer = leg.session_timer().await.expect("timer should still exist");
-        assert!(!timer.refreshing);
-    }
-
-    #[tokio::test]
-    async fn test_standalone_session_timer_tick_skips_when_negotiation_in_progress() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-timer-pending")
-            .await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-timer-pending".to_string())
-            .expect("leg should exist");
-
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refresher = SessionRefresher::Uac;
-        timer.last_refresh = Instant::now() - (timer.session_interval / 2);
-        leg.set_session_timer(Some(timer)).await;
-        leg.try_begin_negotiation("INVITE")
-            .await
-            .expect("negotiation should start");
-
-        let should_break = RwiCommandProcessor::handle_standalone_session_timer_tick(
-            "standalone-timer-pending",
-            &leg,
-            None,
-            processor.gateway.clone(),
-        )
-        .await
-        .expect("tick should succeed");
-
-        assert!(!should_break);
-        let timer = leg.session_timer().await.expect("timer should still exist");
-        assert!(!timer.refreshing);
-        assert_eq!(leg.pending_negotiation_method().await.as_deref(), Some("INVITE"));
-    }
-
-    #[tokio::test]
-    async fn test_standalone_session_timer_expiry_terminates_leg() {
-        let processor = create_test_processor();
-        register_test_standalone_media_ready_rwi_leg(&processor, "standalone-timer-expired").await;
-        let leg = processor
-            .gateway
-            .read()
-            .await
-            .get_leg(&"standalone-timer-expired".to_string())
-            .expect("leg should exist");
-
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refresher = SessionRefresher::Uac;
-        timer.last_refresh = Instant::now() - timer.session_interval - std::time::Duration::from_secs(1);
-        leg.set_session_timer(Some(timer)).await;
-
-        let should_break = RwiCommandProcessor::handle_standalone_session_timer_tick(
-            "standalone-timer-expired",
-            &leg,
-            None,
-            processor.gateway.clone(),
-        )
-        .await
-        .expect("tick should succeed");
-
-        assert!(should_break);
-        assert_eq!(leg.state().await, RwiCallLegState::Terminated);
     }
 
     #[tokio::test]

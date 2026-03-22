@@ -29,6 +29,8 @@ pub(crate) struct SipLeg {
     pub dialog_guards: Vec<DialogStateReceiverGuard>,
     pub session_timer: Arc<Mutex<SessionTimerState>>,
     pub supports_trickle_ice: bool,
+    /// The inbound server dialog. Only populated for caller legs.
+    pub server_dialog: Option<ServerInviteDialog>,
 }
 
 impl SipLeg {
@@ -42,6 +44,7 @@ impl SipLeg {
             dialog_guards: Vec::new(),
             session_timer: Arc::new(Mutex::new(SessionTimerState::default())),
             supports_trickle_ice: false,
+            server_dialog: None,
         }
     }
 
@@ -216,10 +219,12 @@ impl SipLeg {
 
     pub async fn hangup_inbound_dialog(
         &self,
-        server_dialog: &ServerInviteDialog,
         code: Option<StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
+        let Some(ref server_dialog) = self.server_dialog else {
+            return Err(anyhow::anyhow!("No server dialog on this leg"));
+        };
         if server_dialog.state().is_confirmed() || server_dialog.state().waiting_ack() {
             if let Some(reason) = reason {
                 server_dialog.bye_with_reason(reason).await?;
@@ -259,9 +264,12 @@ impl SipLeg {
 
     pub fn reply_to_server_reinvite(
         &self,
-        server_dialog: &ServerInviteDialog,
         answer_sdp: Option<String>,
     ) -> bool {
+        let Some(ref server_dialog) = self.server_dialog else {
+            warn!("No server dialog on this leg, cannot reply to re-INVITE");
+            return false;
+        };
         let Some(sdp) = answer_sdp else {
             let _ = server_dialog.reject(Some(StatusCode::NotAcceptableHere), None);
             return false;
@@ -278,9 +286,12 @@ impl SipLeg {
 
     pub fn reply_to_server_offerless_update(
         &self,
-        server_dialog: &ServerInviteDialog,
         answer_sdp: Option<String>,
     ) {
+        let Some(ref server_dialog) = self.server_dialog else {
+            warn!("No server dialog on this leg, cannot reply to UPDATE");
+            return;
+        };
         let Some(sdp) = answer_sdp else {
             return;
         };

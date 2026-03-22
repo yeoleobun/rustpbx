@@ -13,6 +13,7 @@ impl DialplanRuntime {
         session: &mut CallSession,
         mut inbox: ActionInbox<'_>,
     ) -> Result<()> {
+        session.shared.transition_to_routing();
         session.process_pending_actions(inbox.as_deref_mut()).await?;
         if session.context.dialplan.is_empty() {
             session.set_error(
