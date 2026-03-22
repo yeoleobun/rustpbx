@@ -189,17 +189,17 @@ impl CallLeg {
         .await
     }
 
-    /// Set the server dialog on this leg (caller legs only).
+    /// Set the server dialog on this leg (exported legs only).
     pub fn set_server_dialog(&mut self, server_dialog: ServerInviteDialog) {
         self.sip.server_dialog = Some(server_dialog);
     }
 
-    /// Get a reference to the server dialog (caller legs only).
+    /// Get a reference to the server dialog (exported legs only).
     pub fn server_dialog_ref(&self) -> Option<&ServerInviteDialog> {
         self.sip.server_dialog.as_ref()
     }
 
-    /// Get the server dialog ID (caller legs only).
+    /// Get the server dialog ID (exported legs only).
     pub fn server_dialog_id(&self) -> Option<DialogId> {
         self.sip.server_dialog.as_ref().map(|d| d.id())
     }

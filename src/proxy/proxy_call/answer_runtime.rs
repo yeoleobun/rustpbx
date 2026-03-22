@@ -25,7 +25,7 @@ impl AnswerRuntime {
 
     async fn spawn_inbound_trickle_ice_sender(session: &CallSession) {
         let Some(server_dialog) = session.exported_leg.clone_server_dialog() else {
-            warn!("No server dialog on caller leg, cannot send trickle ICE");
+            warn!("No server dialog on exported leg, cannot send trickle ICE");
             return;
         };
         let cancel_token = session.cancel_token.child_token();
