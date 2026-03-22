@@ -29,8 +29,8 @@ fn is_trickle_ice_info(request: &rsip::Request) -> bool {
     })
 }
 
-/// Task that processes caller (server) dialog events and emits `LegEvent`s.
-async fn run_caller_event_task(
+/// Task that processes exported-leg (server) dialog events and emits `LegEvent`s.
+async fn run_exported_event_task(
     session_id: String,
     mut state_rx: mpsc::UnboundedReceiver<DialogState>,
     server_timer: Arc<Mutex<SessionTimerState>>,
@@ -118,12 +118,12 @@ async fn run_caller_event_task(
     }
 }
 
-/// Task that processes callee (client) dialog events and emits `LegEvent`s.
-async fn run_callee_event_task(
+/// Task that processes target-leg (client) dialog events and emits `LegEvent`s.
+async fn run_target_event_task(
     session_id: String,
-    mut callee_state_rx: mpsc::UnboundedReceiver<DialogState>,
+    mut target_state_rx: mpsc::UnboundedReceiver<DialogState>,
     client_timer: Arc<Mutex<SessionTimerState>>,
-    callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
+    target_dialogs: Arc<Mutex<HashSet<DialogId>>>,
     shared: CallSessionShared,
     leg_tx: mpsc::UnboundedSender<LegEvent>,
     cancel_token: CancellationToken,
@@ -131,11 +131,11 @@ async fn run_callee_event_task(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => break,
-            state = callee_state_rx.recv() => {
+            state = target_state_rx.recv() => {
                 match state {
                     Some(DialogState::Terminated(dialog_id, reason)) => {
                         let is_active = {
-                            let mut dialogs = callee_dialogs.lock().unwrap();
+                            let mut dialogs = target_dialogs.lock().unwrap();
                             dialogs.remove(&dialog_id)
                         };
                         if is_active {
@@ -188,10 +188,10 @@ impl SessionLoopRuntime {
         proxy_config: Arc<crate::config::ProxyConfig>,
         dialog_layer: Arc<DialogLayer>,
         state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
-        callee_state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
+        target_state_rx: Option<mpsc::UnboundedReceiver<DialogState>>,
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
-        callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
+        target_dialogs: Arc<Mutex<HashSet<DialogId>>>,
         server_dialog: Option<ServerInviteDialog>,  // exported leg's server dialog clone for timer refresh (None for non-proxy sessions)
         handle: CallSessionHandle,
         cancel_token: CancellationToken,
@@ -200,9 +200,9 @@ impl SessionLoopRuntime {
     ) -> Result<()> {
         let (leg_tx, mut leg_rx) = mpsc::unbounded_channel::<LegEvent>();
 
-        // Spawn caller event task only when an inbound server dialog exists (proxy sessions)
+        // Spawn exported-leg event task only when an inbound server dialog exists (proxy sessions)
         if let Some(state_rx) = state_rx {
-            crate::utils::spawn(run_caller_event_task(
+            crate::utils::spawn(run_exported_event_task(
                 context.session_id.clone(),
                 state_rx,
                 server_timer.clone(),
@@ -211,12 +211,12 @@ impl SessionLoopRuntime {
                 cancel_token.child_token(),
             ));
         }
-        if let Some(callee_rx) = callee_state_rx {
-            crate::utils::spawn(run_callee_event_task(
+        if let Some(target_rx) = target_state_rx {
+            crate::utils::spawn(run_target_event_task(
                 context.session_id.clone(),
-                callee_rx,
+                target_rx,
                 client_timer.clone(),
-                callee_dialogs.clone(),
+                target_dialogs.clone(),
                 shared,
                 leg_tx,
                 cancel_token.child_token(),
@@ -410,7 +410,7 @@ impl SessionLoopRuntime {
                         ];
 
                         let dialog_ids: Vec<DialogId> = {
-                            let dialogs = callee_dialogs.lock().unwrap();
+                            let dialogs = target_dialogs.lock().unwrap();
                             dialogs.iter().cloned().collect()
                         };
 

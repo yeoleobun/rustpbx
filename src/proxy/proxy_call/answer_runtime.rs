@@ -14,9 +14,9 @@ pub(crate) struct AnswerRuntime;
 
 impl AnswerRuntime {
     fn trickle_ice_enabled(session: &CallSession) -> bool {
-        session.exported_leg.sip.supports_trickle_ice
+        session.exported_leg().sip.supports_trickle_ice
             && session
-                .exported_leg
+                .exported_leg()
                 .media.offer_sdp
                 .as_deref()
                 .map(CallSession::is_webrtc_sdp)
@@ -24,14 +24,14 @@ impl AnswerRuntime {
     }
 
     async fn spawn_inbound_trickle_ice_sender(session: &CallSession) {
-        let Some(server_dialog) = session.exported_leg.clone_server_dialog() else {
+        let Some(server_dialog) = session.exported_leg().clone_server_dialog() else {
             warn!("No server dialog on exported leg, cannot send trickle ICE");
             return;
         };
         let cancel_token = session.cancel_token.child_token();
         let session_id = session.context.session_id.clone();
         let Some((_pc, mut candidate_rx, mut gathering_rx)) =
-            session.exported_leg.media.trickle_ice_context("caller-track").await
+            session.exported_leg().media.trickle_ice_context("caller-track").await
         else {
             return;
         };

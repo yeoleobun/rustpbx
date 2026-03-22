@@ -368,10 +368,22 @@ impl CallSession {
         &mut self.exported_leg
     }
 
+    pub(crate) fn has_target_leg(&self) -> bool {
+        self.target_leg.is_some()
+    }
+
+    pub(crate) fn target_leg_opt(&self) -> Option<&CallLeg> {
+        self.target_leg.as_ref()
+    }
+
+    pub(crate) fn target_leg_mut_opt(&mut self) -> Option<&mut CallLeg> {
+        self.target_leg.as_mut()
+    }
+
     /// Ensures the target leg exists, creating it on demand if absent.
     /// Used by both proxy and originated paths to defer target creation until dialing.
     pub(crate) fn ensure_target_leg(&mut self) {
-        if self.target_leg.is_some() {
+        if self.has_target_leg() {
             return;
         }
         let target_media_builder = crate::media::MediaStreamBuilder::new()
@@ -523,7 +535,7 @@ impl CallSession {
             routed_contact: self.routed_contact.clone(),
             routed_destination: self.routed_destination.clone(),
             last_queue_name: self.last_queue_name(),
-            target_dialogs: self.target_leg.as_ref().map(|l| l.sip.recorded_dialogs()).unwrap_or_default(),
+            target_dialogs: self.target_leg_opt().map(|l| l.sip.recorded_dialogs()).unwrap_or_default(),
             server_dialog_id: self.exported_leg.server_dialog_id(),
             extensions: self.context.dialplan.extensions.clone(),
         }
@@ -1930,7 +1942,7 @@ impl CallSession {
         let mut term_state = TerminationState::new(3);
 
         // Step 5: SIP dialog cleanup — terminate callee dialogs
-        if let Some(ref callee) = self.target_leg {
+        if let Some(callee) = self.target_leg_opt() {
             callee
                 .terminate_client_dialogs(&self.context.session_id, &self.dialog_layer)
                 .await;
@@ -2002,7 +2014,7 @@ impl CallSession {
 
         // Callee side: must have no active dialogs if cleanup was sent
         let callee_ok = if ts.callee_cleanup_sent {
-            self.target_leg.as_ref().map_or(true, |l| l.sip.active_dialog_ids.lock().unwrap().is_empty())
+            self.target_leg_opt().map_or(true, |l| l.sip.active_dialog_ids.lock().unwrap().is_empty())
         } else {
             true
         };
@@ -2034,7 +2046,7 @@ impl CallSession {
                     debug!(
                         session_id = %self.context.session_id,
                         caller_terminated = self.exported_leg.is_server_dialog_terminated(),
-                        callee_empty = self.target_leg.as_ref().map_or(true, |l| l.sip.active_dialog_ids.lock().unwrap().is_empty()),
+                        callee_empty = self.target_leg_opt().map_or(true, |l| l.sip.active_dialog_ids.lock().unwrap().is_empty()),
                         "Termination grace period expired, finalizing"
                     );
                     break;
@@ -2408,7 +2420,7 @@ impl CallSession {
 
         let use_media_proxy = self.use_media_proxy;
         let exported_peer = self.exported_leg.media.peer.clone();
-        let target_peer = self.target_leg.as_ref().map(|l| l.media.peer.clone());
+        let target_peer = self.target_leg_opt().map(|l| l.media.peer.clone());
 
         let _guard = dialog_guard;
 
@@ -2423,10 +2435,10 @@ impl CallSession {
         }
 
         let server_timer = self.exported_leg.sip.session_timer.clone();
-        let client_timer = self.target_leg.as_ref()
+        let client_timer = self.target_leg_opt()
             .map(|l| l.sip.session_timer.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(crate::proxy::proxy_call::session_timer::SessionTimerState::default())));
-        let target_dialogs = self.target_leg.as_ref()
+        let target_dialogs = self.target_leg_opt()
             .map(|l| l.sip.active_dialog_ids.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
         let server_dialog_clone = self.exported_leg.clone_server_dialog();
@@ -2540,7 +2552,7 @@ impl Drop for CallSession {
             bridge.stop();
         }
         self.exported_leg.media.peer.stop();
-        if let Some(ref callee) = self.target_leg {
+        if let Some(callee) = self.target_leg_opt() {
             callee.media.peer.stop();
         }
         if let Some(reporter) = self.reporter.take() {
