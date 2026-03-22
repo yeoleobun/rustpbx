@@ -221,8 +221,8 @@ pub(crate) struct CallSession {
     pub hangup_reason: Option<CallRecordHangupReason>,
     pub hangup_messages: Vec<SessionHangupMessage>,
     pub shared: CallSessionShared,
-    pub exported_leg: CallLeg,
-    pub target_leg: Option<CallLeg>,
+    pub(super) exported_leg: CallLeg,
+    pub(super) target_leg: Option<CallLeg>,
     pub bridge_runtime: BridgeRuntime,
     pub use_media_proxy: bool,
     pub routed_caller: Option<String>,
@@ -967,7 +967,7 @@ impl CallSession {
             let bridge_result = match offered_direction {
                 "sendonly" | "inactive" => {
                     self.bridge_runtime
-                        .suppress_or_pause_callee_forwarding(
+                        .suppress_or_pause_target_forwarding(
                             Self::CALLEE_TRACK_ID,
                             self.exported_leg.media.peer.clone(),
                         )
@@ -975,7 +975,7 @@ impl CallSession {
                 }
                 _ => {
                     self.bridge_runtime
-                        .resume_or_unpause_callee_forwarding(
+                        .resume_or_unpause_target_forwarding(
                             Self::CALLEE_TRACK_ID,
                             self.exported_leg.media.peer.clone(),
                         )

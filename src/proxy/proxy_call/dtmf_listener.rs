@@ -75,13 +75,13 @@ async fn dtmf_track_reader(
 }
 
 pub(crate) async fn spawn_caller_dtmf_listener(
-    caller_peer: Arc<dyn MediaPeer>,
+    exported_peer: Arc<dyn MediaPeer>,
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
     dtmf_codecs: Vec<CodecInfo>,
     cancel: CancellationToken,
 ) {
     let mut started_track_ids = HashSet::new();
-    let tracks = caller_peer.get_tracks().await;
+    let tracks = exported_peer.get_tracks().await;
     let Some(track_handle) = tracks.into_iter().next() else {
         return;
     };
