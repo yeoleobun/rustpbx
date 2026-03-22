@@ -227,7 +227,7 @@ impl AppRuntime {
 
     fn teardown(session: &mut CallSession) {
         session.app_event_tx = None;
-        session.caller_leg.media.cancel_dtmf_listener();
+        session.exported_leg.media.cancel_dtmf_listener();
         session.shared.set_dtmf_listener_cancel(None);
         session.shared.set_app_event_sender(None);
     }
@@ -244,11 +244,11 @@ impl AppRuntime {
             return Ok(());
         }
 
-        if session.caller_leg.media.answer_sdp.is_none() {
+        if session.exported_leg.media.answer_sdp.is_none() {
             match session
                 .build_caller_answer(
                     caller_negotiation::build_passthrough_caller_answer_codec_info(
-                        session.caller_leg.media.offer_sdp.as_deref(),
+                        session.exported_leg.media.offer_sdp.as_deref(),
                     ),
                 )
                 .await
@@ -322,7 +322,7 @@ impl AppRuntime {
         cancel_token: &CancellationToken,
     ) {
         let caller_dtmf_codecs = session
-            .caller_leg
+            .exported_leg
             .media.offer_sdp
             .as_deref()
             .map(MediaNegotiator::extract_dtmf_codecs)
@@ -331,10 +331,10 @@ impl AppRuntime {
             return;
         }
 
-        let caller_peer = session.caller_leg.media.peer.clone();
+        let caller_peer = session.exported_leg.media.peer.clone();
         let dtmf_event_tx = event_tx.clone();
         let dtmf_cancel = cancel_token.child_token();
-        session.caller_leg.media.set_dtmf_listener_cancel(dtmf_cancel.clone());
+        session.exported_leg.media.set_dtmf_listener_cancel(dtmf_cancel.clone());
         session
             .shared
             .set_dtmf_listener_cancel(Some(dtmf_cancel.clone()));

@@ -14,9 +14,9 @@ pub(crate) struct AnswerRuntime;
 
 impl AnswerRuntime {
     fn trickle_ice_enabled(session: &CallSession) -> bool {
-        session.caller_leg.sip.supports_trickle_ice
+        session.exported_leg.sip.supports_trickle_ice
             && session
-                .caller_leg
+                .exported_leg
                 .media.offer_sdp
                 .as_deref()
                 .map(CallSession::is_webrtc_sdp)
@@ -24,14 +24,14 @@ impl AnswerRuntime {
     }
 
     async fn spawn_inbound_trickle_ice_sender(session: &CallSession) {
-        let Some(server_dialog) = session.caller_leg.clone_server_dialog() else {
+        let Some(server_dialog) = session.exported_leg.clone_server_dialog() else {
             warn!("No server dialog on caller leg, cannot send trickle ICE");
             return;
         };
         let cancel_token = session.cancel_token.child_token();
         let session_id = session.context.session_id.clone();
         let Some((_pc, mut candidate_rx, mut gathering_rx)) =
-            session.caller_leg.media.trickle_ice_context("caller-track").await
+            session.exported_leg.media.trickle_ice_context("caller-track").await
         else {
             return;
         };
@@ -91,7 +91,7 @@ impl AnswerRuntime {
             return;
         }
 
-        if session.caller_leg.media.early_media_sent && dialog_id.is_none() {
+        if session.exported_leg.media.early_media_sent && dialog_id.is_none() {
             debug!("Early media already sent, skipping ringing");
             return;
         }
@@ -120,7 +120,7 @@ impl AnswerRuntime {
         };
 
         if has_early_media {
-            session.caller_leg.media.early_media_sent = true;
+            session.exported_leg.media.early_media_sent = true;
 
             if session.use_media_proxy {
                 if should_passthrough {
@@ -129,11 +129,11 @@ impl AnswerRuntime {
                         mode = ?ringback_mode,
                         "Forwarding callee early media to caller (passthrough mode)"
                     );
-                    let _ = session.setup_callee_track(&answer, dialog_id.as_ref()).await;
+                    let _ = session.setup_target_track(&answer, dialog_id.as_ref()).await;
                 }
 
                 let caller_codec_info = caller_negotiation::build_final_caller_codec_info(
-                    session.caller_leg.media.offer_sdp.as_deref(),
+                    session.exported_leg.media.offer_sdp.as_deref(),
                     &answer,
                     &session.context.dialplan.allow_codecs,
                     session.use_media_proxy,
@@ -176,7 +176,7 @@ impl AnswerRuntime {
                                     let loop_playback =
                                         session.context.dialplan.ringback.loop_playback;
                                     session
-                                        .caller_leg
+                                        .exported_leg
                                         .media
                                         .create_file_track(
                                             CallSession::RINGBACK_TRACK_ID,
@@ -189,7 +189,7 @@ impl AnswerRuntime {
                                     } else {
                                         CallSession::CALLEE_TRACK_ID.to_string()
                                     };
-                                    session.caller_leg.media.peer.suppress_forwarding(&track_id).await;
+                                    session.exported_leg.media.peer.suppress_forwarding(&track_id).await;
                                 }
                             }
                         }
@@ -216,7 +216,7 @@ impl AnswerRuntime {
                 if session.use_media_proxy {
                     let loop_playback = session.context.dialplan.ringback.loop_playback;
                     session
-                        .caller_leg
+                        .exported_leg
                         .media
                         .create_file_track(
                             CallSession::RINGBACK_TRACK_ID,
@@ -245,7 +245,7 @@ impl AnswerRuntime {
             (None, None)
         };
 
-        if let Err(e) = session.caller_leg.send_provisional(headers, body) {
+        if let Err(e) = session.exported_leg.send_provisional(headers, body) {
             warn!("Failed to send {} response: {}", status_code, e);
             return;
         }
@@ -265,30 +265,30 @@ impl AnswerRuntime {
         }
         if let Some(ref id_str) = dialog_id {
             let matched_dialog_id = session
-                .callee_leg()
+                .target_leg()
                 .sip
                 .recorded_dialogs()
                 .into_iter()
                 .find(|id| id.to_string() == *id_str);
             if let Some(id) = matched_dialog_id {
-                session.callee_leg_mut().sip.set_connected_dialog(id);
+                session.target_leg_mut().sip.set_connected_dialog(id);
             }
         }
         if first_answer {
             session.answer_time = Some(Instant::now());
         }
         info!(
-            server_dialog_id = ?session.caller_leg.server_dialog_id(),
+            server_dialog_id = ?session.exported_leg.server_dialog_id(),
             use_media_proxy = session.use_media_proxy,
-            has_answer = session.caller_leg.media.answer_sdp.is_some(),
+            has_answer = session.exported_leg.media.answer_sdp.is_some(),
             dialog_id = ?dialog_id,
             "Call answered"
         );
 
-        if first_answer && !session.caller_leg.media.early_media_sent {
+        if first_answer && !session.exported_leg.media.early_media_sent {
             if let Some(ref callee_sdp) = callee_answer {
                 if let Some(codec_info) = caller_negotiation::build_optimized_caller_codec_info(
-                    session.caller_leg.media.offer_sdp.as_deref(),
+                    session.exported_leg.media.offer_sdp.as_deref(),
                     callee_sdp,
                     &session.context.dialplan.allow_codecs,
                     session.use_media_proxy,
@@ -310,12 +310,12 @@ impl AnswerRuntime {
             }
         }
 
-        if session.caller_leg.media.answer_sdp.is_none() {
+        if session.exported_leg.media.answer_sdp.is_none() {
             let answer_for_caller = if Self::trickle_ice_enabled(session) {
                 session
                     .build_caller_answer_trickle(
                         caller_negotiation::build_passthrough_caller_answer_codec_info(
-                            session.caller_leg.media.offer_sdp.as_deref(),
+                            session.exported_leg.media.offer_sdp.as_deref(),
                         ),
                     )
                     .await?
@@ -323,7 +323,7 @@ impl AnswerRuntime {
                 session
                     .build_caller_answer(
                         caller_negotiation::build_passthrough_caller_answer_codec_info(
-                            session.caller_leg.media.offer_sdp.as_deref(),
+                            session.exported_leg.media.offer_sdp.as_deref(),
                         ),
                     )
                     .await?
@@ -338,15 +338,15 @@ impl AnswerRuntime {
         if session.use_media_proxy {
             let track_id = CallSession::CALLEE_TRACK_ID.to_string();
             session
-                .caller_leg
+                .exported_leg
                 .media
                 .remove_ringback_track(CallSession::RINGBACK_TRACK_ID)
                 .await;
             if let Some(answer) = callee_answer.as_ref() {
-                session.setup_callee_track(answer, None).await?;
+                session.setup_target_track(answer, None).await?;
 
                 if session.bridge_runtime.media_bridge.is_none() {
-                    session.caller_leg.media.cancel_dtmf_listener();
+                    session.exported_leg.media.cancel_dtmf_listener();
                     session.shared.set_dtmf_listener_cancel(None);
                     session
                         .ensure_media_bridge_from_sdp(answer, false, "final-answer")
@@ -363,18 +363,18 @@ impl AnswerRuntime {
                 session.set_answer(answer);
             }
             session.bridge_runtime.stop_bridge();
-            session.caller_leg.media.peer.stop();
-            session.callee_leg().media.peer.stop();
+            session.exported_leg.media.peer.stop();
+            session.target_leg().media.peer.stop();
         }
 
-        let mut headers = if session.caller_leg.media.answer_sdp.is_some() {
+        let mut headers = if session.exported_leg.media.answer_sdp.is_some() {
             vec![rsip::Header::ContentType("application/sdp".into())]
         } else {
             vec![]
         };
 
         {
-            let server_timer = session.caller_leg.sip.session_timer.lock().unwrap();
+            let server_timer = session.exported_leg.sip.session_timer.lock().unwrap();
             if server_timer.active {
                 headers.push(rsip::Header::Supported(
                     rsip::headers::Supported::from(crate::proxy::proxy_call::session_timer::TIMER_TAG).into(),
@@ -389,15 +389,15 @@ impl AnswerRuntime {
                 ));
             }
         }
-        if session.caller_leg.sip.supports_trickle_ice {
+        if session.exported_leg.sip.supports_trickle_ice {
             headers.push(rsip::Header::Supported(
                 rsip::headers::Supported::from(TRICKLE_ICE_TAG).into(),
             ));
         }
 
-        if let Err(e) = session.caller_leg.accept_inbound(
+        if let Err(e) = session.exported_leg.accept_inbound(
             Some(headers),
-            session.caller_leg.media.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
+            session.exported_leg.media.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
         ) {
             return Err(anyhow!("Failed to send 200 OK: {}", e));
         }

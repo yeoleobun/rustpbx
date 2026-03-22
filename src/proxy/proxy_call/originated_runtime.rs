@@ -34,20 +34,20 @@ impl OriginatedRuntime {
         // Create the callee leg now that we're about to dial
         let offer_sdp = params.invite_option.offer.as_ref()
             .map(|b| String::from_utf8_lossy(b).to_string());
-        let callee_media_builder = crate::media::MediaStreamBuilder::new()
+        let target_media_builder = crate::media::MediaStreamBuilder::new()
             .with_id(format!("{}-callee", session.context.session_id))
             .with_cancel_token(session.cancel_token.child_token());
-        let callee_peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(callee_media_builder.build())));
-        session.callee_leg = Some(CallLeg::new(
+        let target_peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(target_media_builder.build())));
+        session.target_leg = Some(CallLeg::new(
             session.context.session_id.clone(),
             crate::proxy::proxy_call::call_leg::LegRole::Callee,
             CallLegDirection::Outbound,
-            callee_peer,
+            target_peer,
             offer_sdp,
         ));
         // Set dialog event channel from stored tx
-        if let Some(tx) = session.callee_dialog_event_tx.take() {
-            session.callee_leg_mut().sip.dialog_event_tx = Some(tx);
+        if let Some(tx) = session.target_dialog_event_tx.take() {
+            session.target_leg_mut().sip.dialog_event_tx = Some(tx);
         }
 
         let (state_tx, mut state_rx) = mpsc::unbounded_channel();
@@ -159,10 +159,10 @@ impl OriginatedRuntime {
                             // Register callee dialog
                             let dialog_id = dialog.id();
                             {
-                                let mut active = session.callee_leg_mut().sip.active_dialog_ids.lock().unwrap();
+                                let mut active = session.target_leg_mut().sip.active_dialog_ids.lock().unwrap();
                                 active.insert(dialog_id.clone());
                             }
-                            session.callee_leg_mut().sip.connected_dialog_id = Some(dialog_id.clone());
+                            session.target_leg_mut().sip.connected_dialog_id = Some(dialog_id.clone());
                             if let Some(ref handle) = session.handle {
                                 session.shared.register_dialog(dialog_id.to_string(), handle.clone());
                             }
@@ -170,9 +170,9 @@ impl OriginatedRuntime {
                             // Store answer SDP from the remote on both legs
                             if !resp.body().is_empty() {
                                 let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                                session.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                                session.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                                session.caller_leg.media.select_or_store_negotiated_audio(
+                                session.target_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
+                                session.exported_leg.media.answer_sdp = Some(answer_sdp.clone());
+                                session.exported_leg.media.select_or_store_negotiated_audio(
                                     MediaEndpoint::select_best_audio_from_sdp(
                                         &answer_sdp,
                                         &session.context.dialplan.allow_codecs,
@@ -243,7 +243,7 @@ impl OriginatedRuntime {
     pub async fn hold_callee(session: &mut CallSession, music_source: Option<&str>) -> Result<()> {
         use rsipstack::dialog::dialog::Dialog;
 
-        let callee_dialog_id = session.callee_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for hold"))?
             .clone();
 
@@ -256,7 +256,7 @@ impl OriginatedRuntime {
 
         // Build a sendonly SDP offer from the caller peer's track
         let offer_sdp = Self::build_local_offer_with_direction(session, "sendonly").await?;
-        session.caller_leg.media.offer_sdp = Some(offer_sdp.clone());
+        session.exported_leg.media.offer_sdp = Some(offer_sdp.clone());
 
         let headers = vec![rsip::Header::ContentType("application/sdp".into())];
         let response = client_dialog
@@ -267,9 +267,9 @@ impl OriginatedRuntime {
         if let Some(resp) = response {
             if !resp.body().is_empty() {
                 let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                session.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                session.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                session.caller_leg.media.select_or_store_negotiated_audio(
+                session.target_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
+                session.exported_leg.media.answer_sdp = Some(answer_sdp.clone());
+                session.exported_leg.media.select_or_store_negotiated_audio(
                     MediaEndpoint::select_best_audio_from_sdp(
                         &answer_sdp,
                         &session.context.dialplan.allow_codecs,
@@ -282,15 +282,15 @@ impl OriginatedRuntime {
         session.publish_exported_leg_media();
 
         // Suppress media forwarding on the caller peer
-        let tracks = session.caller_leg.media.peer.get_tracks().await;
+        let tracks = session.exported_leg.media.peer.get_tracks().await;
         if let Some(track) = tracks.first() {
             let guard = track.lock().await;
-            session.caller_leg.media.peer.suppress_forwarding(guard.id()).await;
+            session.exported_leg.media.peer.suppress_forwarding(guard.id()).await;
         }
 
         // Play hold music if provided
         if let Some(audio_file) = music_source.filter(|s| !s.is_empty()) {
-            session.caller_leg
+            session.exported_leg
                 .play_audio(
                     &session.context.session_id,
                     audio_file,
@@ -311,7 +311,7 @@ impl OriginatedRuntime {
     pub async fn unhold_callee(session: &mut CallSession) -> Result<()> {
         use rsipstack::dialog::dialog::Dialog;
 
-        let callee_dialog_id = session.callee_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for unhold"))?
             .clone();
 
@@ -323,7 +323,7 @@ impl OriginatedRuntime {
         };
 
         let offer_sdp = Self::build_local_offer_with_direction(session, "sendrecv").await?;
-        session.caller_leg.media.offer_sdp = Some(offer_sdp.clone());
+        session.exported_leg.media.offer_sdp = Some(offer_sdp.clone());
 
         let headers = vec![rsip::Header::ContentType("application/sdp".into())];
         let response = client_dialog
@@ -334,9 +334,9 @@ impl OriginatedRuntime {
         if let Some(resp) = response {
             if !resp.body().is_empty() {
                 let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
-                session.callee_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
-                session.caller_leg.media.answer_sdp = Some(answer_sdp.clone());
-                session.caller_leg.media.select_or_store_negotiated_audio(
+                session.target_leg_mut().media.answer_sdp = Some(answer_sdp.clone());
+                session.exported_leg.media.answer_sdp = Some(answer_sdp.clone());
+                session.exported_leg.media.select_or_store_negotiated_audio(
                     MediaEndpoint::select_best_audio_from_sdp(
                         &answer_sdp,
                         &session.context.dialplan.allow_codecs,
@@ -349,11 +349,11 @@ impl OriginatedRuntime {
         session.publish_exported_leg_media();
 
         // Remove hold music and resume forwarding
-        session.caller_leg.media.peer.remove_track("hold_music", true).await;
-        let tracks = session.caller_leg.media.peer.get_tracks().await;
+        session.exported_leg.media.peer.remove_track("hold_music", true).await;
+        let tracks = session.exported_leg.media.peer.get_tracks().await;
         if let Some(track) = tracks.first() {
             let guard = track.lock().await;
-            session.caller_leg.media.peer.resume_forwarding(guard.id()).await;
+            session.exported_leg.media.peer.resume_forwarding(guard.id()).await;
         }
 
         Ok(())
@@ -366,7 +366,7 @@ impl OriginatedRuntime {
         let target_uri = Uri::try_from(target)
             .map_err(|e| anyhow!("invalid transfer target '{}': {}", target, e))?;
 
-        let callee_dialog_id = session.callee_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for transfer"))?
             .clone();
 
@@ -404,7 +404,7 @@ impl OriginatedRuntime {
     /// Build a local SDP offer from the caller peer's first track with
     /// the specified media direction.
     async fn build_local_offer_with_direction(session: &CallSession, direction: &str) -> Result<String> {
-        let tracks = session.caller_leg.media.peer.get_tracks().await;
+        let tracks = session.exported_leg.media.peer.get_tracks().await;
         let track = tracks.first()
             .ok_or_else(|| anyhow!("no track on caller peer for SDP offer"))?;
         let guard = track.lock().await;

@@ -127,7 +127,7 @@ impl CallReporter {
             sip_leg_roles.insert(server_dialog_id.call_id.clone(), "caller".to_string());
         }
 
-        for dialog_id in &snapshot.callee_dialogs {
+        for dialog_id in &snapshot.target_dialogs {
             call_ids.insert(dialog_id.call_id.clone());
             sip_leg_roles.insert(dialog_id.call_id.clone(), "callee".to_string());
         }
