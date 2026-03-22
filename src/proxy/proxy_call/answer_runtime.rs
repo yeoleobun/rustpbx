@@ -265,13 +265,13 @@ impl AnswerRuntime {
         }
         if let Some(ref id_str) = dialog_id {
             let matched_dialog_id = session
-                .callee_leg
+                .callee_leg()
                 .sip
                 .recorded_dialogs()
                 .into_iter()
                 .find(|id| id.to_string() == *id_str);
             if let Some(id) = matched_dialog_id {
-                session.callee_leg.sip.set_connected_dialog(id);
+                session.callee_leg_mut().sip.set_connected_dialog(id);
             }
         }
         if first_answer {
@@ -364,7 +364,7 @@ impl AnswerRuntime {
             }
             session.bridge_runtime.stop_bridge();
             session.caller_leg.media.peer.stop();
-            session.callee_leg.media.peer.stop();
+            session.callee_leg().media.peer.stop();
         }
 
         let mut headers = if session.caller_leg.media.answer_sdp.is_some() {
@@ -415,7 +415,7 @@ impl AnswerRuntime {
                 callee,
             });
         }
-        session.publish_caller_media();
+        session.publish_exported_leg_media();
         Ok(())
     }
 }
