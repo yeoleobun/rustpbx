@@ -1,5 +1,6 @@
 use crate::call::{CallForwardingMode, Location};
 use crate::config::RouteResult;
+use crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime;
 use crate::proxy::proxy_call::session::{ActionInbox, CallSession, ParallelEvent};
 use crate::proxy::proxy_call::state::SessionAction;
 use anyhow::{Result, anyhow};
@@ -689,7 +690,7 @@ impl TargetRuntime {
                         endpoint = ?config.endpoint,
                         "Call forwarding (busy) engaged"
                     );
-                    return session.transfer_to_endpoint(&config.endpoint, inbox).await;
+                    return ProxySessionRuntime::transfer_to_endpoint(session, &config.endpoint, inbox).await;
                 }
             }
             if session.context.dialplan.voicemail_enabled {
@@ -712,7 +713,7 @@ impl TargetRuntime {
                         endpoint = ?config.endpoint,
                         "Call forwarding (no answer) engaged"
                     );
-                    return session.transfer_to_endpoint(&config.endpoint, inbox).await;
+                    return ProxySessionRuntime::transfer_to_endpoint(session, &config.endpoint, inbox).await;
                 }
             }
             if session.context.dialplan.voicemail_enabled {

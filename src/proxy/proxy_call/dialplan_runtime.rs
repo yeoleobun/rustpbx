@@ -1,4 +1,5 @@
 use crate::call::{DialStrategy, DialplanFlow};
+use crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime;
 use crate::proxy::proxy_call::session::{ActionInbox, CallSession, FlowFailureHandling};
 use anyhow::{Result, anyhow};
 use futures::{FutureExt, future::BoxFuture};
@@ -47,7 +48,7 @@ impl DialplanRuntime {
             endpoint = ?config.endpoint,
             "Call forwarding (always) engaged"
         );
-        session.transfer_to_endpoint(&config.endpoint, inbox).await?;
+        ProxySessionRuntime::transfer_to_endpoint(session, &config.endpoint, inbox).await?;
         Ok(true)
     }
 
@@ -61,7 +62,7 @@ impl DialplanRuntime {
             match flow {
                 DialplanFlow::Targets(strategy) => match handling {
                     FlowFailureHandling::Handle => Self::execute_targets(session, strategy, inbox).await,
-                    FlowFailureHandling::Propagate => session.run_targets(strategy, inbox).await,
+                    FlowFailureHandling::Propagate => ProxySessionRuntime::run_targets(session, strategy, inbox).await,
                 },
                 DialplanFlow::Queue { plan, next } => {
                     crate::proxy::proxy_call::queue_flow::QueueFlow::execute_queue_plan(
@@ -91,13 +92,13 @@ impl DialplanRuntime {
         let timeout_duration = session.forwarding_timeout();
 
         if let Some(duration) = timeout_duration {
-            match timeout(duration, session.run_targets(strategy, inbox.as_deref_mut())).await {
+            match timeout(duration, ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut())).await {
                 Ok(outcome) => match outcome {
                     Ok(_) => {
                         debug!(session_id = %session.context.session_id, "Dialplan executed successfully");
                         Ok(())
                     }
-                    Err(_) => session.handle_failure(inbox).await,
+                    Err(_) => ProxySessionRuntime::handle_failure(session, inbox).await,
                 },
                 Err(_) => {
                     session.set_error(
@@ -109,12 +110,12 @@ impl DialplanRuntime {
                 }
             }
         } else {
-            match session.run_targets(strategy, inbox.as_deref_mut()).await {
+            match ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut()).await {
                 Ok(_) => {
                     debug!(session_id = %session.context.session_id, "Dialplan executed successfully");
                     Ok(())
                 }
-                Err(_) => session.handle_failure(inbox).await,
+                Err(_) => ProxySessionRuntime::handle_failure(session, inbox).await,
             }
         }
     }
