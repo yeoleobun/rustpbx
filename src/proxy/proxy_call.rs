@@ -208,7 +208,7 @@ impl CallSessionBuilder {
             routed_contact: None,
             routed_destination: None,
             last_queue_name: None,
-            callee_dialogs: vec![],
+            target_dialogs: vec![],
             server_dialog_id: DialogId::try_from((
                 dialplan.original.as_ref(),
                 TransactionRole::Server,

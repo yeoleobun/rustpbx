@@ -113,7 +113,7 @@ impl TargetRuntime {
             return Err(anyhow!("No targets provided for parallel dialing"));
         }
 
-        if !session.caller_leg.media.early_media_sent {
+        if !session.exported_leg.media.early_media_sent {
             let _ = session
                 .apply_session_action(
                     SessionAction::StartRinging {
@@ -153,7 +153,7 @@ impl TargetRuntime {
                 .dialplan
                 .build_invite_headers(target)
                 .unwrap_or_default();
-            let invite_option = session.callee_leg().sip.build_outbound_invite_option(
+            let invite_option = session.target_leg().sip.build_outbound_invite_option(
                 target,
                 caller.clone(),
                 None,
@@ -174,7 +174,7 @@ impl TargetRuntime {
                 .map(|addr| addr.to_string());
             let aor = target.aor.to_string();
 
-            let callee_event_tx = session.callee_leg().sip.dialog_event_tx.clone();
+            let callee_event_tx = session.target_leg().sip.dialog_event_tx.clone();
             let dialog_layer_for_guard = session.dialog_layer.clone();
             let dialog_layer_for_invite = session.dialog_layer.clone();
 
@@ -318,7 +318,7 @@ impl TargetRuntime {
                                         None,
                                     )
                                     .await;
-                            } else if !session.caller_leg.media.early_media_sent {
+                            } else if !session.exported_leg.media.early_media_sent {
                                 let _ = session
                                     .apply_session_action(
                                         SessionAction::StartRinging {
@@ -439,7 +439,7 @@ impl TargetRuntime {
             .dialplan
             .build_invite_headers(target)
             .unwrap_or_default();
-        let invite_option = session.callee_leg().sip.build_outbound_invite_option(
+        let invite_option = session.target_leg().sip.build_outbound_invite_option(
             target,
             caller.clone(),
             caller_display_name,

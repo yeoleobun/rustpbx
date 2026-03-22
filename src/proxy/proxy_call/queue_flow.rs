@@ -84,11 +84,11 @@ impl QueueFlow {
     async fn prepare_immediate_accept(session: &mut CallSession) -> Result<()> {
         info!(session_id = %session.context.session_id, "Queue accepting immediately");
 
-        if session.caller_leg.media.answer_sdp.is_none() {
+        if session.exported_leg.media.answer_sdp.is_none() {
             let answer: String = session
                 .build_caller_answer(
                     caller_negotiation::build_passthrough_caller_answer_codec_info(
-                        session.caller_leg.media.offer_sdp.as_deref(),
+                        session.exported_leg.media.offer_sdp.as_deref(),
                     ),
                 )
                 .await
@@ -112,14 +112,14 @@ impl QueueFlow {
         );
 
         if let Err(e) = session
-            .caller_leg
+            .exported_leg
             .media
             .create_or_switch_hold_track("queue-hold-music", audio_file, hold_config.loop_playback)
             .await
         {
             warn!("Failed to reuse queue hold track: {}", e);
             if let Err(err) = session
-                .caller_leg
+                .exported_leg
                 .media
                 .create_hold_track("queue-hold-music", audio_file, hold_config.loop_playback)
                 .await
@@ -134,19 +134,19 @@ impl QueueFlow {
             .bridge_runtime
             .suppress_or_pause_callee_forwarding(
                 CallSession::CALLEE_TRACK_ID,
-                session.caller_leg.media.peer.clone(),
+                session.exported_leg.media.peer.clone(),
             )
             .await;
     }
 
     async fn stop_hold(session: &mut CallSession) {
         info!(session_id = %session.context.session_id, "Stopping queue hold music");
-        session.caller_leg.media.remove_track("queue-hold-music").await;
+        session.exported_leg.media.remove_track("queue-hold-music").await;
         let _ = session
             .bridge_runtime
             .resume_or_unpause_callee_forwarding(
                 CallSession::CALLEE_TRACK_ID,
-                session.caller_leg.media.peer.clone(),
+                session.exported_leg.media.peer.clone(),
             )
             .await;
     }
