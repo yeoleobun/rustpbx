@@ -29,7 +29,7 @@ pub(crate) struct SipLeg {
     pub dialog_guards: Vec<DialogStateReceiverGuard>,
     pub session_timer: Arc<Mutex<SessionTimerState>>,
     pub supports_trickle_ice: bool,
-    /// The inbound server dialog. Only populated for caller legs.
+    /// The inbound server dialog. Only populated for exported legs.
     pub server_dialog: Option<ServerInviteDialog>,
 }
 

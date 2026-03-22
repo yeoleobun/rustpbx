@@ -18,7 +18,7 @@ use super::session::SessionActionInbox;
 pub(crate) struct OriginatedRuntime;
 
 impl OriginatedRuntime {
-    /// Run the originated dial flow: create callee leg, send INVITE, handle
+    /// Run the originated dial flow: create target leg, send INVITE, handle
     /// dialog state transitions until answered or failed.
     pub async fn run_dial(
         session: &mut CallSession,
@@ -31,7 +31,7 @@ impl OriginatedRuntime {
 
         session.shared.transition_to_dialing();
 
-        // Create the callee leg now that we're about to dial
+        // Create the target leg now that we're about to dial
         let offer_sdp = params.invite_option.offer.as_ref()
             .map(|b| String::from_utf8_lossy(b).to_string());
         let target_media_builder = crate::media::MediaStreamBuilder::new()

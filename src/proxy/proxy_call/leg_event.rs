@@ -25,6 +25,6 @@ pub(crate) enum LegEvent {
         dialog_id: String,
     },
 
-    /// A trickle-ICE INFO was received on the caller leg.
+    /// A trickle-ICE INFO was received on the exported leg.
     TrickleIce { payload: String },
 }

@@ -663,7 +663,7 @@ impl CallSession {
             "create_offer_for_target called"
         );
 
-        // Ensure callee leg exists for outbound dialing
+        // Ensure target leg exists for outbound dialing
         self.ensure_target_leg();
 
         if !self.use_media_proxy {
@@ -900,7 +900,7 @@ impl CallSession {
             session_id = %self.context.session_id,
             ?method,
             dialog_id,
-            "Handling mid-dialog request on callee leg"
+            "Handling mid-dialog request on target leg"
         );
 
         let response_body = if let Some(offer) = sdp {

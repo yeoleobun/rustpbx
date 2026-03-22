@@ -192,7 +192,7 @@ impl SessionLoopRuntime {
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
         callee_dialogs: Arc<Mutex<HashSet<DialogId>>>,
-        server_dialog: Option<ServerInviteDialog>,  // caller leg's server dialog clone for timer refresh (None for non-proxy sessions)
+        server_dialog: Option<ServerInviteDialog>,  // exported leg's server dialog clone for timer refresh (None for non-proxy sessions)
         handle: CallSessionHandle,
         cancel_token: CancellationToken,
         pending_hangup: Arc<Mutex<Option<PendingHangup>>>,
