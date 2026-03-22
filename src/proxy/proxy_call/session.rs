@@ -364,6 +364,29 @@ impl CallSession {
         &self.caller_leg
     }
 
+    /// Ensures the callee leg exists, creating it on demand if absent.
+    /// Used by the proxy path to defer callee creation until the first target is dialed.
+    pub(crate) fn ensure_callee_leg(&mut self) {
+        if self.callee_leg.is_some() {
+            return;
+        }
+        let callee_media_builder = crate::media::MediaStreamBuilder::new()
+            .with_id(format!("{}-callee", self.context.session_id))
+            .with_cancel_token(self.cancel_token.child_token());
+        let callee_peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(callee_media_builder.build())));
+        self.callee_leg = Some(CallLeg::new(
+            self.context.session_id.clone(),
+            crate::proxy::proxy_call::call_leg::LegRole::Callee,
+            CallLegDirection::Outbound,
+            callee_peer,
+            None,
+        ));
+        // Set dialog event channel if one was stored
+        if let Some(tx) = self.callee_dialog_event_tx.take() {
+            self.callee_leg_mut().sip.dialog_event_tx = Some(tx);
+        }
+    }
+
     fn explicit_audio_default_selection() -> BridgeSelection {
         BridgeSelection {
             codec: CodecType::PCMU,
@@ -636,9 +659,12 @@ impl CallSession {
             "create_offer_for_target called"
         );
 
+        // Ensure callee leg exists for outbound dialing
+        self.ensure_callee_leg();
+
         if !self.use_media_proxy {
             // Media proxy disabled: use caller's original offer
-            return match self.callee_leg().media.offer_sdp.as_ref() {
+            return match self.caller_leg.media.offer_sdp.as_ref() {
                 Some(sdp) if !sdp.trim().is_empty() => Some(sdp.clone().into_bytes()),
                 _ => None,
             };
@@ -2369,11 +2395,6 @@ impl CallSession {
             .with_cancel_token(cancel_token.child_token());
         let caller_peer = Arc::new(VoiceEnginePeer::new(Arc::new(caller_media_builder.build())));
 
-        let callee_media_builder = crate::media::MediaStreamBuilder::new()
-            .with_id(format!("{}-callee", context.session_id))
-            .with_cancel_token(cancel_token.child_token());
-        let callee_peer = Arc::new(VoiceEnginePeer::new(Arc::new(callee_media_builder.build())));
-
         let session_shared = CallSessionShared::new(
             context.session_id.clone(),
             context.dialplan.direction,
@@ -2395,7 +2416,7 @@ impl CallSession {
             use_media_proxy,
             recorder_option,
             caller_peer,
-            Some(callee_peer),
+            None, // callee leg created lazily via ensure_callee_leg()
             session_shared.clone(),
             Some(reporter),
         ));
@@ -2403,14 +2424,8 @@ impl CallSession {
         session.caller_leg.sip.supports_trickle_ice =
             SipLeg::has_trickle_ice_support(&initial_request.headers);
 
-        if use_media_proxy {
-            session.caller_leg.media.offer_sdp = Some(offer_sdp);
-            session.callee_leg_mut().media.offer_sdp =
-                session.create_callee_track(all_webrtc_target).await.ok();
-        } else {
-            session.caller_leg.media.offer_sdp = Some(offer_sdp.clone());
-            session.callee_leg_mut().media.offer_sdp = Some(offer_sdp);
-        }
+        // Store caller offer SDP; callee offer will be set when callee leg is created
+        session.caller_leg.media.offer_sdp = Some(offer_sdp);
 
         // In serve(), the server dialog was just created above — safe to expect.
         let caller_dialog_id = session.caller_leg.server_dialog_id()
@@ -2421,7 +2436,7 @@ impl CallSession {
         session.register_active_call(handle);
 
         let (callee_state_tx, callee_state_rx) = mpsc::unbounded_channel();
-        session.callee_leg_mut().sip.dialog_event_tx = Some(callee_state_tx);
+        session.callee_dialog_event_tx = Some(callee_state_tx);
 
         let action_inbox = SessionActionInbox::new(action_rx);
 
