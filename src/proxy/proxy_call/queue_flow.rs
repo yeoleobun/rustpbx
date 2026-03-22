@@ -1,5 +1,6 @@
 use crate::call::{DialStrategy, DialplanFlow, Location, QueueHoldConfig, QueuePlan};
 use crate::proxy::proxy_call::caller_negotiation;
+use crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime;
 use crate::proxy::proxy_call::session::{ActionInbox, CallSession};
 use anyhow::{Result, anyhow};
 use rsip::StatusCode;
@@ -54,7 +55,7 @@ impl QueueFlow {
         }
 
         let dial_result = match &plan.dial_strategy {
-            Some(strategy) => session.run_targets(strategy, inbox.as_deref_mut()).await,
+            Some(strategy) => ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut()).await,
             None => {
                 warn!(session_id = %session.context.session_id, "No dial strategy");
                 Err(anyhow!("No dial strategy configured"))
@@ -169,7 +170,7 @@ impl QueueFlow {
             return session.execute_flow(next_flow, inbox).await;
         }
 
-        session.handle_failure(inbox).await
+        ProxySessionRuntime::handle_failure(session, inbox).await
     }
 
     pub async fn run_target_attempt(
@@ -183,7 +184,7 @@ impl QueueFlow {
                     ?timeout,
                     "Applying no-trying timeout"
                 );
-                return match tokio::time::timeout(timeout, session.try_single_target(target)).await {
+                return match tokio::time::timeout(timeout, ProxySessionRuntime::try_single_target(session, target)).await {
                     Ok(res) => res,
                     Err(_) => {
                         warn!(
@@ -199,7 +200,7 @@ impl QueueFlow {
             }
         }
 
-        session.try_single_target(target).await
+        ProxySessionRuntime::try_single_target(session, target).await
     }
 
     pub fn should_retry_code(retry_codes: Option<&Vec<u16>>, code: StatusCode) -> bool {

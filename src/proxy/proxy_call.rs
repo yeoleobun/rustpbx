@@ -38,6 +38,7 @@ pub(crate) mod sip_leg;
 pub(crate) mod state;
 pub(crate) mod session_loop_runtime;
 pub(crate) mod target_runtime;
+pub(crate) mod proxy_runtime;
 
 #[cfg(test)]
 pub(crate) mod test_util;

@@ -8,21 +8,18 @@ use crate::proxy::proxy_call::bridge_runtime::BridgeRuntime;
 use crate::proxy::proxy_call::call_leg::{CallLeg, CallLegDirection};
 use crate::proxy::proxy_call::dialplan_runtime::DialplanRuntime;
 use crate::proxy::proxy_call::originated_runtime::OriginatedRuntime;
+use crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime;
 use crate::proxy::proxy_call::media_endpoint::{BridgeSelection, MediaEndpoint};
-use crate::proxy::proxy_call::queue_flow::QueueFlow;
 use crate::proxy::proxy_call::recording_runtime::RecordingState;
 use crate::proxy::proxy_call::reporter::CallReporter;
 use crate::proxy::proxy_call::session_loop_runtime::SessionLoopRuntime;
 use crate::proxy::proxy_call::sip_leg::SipLeg;
-use crate::proxy::proxy_call::target_runtime::TargetRuntime;
-use crate::proxy::routing::matcher::RouteResourceLookup;
 use crate::{
     call::{
-        CallForwardingConfig, CallForwardingMode, DialStrategy, DialplanFlow, Location,
-        TransferEndpoint,
+        CallForwardingConfig, CallForwardingMode, DialplanFlow, Location,
     },
     callrecord::{CallRecordHangupMessage, CallRecordHangupReason, CallRecordSender},
-    config::{MediaProxyMode, RouteResult},
+    config::MediaProxyMode,
     proxy::{
         proxy_call::{
             media_peer::{MediaPeer, VoiceEnginePeer},
@@ -1379,11 +1376,7 @@ impl CallSession {
                             OriginatedRuntime::refer_callee(self, &target).await
                         }
                         _ => {
-                            if let Some(endpoint) = TransferEndpoint::parse(&target) {
-                                self.transfer_to_endpoint(&endpoint, inbox).await
-                            } else {
-                                self.transfer_to_uri(&target).await
-                            }
+                            ProxySessionRuntime::transfer_target(self, &target, inbox).await
                         }
                     }
                 }
@@ -1464,21 +1457,7 @@ impl CallSession {
                             OriginatedRuntime::hold_callee(self, music_source.as_deref()).await
                         }
                         _ => {
-                            let audio_file = music_source.clone().unwrap_or_default();
-                            if !audio_file.is_empty() {
-                                self.exported_leg
-                                    .play_audio(
-                                        &self.context.session_id,
-                                        &audio_file,
-                                        true,
-                                        "hold_music",
-                                        true,
-                                        self.cancel_token.clone(),
-                                        self.app_event_tx.clone(),
-                                    )
-                                    .await?;
-                            }
-                            Ok(())
+                            ProxySessionRuntime::hold(self, music_source.as_deref()).await
                         }
                     }
                 }
@@ -1489,8 +1468,7 @@ impl CallSession {
                             OriginatedRuntime::unhold_callee(self).await
                         }
                         _ => {
-                            self.exported_leg.unhold().await;
-                            Ok(())
+                            ProxySessionRuntime::unhold(self).await
                         }
                     }
                 }
@@ -1660,239 +1638,12 @@ impl CallSession {
         .boxed()
     }
 
-    pub(crate) fn transfer_to_endpoint<'a>(
-        &'a mut self,
-        endpoint: &'a TransferEndpoint,
-        inbox: ActionInbox<'a>,
-    ) -> BoxFuture<'a, Result<()>> {
-        async move {
-            match endpoint {
-                TransferEndpoint::Uri(uri) => self.transfer_to_uri(uri).await,
-                TransferEndpoint::Queue(name) => {
-                    if let Some(inbox) = inbox {
-                        info!(session_id = %self.context.session_id, queue = %name, "Transferring to queue");
-
-                        let lookup_ref = if name.chars().all(|c| c.is_ascii_digit()) {
-                            format!("db-{}", name)
-                        } else {
-                            name.clone()
-                        };
-
-                        let queue_config = self
-                            .server
-                            .data_context
-                            .load_queue(&lookup_ref)
-                            .await?
-                            .ok_or_else(|| anyhow!("Queue not found: {}", name))?;
-
-                        let mut plan = queue_config.to_queue_plan()?;
-                        if plan.label.is_none() {
-                            plan.label = Some(name.clone());
-                        }
-
-                        QueueFlow::execute_queue_plan(self, &plan, None, Some(inbox)).await
-                    } else {
-                        warn!("Queue forwarding not supported without inbox: {}", name);
-                        Err(anyhow!("Queue forwarding not supported without inbox"))
-                    }
-                }
-            }
-        }
-        .boxed()
-    }
-
-    async fn transfer_to_uri(&mut self, uri: &str) -> Result<()> {
-        let parsed = Uri::try_from(uri)
-            .map_err(|err| anyhow!("invalid forwarding uri '{}': {}", uri, err))?;
-        let mut location = Location::default();
-        location.aor = parsed.clone();
-        location.contact_raw = Some(parsed.to_string());
-        match self.try_single_target(&location).await {
-            Ok(_) => Ok(()),
-            Err((code, reason)) => {
-                let message = reason.unwrap_or_else(|| code.to_string());
-                Err(anyhow!("forwarding to {} failed: {}", uri, message))
-            }
-        }
-    }
-
     pub(crate) fn execute_flow<'a>(
         &'a mut self,
         flow: &'a DialplanFlow,
         inbox: ActionInbox<'a>,
     ) -> BoxFuture<'a, Result<()>> {
         DialplanRuntime::execute_flow(self, flow, inbox, FlowFailureHandling::Handle)
-    }
-
-    pub(crate) async fn run_targets(
-        &mut self,
-        strategy: &DialStrategy,
-        mut inbox: ActionInbox<'_>,
-    ) -> Result<()> {
-        self.shared.transition_to_dialing();
-        self.process_pending_actions(inbox.as_deref_mut()).await?;
-        debug!(
-            session_id = %self.context.session_id,
-            strategy = %strategy,
-            media_proxy = self.use_media_proxy,
-            "executing dialplan"
-        );
-
-        match strategy {
-            DialStrategy::Sequential(targets) => TargetRuntime::dial_sequential(self, targets, inbox).await,
-            DialStrategy::Parallel(targets) => self.dial_parallel(targets, inbox).await,
-        }
-    }
-
-    async fn dial_parallel(
-        &mut self,
-        targets: &[Location],
-        inbox: ActionInbox<'_>,
-    ) -> Result<()> {
-        TargetRuntime::dial_parallel(self, targets, inbox).await
-    }
-
-    pub(crate) async fn try_single_target(
-        &mut self,
-        target: &Location,
-    ) -> Result<(), (StatusCode, Option<String>)> {
-        let caller = self
-            .context
-            .dialplan
-            .caller
-            .as_ref()
-            .ok_or((
-                StatusCode::ServerInternalError,
-                Some("No caller specified in dialplan".to_string()),
-            ))?
-            .clone();
-        let caller_display_name = self.context.dialplan.caller_display_name.clone();
-
-        // Generate offer based on target's WebRTC support
-        let offer = self.create_offer_for_target(target).await;
-
-        let enforced_contact = self.local_contact_uri();
-        let headers = self
-            .context
-            .dialplan
-            .build_invite_headers(&target)
-            .unwrap_or_default();
-        let invite_option = self.target_leg().sip.build_outbound_invite_option(
-            target,
-            caller.clone(),
-            caller_display_name,
-            offer,
-            enforced_contact.clone(),
-            headers,
-            self.context.max_forwards,
-            if self.server.proxy_config.session_timer {
-                self.server.proxy_config.session_expires
-            } else {
-                None
-            },
-            self.context.dialplan.call_id.clone(),
-        );
-
-        let mut invite_option = if let Some(ref route_invite) = self.context.dialplan.route_invite {
-            let route_result = route_invite
-                .route_invite(
-                    invite_option,
-                    &self.context.dialplan.original,
-                    &self.context.dialplan.direction,
-                    &self.context.cookie,
-                )
-                .await
-                .map_err(|e| {
-                    warn!(session_id = %self.context.session_id, error = %e, "Routing function error");
-                    (
-                        StatusCode::ServerInternalError,
-                        Some("Routing function error".to_string()),
-                    )
-                })?;
-            match route_result {
-                RouteResult::NotHandled(option, _) => {
-                    debug!(session_id = self.context.session_id, %target,
-                        "Routing function returned NotHandled"
-                    );
-                    option
-                }
-                RouteResult::Forward(option, _) | RouteResult::Queue { option, .. } => option,
-                RouteResult::Abort(code, reason) => {
-                    warn!(session_id = self.context.session_id, %code, ?reason, "route abort");
-                    return Err((code, reason));
-                }
-                RouteResult::Application { option, .. } => option,
-            }
-        } else {
-            invite_option
-        };
-
-        if let Some(contact_uri) = enforced_contact {
-            invite_option.contact = contact_uri;
-        }
-
-        let callee_uri = &invite_option.callee;
-        let callee_realm = callee_uri.host_with_port.to_string();
-        if self.server.is_same_realm(&callee_realm).await {
-            let dialplan = &self.context.dialplan;
-            let locations = self.server.locator.lookup(&callee_uri).await.map_err(|e| {
-                (
-                    rsip::StatusCode::TemporarilyUnavailable,
-                    Some(e.to_string()),
-                )
-            })?;
-
-            if locations.is_empty() {
-                match self
-                    .server
-                    .user_backend
-                    .get_user(
-                        &callee_uri.user().unwrap_or_default(),
-                        Some(&callee_realm),
-                        Some(&self.context.dialplan.original),
-                    )
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        info!(session_id = ?dialplan.session_id, callee = %callee_uri, %callee_realm, "user offline in locator, abort now");
-                        return Err((
-                            rsip::StatusCode::TemporarilyUnavailable,
-                            Some("User offline".to_string()),
-                        ));
-                    }
-                    Ok(None) => {
-                        info!(session_id = ?dialplan.session_id, callee = %callee_uri, %callee_realm, "user not found in auth backend, reject");
-                        return Err((
-                            rsip::StatusCode::NotFound,
-                            Some("User not found".to_string()),
-                        ));
-                    }
-                    Err(e) => {
-                        warn!(session_id = ?dialplan.session_id, callee = %callee_uri, %callee_realm, "failed to lookup user in auth backend: {}", e);
-                        return Err((rsip::StatusCode::ServerInternalError, Some(e.to_string())));
-                    }
-                }
-            } else {
-                invite_option.destination = locations[0].destination.clone();
-            }
-        }
-
-        let destination = invite_option
-            .destination
-            .as_ref()
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "?".to_string());
-
-        debug!(
-            session_id = %self.context.session_id, %caller, %target, destination,
-            "Sending INVITE to callee"
-        );
-
-        TargetRuntime::try_single_target(self, target).await
-    }
-
-    pub(crate) async fn handle_failure(&mut self, inbox: ActionInbox<'_>) -> Result<()> {
-        TargetRuntime::handle_failure(self, inbox).await
     }
 
     /// Run a call application (voicemail, IVR, etc.) by looking up the addon,
