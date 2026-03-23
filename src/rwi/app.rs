@@ -17,30 +17,40 @@ pub struct RwiAddon {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 struct RwiAppParams {
-    #[serde(default = "default_context_name")]
     context: String,
-    #[serde(default)]
     session_id: Option<String>,
 }
 
+impl Default for RwiAppParams {
+    fn default() -> Self {
+        Self {
+            context: "default".to_string(),
+            session_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 struct MediaPlayEventData {
     audio_file: String,
-    #[serde(default = "default_track_id")]
     track_id: String,
-    #[serde(default)]
     interrupt_on_dtmf: bool,
-    #[serde(rename = "loop", default)]
+    #[serde(rename = "loop")]
     loop_playback: bool,
 }
 
-fn default_context_name() -> String {
-    "default".to_string()
-}
-
-fn default_track_id() -> String {
-    "default".to_string()
+impl Default for MediaPlayEventData {
+    fn default() -> Self {
+        Self {
+            audio_file: String::new(),
+            track_id: "default".to_string(),
+            interrupt_on_dtmf: false,
+            loop_playback: false,
+        }
+    }
 }
 
 impl RwiAddon {
