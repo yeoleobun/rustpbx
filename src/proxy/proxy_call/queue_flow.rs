@@ -15,7 +15,9 @@ impl QueueFlow {
         next: Option<&DialplanFlow>,
         mut inbox: ActionInbox<'_>,
     ) -> Result<()> {
-        session.process_pending_actions(inbox.as_deref_mut()).await?;
+        session
+            .process_pending_actions(inbox.as_deref_mut())
+            .await?;
 
         info!(
             session_id = %session.context.session_id,
@@ -55,7 +57,9 @@ impl QueueFlow {
         }
 
         let dial_result = match &plan.dial_strategy {
-            Some(strategy) => ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut()).await,
+            Some(strategy) => {
+                ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut()).await
+            }
             None => {
                 warn!(session_id = %session.context.session_id, "No dial strategy");
                 Err(anyhow!("No dial strategy configured"))
@@ -142,7 +146,11 @@ impl QueueFlow {
 
     async fn stop_hold(session: &mut CallSession) {
         info!(session_id = %session.context.session_id, "Stopping queue hold music");
-        session.exported_leg.media.remove_track("queue-hold-music").await;
+        session
+            .exported_leg
+            .media
+            .remove_track("queue-hold-music")
+            .await;
         let _ = session
             .bridge_runtime
             .resume_or_unpause_target_forwarding(
@@ -184,7 +192,12 @@ impl QueueFlow {
                     ?timeout,
                     "Applying no-trying timeout"
                 );
-                return match tokio::time::timeout(timeout, ProxySessionRuntime::try_single_target(session, target)).await {
+                return match tokio::time::timeout(
+                    timeout,
+                    ProxySessionRuntime::try_single_target(session, target),
+                )
+                .await
+                {
                     Ok(res) => res,
                     Err(_) => {
                         warn!(

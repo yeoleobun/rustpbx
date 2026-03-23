@@ -1,13 +1,17 @@
+use crate::callrecord::CallRecordHangupReason;
 use crate::proxy::proxy_call::leg_event::{LegEvent, TerminationReason};
 use crate::proxy::proxy_call::session::{CallSession, PendingHangup};
 use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, TIMER_TAG,
 };
 use crate::proxy::proxy_call::sip_leg::SipLeg;
-use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg, SessionAction};
-use crate::callrecord::CallRecordHangupReason;
+use crate::proxy::proxy_call::state::{
+    CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg, SessionAction,
+};
 use anyhow::Result;
-use rsipstack::dialog::{DialogId, dialog::DialogState, dialog_layer::DialogLayer, server_dialog::ServerInviteDialog};
+use rsipstack::dialog::{
+    DialogId, dialog::DialogState, dialog_layer::DialogLayer, server_dialog::ServerInviteDialog,
+};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -192,7 +196,7 @@ impl SessionLoopRuntime {
         server_timer: Arc<Mutex<SessionTimerState>>,
         client_timer: Arc<Mutex<SessionTimerState>>,
         target_dialogs: Arc<Mutex<HashSet<DialogId>>>,
-        server_dialog: Option<ServerInviteDialog>,  // exported leg's server dialog clone for timer refresh (None for non-proxy sessions)
+        server_dialog: Option<ServerInviteDialog>, // exported leg's server dialog clone for timer refresh (None for non-proxy sessions)
         handle: CallSessionHandle,
         cancel_token: CancellationToken,
         pending_hangup: Arc<Mutex<Option<PendingHangup>>>,

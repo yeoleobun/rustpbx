@@ -10,10 +10,10 @@ use rsipstack::rsip_ext::RsipResponseExt;
 use tokio::{sync::mpsc, task::JoinSet};
 use tracing::{debug, info, warn};
 
+use crate::call::sip::DialogStateReceiverGuard;
 use crate::proxy::proxy_call::session_timer::{
     HEADER_MIN_SE, HEADER_SESSION_EXPIRES, get_header_value, parse_min_se,
 };
-use crate::call::sip::DialogStateReceiverGuard;
 
 pub(crate) struct TargetRuntime;
 
@@ -30,13 +30,18 @@ impl TargetRuntime {
         );
 
         for (index, target) in targets.iter().enumerate() {
-            session.process_pending_actions(inbox.as_deref_mut()).await?;
+            session
+                .process_pending_actions(inbox.as_deref_mut())
+                .await?;
             debug!(
                 session_id = %session.context.session_id, index, %target,
                 "trying sequential target"
             );
 
-            let result = crate::proxy::proxy_call::queue_flow::QueueFlow::run_target_attempt(session, target).await;
+            let result = crate::proxy::proxy_call::queue_flow::QueueFlow::run_target_attempt(
+                session, target,
+            )
+            .await;
 
             match result {
                 Ok(_) => {
@@ -56,10 +61,11 @@ impl TargetRuntime {
                         "Sequential target failed"
                     );
 
-                    let should_retry = crate::proxy::proxy_call::queue_flow::QueueFlow::should_retry_code(
-                        session.get_retry_codes(),
-                        code.clone(),
-                    );
+                    let should_retry =
+                        crate::proxy::proxy_call::queue_flow::QueueFlow::should_retry_code(
+                            session.get_retry_codes(),
+                            code.clone(),
+                        );
                     if should_retry {
                         info!(
                             session_id = %session.context.session_id,
@@ -124,7 +130,9 @@ impl TargetRuntime {
                 )
                 .await;
         }
-        session.process_pending_actions(inbox.as_deref_mut()).await?;
+        session
+            .process_pending_actions(inbox.as_deref_mut())
+            .await?;
 
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<ParallelEvent>();
         let cancel_token = session.cancel_token.clone();
@@ -455,7 +463,9 @@ impl TargetRuntime {
             session.context.dialplan.call_id.clone(),
         );
 
-        let mut invite_option = if let Some(ref route_invite) = session.context.dialplan.route_invite {
+        let mut invite_option = if let Some(ref route_invite) =
+            session.context.dialplan.route_invite
+        {
             let route_result = route_invite
                 .route_invite(
                     invite_option,
@@ -494,11 +504,20 @@ impl TargetRuntime {
 
         let callee_uri = &invite_option.callee;
         let callee_realm = callee_uri.host_with_port.to_string();
-        if invite_option.destination.is_none() && session.server.is_same_realm(&callee_realm).await {
+        if invite_option.destination.is_none() && session.server.is_same_realm(&callee_realm).await
+        {
             let dialplan = &session.context.dialplan;
-            let locations = session.server.locator.lookup(callee_uri).await.map_err(|e| {
-                (rsip::StatusCode::TemporarilyUnavailable, Some(e.to_string()))
-            })?;
+            let locations = session
+                .server
+                .locator
+                .lookup(callee_uri)
+                .await
+                .map_err(|e| {
+                    (
+                        rsip::StatusCode::TemporarilyUnavailable,
+                        Some(e.to_string()),
+                    )
+                })?;
 
             if locations.is_empty() {
                 match session
@@ -679,5 +698,4 @@ impl TargetRuntime {
         session.add_callee_guard(state_rx_guard);
         Ok(())
     }
-
 }

@@ -91,13 +91,12 @@ impl CallReporter {
             .or_else(|| snapshot.connected_callee.clone())
             .unwrap_or_else(|| original_callee.clone());
 
-        let last_error = snapshot
-            .last_error
-            .as_ref()
-            .map(|(code, reason): &(rsip::StatusCode, Option<String>)| CallRecordLastError {
+        let last_error = snapshot.last_error.as_ref().map(
+            |(code, reason): &(rsip::StatusCode, Option<String>)| CallRecordLastError {
                 code: u16::from(code.clone()),
                 reason: reason.clone(),
-            });
+            },
+        );
 
         let mut hangup_messages = snapshot.hangup_messages.clone();
         if hangup_messages.is_empty() {

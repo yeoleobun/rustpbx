@@ -129,7 +129,9 @@ impl ProxySessionRuntime {
         let exported_media_builder = crate::media::MediaStreamBuilder::new()
             .with_id(format!("{}-caller", context.session_id))
             .with_cancel_token(cancel_token.child_token());
-        let exported_peer = Arc::new(VoiceEnginePeer::new(Arc::new(exported_media_builder.build())));
+        let exported_peer = Arc::new(VoiceEnginePeer::new(Arc::new(
+            exported_media_builder.build(),
+        )));
 
         let session_shared = CallSessionShared::new(
             context.session_id.clone(),
@@ -164,10 +166,11 @@ impl ProxySessionRuntime {
         session.exported_leg.media.offer_sdp = Some(offer_sdp);
 
         // In serve(), the server dialog was just created above — safe to expect.
-        let caller_dialog_id = session.exported_leg.server_dialog_id()
+        let caller_dialog_id = session
+            .exported_leg
+            .server_dialog_id()
             .expect("serve() always creates a server dialog");
-        let dialog_guard =
-            ServerDialogGuard::new(server.dialog_layer.clone(), caller_dialog_id);
+        let dialog_guard = ServerDialogGuard::new(server.dialog_layer.clone(), caller_dialog_id);
         let (handle, action_rx) = CallSessionHandle::with_shared(session_shared.clone());
         session.register_active_call(handle);
 
@@ -176,11 +179,18 @@ impl ProxySessionRuntime {
 
         let action_inbox = SessionActionInbox::new(action_rx);
 
-        let mut server_dialog_clone = session.exported_leg.clone_server_dialog()
+        let mut server_dialog_clone = session
+            .exported_leg
+            .clone_server_dialog()
             .expect("serve() always creates a server dialog");
         crate::utils::spawn(async move {
             session
-                .process(Some(state_rx), target_state_rx, action_inbox, Some(dialog_guard))
+                .process(
+                    Some(state_rx),
+                    target_state_rx,
+                    action_inbox,
+                    Some(dialog_guard),
+                )
                 .await
         });
         let ring_time_secs = context.dialplan.max_ring_time.clamp(30, 120);
@@ -222,7 +232,9 @@ impl ProxySessionRuntime {
         mut inbox: ActionInbox<'_>,
     ) -> Result<()> {
         session.shared.transition_to_dialing();
-        session.process_pending_actions(inbox.as_deref_mut()).await?;
+        session
+            .process_pending_actions(inbox.as_deref_mut())
+            .await?;
         debug!(
             session_id = %session.context.session_id,
             strategy = %strategy,
@@ -283,9 +295,10 @@ impl ProxySessionRuntime {
             session.context.dialplan.call_id.clone(),
         );
 
-        let mut invite_option =
-            if let Some(ref route_invite) = session.context.dialplan.route_invite {
-                let route_result = route_invite
+        let mut invite_option = if let Some(ref route_invite) =
+            session.context.dialplan.route_invite
+        {
+            let route_result = route_invite
                     .route_invite(
                         invite_option,
                         &session.context.dialplan.original,
@@ -300,23 +313,23 @@ impl ProxySessionRuntime {
                             Some("Routing function error".to_string()),
                         )
                     })?;
-                match route_result {
-                    RouteResult::NotHandled(option, _) => {
-                        debug!(session_id = session.context.session_id, %target,
-                            "Routing function returned NotHandled"
-                        );
-                        option
-                    }
-                    RouteResult::Forward(option, _) | RouteResult::Queue { option, .. } => option,
-                    RouteResult::Abort(code, reason) => {
-                        warn!(session_id = session.context.session_id, %code, ?reason, "route abort");
-                        return Err((code, reason));
-                    }
-                    RouteResult::Application { option, .. } => option,
+            match route_result {
+                RouteResult::NotHandled(option, _) => {
+                    debug!(session_id = session.context.session_id, %target,
+                        "Routing function returned NotHandled"
+                    );
+                    option
                 }
-            } else {
-                invite_option
-            };
+                RouteResult::Forward(option, _) | RouteResult::Queue { option, .. } => option,
+                RouteResult::Abort(code, reason) => {
+                    warn!(session_id = session.context.session_id, %code, ?reason, "route abort");
+                    return Err((code, reason));
+                }
+                RouteResult::Application { option, .. } => option,
+            }
+        } else {
+            invite_option
+        };
 
         if let Some(contact_uri) = enforced_contact {
             invite_option.contact = contact_uri;
@@ -365,10 +378,7 @@ impl ProxySessionRuntime {
                     }
                     Err(e) => {
                         warn!(session_id = ?dialplan.session_id, callee = %callee_uri, %callee_realm, "failed to lookup user in auth backend: {}", e);
-                        return Err((
-                            rsip::StatusCode::ServerInternalError,
-                            Some(e.to_string()),
-                        ));
+                        return Err((rsip::StatusCode::ServerInternalError, Some(e.to_string())));
                     }
                 }
             } else {
@@ -518,7 +528,9 @@ impl ProxySessionRuntime {
                     "extension": session.context.original_callee,
                     "caller_id": session.context.original_caller,
                 });
-                return session.run_application("voicemail", Some(params), true).await;
+                return session
+                    .run_application("voicemail", Some(params), true)
+                    .await;
             }
         } else if session.failure_is_no_answer() {
             if let Some(config) = session.forwarding_config().cloned() {
@@ -541,7 +553,9 @@ impl ProxySessionRuntime {
                     "extension": session.context.original_callee,
                     "caller_id": session.context.original_caller,
                 });
-                return session.run_application("voicemail", Some(params), true).await;
+                return session
+                    .run_application("voicemail", Some(params), true)
+                    .await;
             }
         }
 

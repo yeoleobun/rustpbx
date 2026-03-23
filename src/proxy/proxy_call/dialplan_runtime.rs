@@ -15,7 +15,9 @@ impl DialplanRuntime {
         mut inbox: ActionInbox<'_>,
     ) -> Result<()> {
         session.shared.transition_to_routing();
-        session.process_pending_actions(inbox.as_deref_mut()).await?;
+        session
+            .process_pending_actions(inbox.as_deref_mut())
+            .await?;
         if session.context.dialplan.is_empty() {
             session.set_error(
                 StatusCode::ServerInternalError,
@@ -61,8 +63,12 @@ impl DialplanRuntime {
         async move {
             match flow {
                 DialplanFlow::Targets(strategy) => match handling {
-                    FlowFailureHandling::Handle => Self::execute_targets(session, strategy, inbox).await,
-                    FlowFailureHandling::Propagate => ProxySessionRuntime::run_targets(session, strategy, inbox).await,
+                    FlowFailureHandling::Handle => {
+                        Self::execute_targets(session, strategy, inbox).await
+                    }
+                    FlowFailureHandling::Propagate => {
+                        ProxySessionRuntime::run_targets(session, strategy, inbox).await
+                    }
                 },
                 DialplanFlow::Queue { plan, next } => {
                     crate::proxy::proxy_call::queue_flow::QueueFlow::execute_queue_plan(
@@ -77,7 +83,11 @@ impl DialplanRuntime {
                     app_name,
                     app_params,
                     auto_answer,
-                } => session.run_application(app_name, app_params.clone(), *auto_answer).await,
+                } => {
+                    session
+                        .run_application(app_name, app_params.clone(), *auto_answer)
+                        .await
+                }
             }
         }
         .boxed()
@@ -88,11 +98,18 @@ impl DialplanRuntime {
         strategy: &DialStrategy,
         mut inbox: ActionInbox<'_>,
     ) -> Result<()> {
-        session.process_pending_actions(inbox.as_deref_mut()).await?;
+        session
+            .process_pending_actions(inbox.as_deref_mut())
+            .await?;
         let timeout_duration = session.forwarding_timeout();
 
         if let Some(duration) = timeout_duration {
-            match timeout(duration, ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut())).await {
+            match timeout(
+                duration,
+                ProxySessionRuntime::run_targets(session, strategy, inbox.as_deref_mut()),
+            )
+            .await
+            {
                 Ok(outcome) => match outcome {
                     Ok(_) => {
                         debug!(session_id = %session.context.session_id, "Dialplan executed successfully");

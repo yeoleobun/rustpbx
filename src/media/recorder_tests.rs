@@ -288,8 +288,12 @@ mod recorder_advanced_tests {
                 .expect("duplicate terminal DTMF packets should be accepted");
         }
 
-        recorder_single.finalize().expect("single finalize should succeed");
-        recorder_dup.finalize().expect("duplicate finalize should succeed");
+        recorder_single
+            .finalize()
+            .expect("single finalize should succeed");
+        recorder_dup
+            .finalize()
+            .expect("duplicate finalize should succeed");
 
         let len_single = std::fs::metadata(&temp_path_single).unwrap().len();
         let len_dup = std::fs::metadata(&temp_path_dup).unwrap().len();

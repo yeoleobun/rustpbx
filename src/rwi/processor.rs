@@ -5,8 +5,8 @@ use crate::media::{MediaStreamBuilder, RtpTrackBuilder, Track};
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use crate::proxy::proxy_call::media_peer::{MediaPeer, VoiceEnginePeer};
+use crate::proxy::proxy_call::session::OriginatedSessionEvent;
 use crate::proxy::proxy_call::session_timer::{HEADER_SESSION_EXPIRES, TIMER_TAG};
-use crate::proxy::proxy_call::session::{CallSession, OriginatedSessionEvent};
 use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction};
 use crate::proxy::server::SipServerRef;
 use crate::rwi::call_leg::{RwiCallLeg, RwiCallLegHandle, RwiCallLegOrigin, RwiCallLegState};
@@ -542,8 +542,8 @@ impl RwiCommandProcessor {
 
         // Generate SDP offer using a persistent leg-owned track.
         let track_id = format!("rwi-originate-{}", req.call_id);
-        let mut track_builder = RtpTrackBuilder::new(track_id.clone())
-            .with_cancel_token(peer.cancel_token());
+        let mut track_builder =
+            RtpTrackBuilder::new(track_id.clone()).with_cancel_token(peer.cancel_token());
 
         if let Some(ref ext_ip) = server.rtp_config.external_ip {
             track_builder = track_builder.with_external_ip(ext_ip.clone());
@@ -592,18 +592,19 @@ impl RwiCommandProcessor {
         // Create event channel for originated session lifecycle events
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let (handle, shared) = crate::proxy::proxy_call::originated_runtime::OriginatedRuntime::serve(
-            server.clone(),
-            call_id.clone(),
-            invite_option,
-            peer.clone(),
-            cancel_token.clone(),
-            timeout_secs as u64,
-            Some(caller_display.clone()),
-            Some(callee_display.clone()),
-            Some(event_tx),
-        )
-        .await;
+        let (handle, shared) =
+            crate::proxy::proxy_call::originated_runtime::OriginatedRuntime::serve(
+                server.clone(),
+                call_id.clone(),
+                invite_option,
+                peer.clone(),
+                cancel_token.clone(),
+                timeout_secs as u64,
+                Some(caller_display.clone()),
+                Some(callee_display.clone()),
+                Some(event_tx),
+            )
+            .await;
 
         let shared_media = Some(shared.shared_exported_leg_media());
         let leg = RwiCallLeg::new_session_originated(
@@ -743,9 +744,7 @@ impl RwiCommandProcessor {
             ));
         }
         leg.session_handle().ok_or_else(|| {
-            CommandError::CommandFailed(
-                "unsupported for standalone originated RWI leg".to_string(),
-            )
+            CommandError::CommandFailed("unsupported for standalone originated RWI leg".to_string())
         })
     }
 
@@ -764,9 +763,8 @@ impl RwiCommandProcessor {
                 capability_name,
             )));
         }
-        leg.session_handle().ok_or_else(|| {
-            CommandError::CommandFailed("no session handle available".to_string())
-        })
+        leg.session_handle()
+            .ok_or_else(|| CommandError::CommandFailed("no session handle available".to_string()))
     }
 
     async fn send_leg_action(
@@ -961,9 +959,9 @@ impl RwiCommandProcessor {
             .send_leg_action(
                 consultation_call_id,
                 SessionAction::Hangup {
-                reason: None,
-                code: None,
-                initiator: Some("transfer".to_string()),
+                    reason: None,
+                    code: None,
+                    initiator: Some("transfer".to_string()),
                 },
             )
             .await
@@ -985,9 +983,9 @@ impl RwiCommandProcessor {
             .send_leg_action(
                 consultation_call_id,
                 SessionAction::Hangup {
-                reason: None,
-                code: None,
-                initiator: Some("transfer_cancel".to_string()),
+                    reason: None,
+                    code: None,
+                    initiator: Some("transfer_cancel".to_string()),
                 },
             )
             .await
@@ -2560,11 +2558,12 @@ mod tests {
     }
 
     fn publish_test_media_to_handle(handle: &CallSessionHandle, call_id: &str) {
-        let peer: Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(
-            MediaStreamBuilder::new()
-                .with_id(format!("{}-rwi-test-leg", call_id))
-                .build(),
-        )));
+        let peer: Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> =
+            Arc::new(VoiceEnginePeer::new(Arc::new(
+                MediaStreamBuilder::new()
+                    .with_id(format!("{}-rwi-test-leg", call_id))
+                    .build(),
+            )));
         handle.publish_exported_leg_media(
             peer,
             None,
@@ -2767,10 +2766,20 @@ mod tests {
     async fn test_bridge_both_media_ready_legs_succeeds() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let processor = create_test_processor_with_registry(registry.clone());
-        let ha =
-            create_test_media_ready_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
-        let hb =
-            create_test_media_ready_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
+        let ha = create_test_media_ready_call(
+            &registry,
+            "leg-a",
+            "1001",
+            "2001",
+            DialDirection::Outbound,
+        );
+        let hb = create_test_media_ready_call(
+            &registry,
+            "leg-b",
+            "1001",
+            "2002",
+            DialDirection::Outbound,
+        );
         register_test_media_ready_rwi_leg(&processor, "leg-a", ha).await;
         register_test_media_ready_rwi_leg(&processor, "leg-b", hb).await;
 
@@ -3016,10 +3025,20 @@ mod tests {
         let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway.clone()));
 
         // Create two legs
-        let ha =
-            create_test_media_ready_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
-        let hb =
-            create_test_media_ready_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
+        let ha = create_test_media_ready_call(
+            &registry,
+            "leg-a",
+            "1001",
+            "2001",
+            DialDirection::Outbound,
+        );
+        let hb = create_test_media_ready_call(
+            &registry,
+            "leg-b",
+            "1001",
+            "2002",
+            DialDirection::Outbound,
+        );
         register_test_media_ready_rwi_leg(&processor, "leg-a", ha).await;
         register_test_media_ready_rwi_leg(&processor, "leg-b", hb).await;
 
@@ -3136,10 +3155,20 @@ mod tests {
     async fn test_bridge_media_ready_calls_starts_direct_bridge() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let processor = create_test_processor_with_registry(registry.clone());
-        let ha =
-            create_test_media_ready_call(&registry, "leg-a2", "1001", "2001", DialDirection::Outbound);
-        let hb =
-            create_test_media_ready_call(&registry, "leg-b2", "1001", "2002", DialDirection::Outbound);
+        let ha = create_test_media_ready_call(
+            &registry,
+            "leg-a2",
+            "1001",
+            "2001",
+            DialDirection::Outbound,
+        );
+        let hb = create_test_media_ready_call(
+            &registry,
+            "leg-b2",
+            "1001",
+            "2002",
+            DialDirection::Outbound,
+        );
         register_test_media_ready_rwi_leg(&processor, "leg-a2", ha).await;
         register_test_media_ready_rwi_leg(&processor, "leg-b2", hb).await;
 
@@ -3214,10 +3243,20 @@ mod tests {
     async fn test_unbridge_direct_bridge_clears_rwi_bridge_registry() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let processor = create_test_processor_with_registry(registry.clone());
-        let ha =
-            create_test_media_ready_call(&registry, "leg-a3", "1001", "2001", DialDirection::Outbound);
-        let hb =
-            create_test_media_ready_call(&registry, "leg-b3", "1001", "2002", DialDirection::Outbound);
+        let ha = create_test_media_ready_call(
+            &registry,
+            "leg-a3",
+            "1001",
+            "2001",
+            DialDirection::Outbound,
+        );
+        let hb = create_test_media_ready_call(
+            &registry,
+            "leg-b3",
+            "1001",
+            "2002",
+            DialDirection::Outbound,
+        );
         register_test_media_ready_rwi_leg(&processor, "leg-a3", ha).await;
         register_test_media_ready_rwi_leg(&processor, "leg-b3", hb).await;
 

@@ -1448,13 +1448,8 @@ fn build_detail_payload(
 ) -> Value {
     let inline_recording_url = select_recording_path(record, cdr)
         .map(|_| state.url_for(&format!("/call-records/{}/recording", record.id)));
-    let record_payload = build_record_payload_with_cdr(
-        record,
-        related,
-        state,
-        inline_recording_url.as_deref(),
-        cdr,
-    );
+    let record_payload =
+        build_record_payload_with_cdr(record, related, state, inline_recording_url.as_deref(), cdr);
     let participants = build_participants(record, related);
 
     let media_metrics = json!({

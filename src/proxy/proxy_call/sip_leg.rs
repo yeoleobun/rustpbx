@@ -1,9 +1,9 @@
-use crate::call::sip::DialogStateReceiverGuard;
 use crate::call::Location;
+use crate::call::sip::DialogStateReceiverGuard;
 use crate::proxy::proxy_call::call_leg::CallLegDirection;
 use crate::proxy::proxy_call::session_timer::{
-    HEADER_SESSION_EXPIRES, HEADER_SUPPORTED, SessionRefresher, SessionTimerState, TIMER_TAG, get_header_value,
-    has_timer_support, parse_session_expires,
+    HEADER_SESSION_EXPIRES, HEADER_SUPPORTED, SessionRefresher, SessionTimerState, TIMER_TAG,
+    get_header_value, has_timer_support, parse_session_expires,
 };
 use anyhow::Result;
 use rsip::StatusCode;
@@ -13,9 +13,9 @@ use rsipstack::dialog::{
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tokio::sync::mpsc;
+use tracing::debug;
 
 pub(crate) const TRICKLE_ICE_TAG: &str = "trickle-ice";
 
@@ -110,9 +110,7 @@ impl SipLeg {
         session_timer: Option<u64>,
         call_id: Option<String>,
     ) -> InviteOption {
-        let content_type = offer
-            .as_ref()
-            .map(|_| "application/sdp".to_string());
+        let content_type = offer.as_ref().map(|_| "application/sdp".to_string());
         let mut headers = headers;
         headers.push(rsip::headers::MaxForwards::from(max_forwards).into());
         if let Some(session_expires) = session_timer {
@@ -259,45 +257,6 @@ impl SipLeg {
             } else {
                 let _ = client_dialog.update(Some(headers), offer_body).await;
             }
-        }
-    }
-
-    pub fn reply_to_server_reinvite(
-        &self,
-        answer_sdp: Option<String>,
-    ) -> bool {
-        let Some(ref server_dialog) = self.server_dialog else {
-            warn!("No server dialog on this leg, cannot reply to re-INVITE");
-            return false;
-        };
-        let Some(sdp) = answer_sdp else {
-            let _ = server_dialog.reject(Some(StatusCode::NotAcceptableHere), None);
-            return false;
-        };
-        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-        match server_dialog.accept(Some(headers), Some(sdp.into_bytes())) {
-            Ok(_) => true,
-            Err(e) => {
-                warn!("Failed to reply to re-INVITE with SDP: {}", e);
-                false
-            }
-        }
-    }
-
-    pub fn reply_to_server_offerless_update(
-        &self,
-        answer_sdp: Option<String>,
-    ) {
-        let Some(ref server_dialog) = self.server_dialog else {
-            warn!("No server dialog on this leg, cannot reply to UPDATE");
-            return;
-        };
-        let Some(sdp) = answer_sdp else {
-            return;
-        };
-        let headers = vec![rsip::Header::ContentType("application/sdp".into())];
-        if let Err(e) = server_dialog.accept(Some(headers), Some(sdp.into_bytes())) {
-            warn!("Failed to reply to UPDATE/re-INVITE without SDP: {}", e);
         }
     }
 }

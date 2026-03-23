@@ -3,16 +3,16 @@ use crate::call::app::ControllerEvent;
 use crate::media::FileTrack;
 use crate::media::RtpTrackBuilder;
 use crate::media::Track;
-use crate::media::negotiate::MediaNegotiator;
 use crate::media::negotiate::CodecInfo;
+use crate::media::negotiate::MediaNegotiator;
 use crate::media::recorder::RecorderOption;
 use crate::proxy::proxy_call::media_peer::MediaPeer;
-use audio_codec::CodecType;
 use anyhow::{Result, anyhow};
+use audio_codec::CodecType;
 use rustrtc::SessionDescription;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, watch};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -115,9 +115,7 @@ impl MediaEndpoint {
         }
     }
 
-    fn extract_telephone_event_codecs(
-        rtp_map: &[(u8, (CodecType, u32, u16))],
-    ) -> Vec<CodecInfo> {
+    fn extract_telephone_event_codecs(rtp_map: &[(u8, (CodecType, u32, u16))]) -> Vec<CodecInfo> {
         let mut seen_payload_types = HashSet::new();
         rtp_map
             .iter()
@@ -363,9 +361,7 @@ impl MediaEndpoint {
             return Ok(answer.clone());
         }
 
-        let is_webrtc = caller_offer_sdp
-            .map(Self::is_webrtc_sdp)
-            .unwrap_or(false);
+        let is_webrtc = caller_offer_sdp.map(Self::is_webrtc_sdp).unwrap_or(false);
         let track_builder =
             self.build_track_builder(track_id.to_string(), codec_info, media_config, is_webrtc);
 
@@ -406,9 +402,7 @@ impl MediaEndpoint {
             return Ok(answer.clone());
         }
 
-        let is_webrtc = caller_offer_sdp
-            .map(Self::is_webrtc_sdp)
-            .unwrap_or(false);
+        let is_webrtc = caller_offer_sdp.map(Self::is_webrtc_sdp).unwrap_or(false);
         let track_builder =
             self.build_track_builder(track_id.to_string(), codec_info, media_config, is_webrtc);
 
@@ -450,7 +444,11 @@ impl MediaEndpoint {
             }
         }
 
-        if let Err(_e) = self.peer.update_remote_description(track_id, remote_sdp).await {
+        if let Err(_e) = self
+            .peer
+            .update_remote_description(track_id, remote_sdp)
+            .await
+        {
             let mut track = RtpTrackBuilder::new(track_id.to_string())
                 .with_cancel_token(self.peer.cancel_token())
                 .with_enable_latching(media_config.enable_latching);
@@ -475,16 +473,11 @@ impl MediaEndpoint {
         self.peer.update_remote_description(track_id, offer).await
     }
 
-    pub async fn local_track_description(&self, track_id: &str) -> Result<String> {
-        let track = self
-            .find_track(track_id)
-            .await
-            .ok_or_else(|| anyhow!("track not found: {track_id}"))?;
-        let guard = track.lock().await;
-        guard.local_description().await
-    }
-
-    pub async fn add_remote_ice_candidate(&self, track_id: &str, candidate_sdp: &str) -> Result<()> {
+    pub async fn add_remote_ice_candidate(
+        &self,
+        track_id: &str,
+        candidate_sdp: &str,
+    ) -> Result<()> {
         let track = self
             .find_track(track_id)
             .await
@@ -542,7 +535,10 @@ impl MediaEndpoint {
             })
     }
 
-    pub fn bridge_audio_matching(&self, preferred_codec: Option<CodecType>) -> Option<BridgeSelection> {
+    pub fn bridge_audio_matching(
+        &self,
+        preferred_codec: Option<CodecType>,
+    ) -> Option<BridgeSelection> {
         self.answer_sdp
             .as_deref()
             .and_then(|sdp| Self::matching_bridge_selection_from_sdp(sdp, preferred_codec))
@@ -626,7 +622,8 @@ impl MediaEndpoint {
             }
         }
 
-        self.create_hold_track(track_id, audio_file, loop_playback).await
+        self.create_hold_track(track_id, audio_file, loop_playback)
+            .await
     }
 
     pub fn set_dtmf_listener_cancel(&mut self, cancel: CancellationToken) {
@@ -850,7 +847,12 @@ mod tests {
         let updates_after_first = peer.update_count.load(Ordering::SeqCst);
 
         let cached = endpoint
-            .create_caller_answer("caller-track", codec_info, Some(caller_offer), &media_config)
+            .create_caller_answer(
+                "caller-track",
+                codec_info,
+                Some(caller_offer),
+                &media_config,
+            )
             .await
             .unwrap();
 

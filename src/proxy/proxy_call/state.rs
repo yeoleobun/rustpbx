@@ -5,8 +5,8 @@ use crate::proxy::active_call_registry::{
     ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
 };
 use crate::proxy::proxy_call::media_peer::MediaPeer;
-use crate::rwi::proto::RwiEvent;
 use crate::rwi::SupervisorMode;
+use crate::rwi::proto::RwiEvent;
 use anyhow::Result;
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
@@ -576,7 +576,10 @@ impl CallSessionShared {
 
     pub fn transition_to_terminating(&self) -> bool {
         self.update(|inner| {
-            if matches!(inner.phase, ProxyCallPhase::Ended | ProxyCallPhase::Terminating) {
+            if matches!(
+                inner.phase,
+                ProxyCallPhase::Ended | ProxyCallPhase::Terminating
+            ) {
                 return false;
             }
             inner.phase = ProxyCallPhase::Terminating;
@@ -588,7 +591,10 @@ impl CallSessionShared {
         self.update(|inner| {
             inner.hangup_reason = Some(reason);
             // Ensure we transition through Terminating before Ended
-            if !matches!(inner.phase, ProxyCallPhase::Terminating | ProxyCallPhase::Ended) {
+            if !matches!(
+                inner.phase,
+                ProxyCallPhase::Terminating | ProxyCallPhase::Ended
+            ) {
                 inner.phase = ProxyCallPhase::Terminating;
             }
             inner.phase = ProxyCallPhase::Ended;
@@ -819,7 +825,14 @@ impl CallSessionHandle {
         ssrc: Option<u32>,
         is_bridged: bool,
     ) {
-        self.shared.publish_exported_leg_media(peer, offer_sdp, answer_sdp, negotiated_audio, ssrc, is_bridged);
+        self.shared.publish_exported_leg_media(
+            peer,
+            offer_sdp,
+            answer_sdp,
+            negotiated_audio,
+            ssrc,
+            is_bridged,
+        );
     }
 }
 

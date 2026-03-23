@@ -17,7 +17,8 @@ impl AnswerRuntime {
         session.exported_leg().sip.supports_trickle_ice
             && session
                 .exported_leg()
-                .media.offer_sdp
+                .media
+                .offer_sdp
                 .as_deref()
                 .map(CallSession::is_webrtc_sdp)
                 .unwrap_or(false)
@@ -30,8 +31,11 @@ impl AnswerRuntime {
         };
         let cancel_token = session.cancel_token.child_token();
         let session_id = session.context.session_id.clone();
-        let Some((_pc, mut candidate_rx, mut gathering_rx)) =
-            session.exported_leg().media.trickle_ice_context("caller-track").await
+        let Some((_pc, mut candidate_rx, mut gathering_rx)) = session
+            .exported_leg()
+            .media
+            .trickle_ice_context("caller-track")
+            .await
         else {
             return;
         };
@@ -129,7 +133,9 @@ impl AnswerRuntime {
                         mode = ?ringback_mode,
                         "Forwarding callee early media to caller (passthrough mode)"
                     );
-                    let _ = session.setup_target_track(&answer, dialog_id.as_ref()).await;
+                    let _ = session
+                        .setup_target_track(&answer, dialog_id.as_ref())
+                        .await;
                 }
 
                 let caller_codec_info = caller_negotiation::build_final_caller_codec_info(
@@ -166,7 +172,9 @@ impl AnswerRuntime {
                             }
 
                             if !call_answered && should_play_local {
-                                if let Some(ref file_name) = session.context.dialplan.ringback.audio_file {
+                                if let Some(ref file_name) =
+                                    session.context.dialplan.ringback.audio_file
+                                {
                                     info!(
                                         session_id = %session.context.session_id,
                                         mode = ?ringback_mode,
@@ -189,7 +197,12 @@ impl AnswerRuntime {
                                     } else {
                                         CallSession::CALLEE_TRACK_ID.to_string()
                                     };
-                                    session.exported_leg.media.peer.suppress_forwarding(&track_id).await;
+                                    session
+                                        .exported_leg
+                                        .media
+                                        .peer
+                                        .suppress_forwarding(&track_id)
+                                        .await;
                                 }
                             }
                         }
@@ -218,11 +231,7 @@ impl AnswerRuntime {
                     session
                         .exported_leg
                         .media
-                        .create_file_track(
-                            CallSession::RINGBACK_TRACK_ID,
-                            file_name,
-                            loop_playback,
-                        )
+                        .create_file_track(CallSession::RINGBACK_TRACK_ID, file_name, loop_playback)
                         .await;
                 }
             }
@@ -377,7 +386,10 @@ impl AnswerRuntime {
             let server_timer = session.exported_leg.sip.session_timer.lock().unwrap();
             if server_timer.active {
                 headers.push(rsip::Header::Supported(
-                    rsip::headers::Supported::from(crate::proxy::proxy_call::session_timer::TIMER_TAG).into(),
+                    rsip::headers::Supported::from(
+                        crate::proxy::proxy_call::session_timer::TIMER_TAG,
+                    )
+                    .into(),
                 ));
                 headers.push(rsip::Header::Other(
                     crate::proxy::proxy_call::session_timer::HEADER_SESSION_EXPIRES.into(),
@@ -397,7 +409,12 @@ impl AnswerRuntime {
 
         if let Err(e) = session.exported_leg.accept_inbound(
             Some(headers),
-            session.exported_leg.media.answer_sdp.clone().map(|sdp| sdp.into_bytes()),
+            session
+                .exported_leg
+                .media
+                .answer_sdp
+                .clone()
+                .map(|sdp| sdp.into_bytes()),
         ) {
             return Err(anyhow!("Failed to send 200 OK: {}", e));
         }
@@ -410,10 +427,12 @@ impl AnswerRuntime {
                 .connected_callee
                 .clone()
                 .or_else(|| session.routed_callee.clone());
-            session.shared.emit_custom_event(ProxyCallEvent::TargetAnswered {
-                session_id: session.shared.session_id(),
-                callee,
-            });
+            session
+                .shared
+                .emit_custom_event(ProxyCallEvent::TargetAnswered {
+                    session_id: session.shared.session_id(),
+                    callee,
+                });
         }
         session.publish_exported_leg_media();
         Ok(())

@@ -16,14 +16,15 @@ pub(crate) async fn play_audio_file(
     app_event_tx: Option<mpsc::UnboundedSender<ControllerEvent>>,
 ) -> Result<()> {
     info!(session_id = %session_id, file = %file_path, "Playing audio file");
-    media.play_prompt_on_peer(
-        file_path,
-        track_id,
-        loop_playback,
-        cancel_token,
-        app_event_tx,
-    )
-    .await
+    media
+        .play_prompt_on_peer(
+            file_path,
+            track_id,
+            loop_playback,
+            cancel_token,
+            app_event_tx,
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -120,7 +121,10 @@ mod tests {
                 interrupted,
                 track_id,
             } => {
-                assert!(!interrupted, "normal completion must have interrupted=false");
+                assert!(
+                    !interrupted,
+                    "normal completion must have interrupted=false"
+                );
                 assert_eq!(track_id, "default");
             }
             other => panic!("unexpected event: {:?}", other),

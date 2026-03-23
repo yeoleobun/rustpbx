@@ -23,7 +23,8 @@ pub(crate) async fn start_recording(
     }
 
     *recording_state = Some((path.to_string(), Instant::now()));
-    media.start_directional_recording(RecorderOption::new(path.to_string()))
+    media
+        .start_directional_recording(RecorderOption::new(path.to_string()))
         .await?;
 
     Ok(())

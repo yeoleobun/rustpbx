@@ -15,10 +15,7 @@ fn append_dtmf_codecs(
     }
 }
 
-pub(crate) fn should_advertise_caller_dtmf(
-    use_media_proxy: bool,
-    callee_has_dtmf: bool,
-) -> bool {
+pub(crate) fn should_advertise_caller_dtmf(use_media_proxy: bool, callee_has_dtmf: bool) -> bool {
     use_media_proxy || callee_has_dtmf
 }
 
@@ -30,7 +27,11 @@ pub(crate) fn build_passthrough_caller_answer_codec_info(
         .unwrap_or_default();
     let mut codec_info = caller_codecs.audio;
     let mut used_payload_types = codec_info.iter().map(|codec| codec.payload_type).collect();
-    append_dtmf_codecs(&mut codec_info, &caller_codecs.dtmf, &mut used_payload_types);
+    append_dtmf_codecs(
+        &mut codec_info,
+        &caller_codecs.dtmf,
+        &mut used_payload_types,
+    );
     codec_info
 }
 
@@ -203,7 +204,10 @@ mod tests {
             build_final_caller_codec_info(Some(caller_offer_sdp), callee_answer_sdp, &[], false)
                 .unwrap();
 
-        assert_eq!(codec_types(&codec_info), vec![CodecType::PCMU, CodecType::PCMA]);
+        assert_eq!(
+            codec_types(&codec_info),
+            vec![CodecType::PCMU, CodecType::PCMA]
+        );
     }
 
     #[test]

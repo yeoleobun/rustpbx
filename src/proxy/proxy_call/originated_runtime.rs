@@ -3,8 +3,12 @@ use crate::proxy::proxy_call::call_leg::{CallLeg, CallLegDirection};
 use crate::proxy::proxy_call::media_endpoint::MediaEndpoint;
 use crate::proxy::proxy_call::media_peer::{MediaPeer, VoiceEnginePeer};
 use crate::proxy::proxy_call::reporter::CallReporter;
-use crate::proxy::proxy_call::session::{CallSession, OriginatedDialParams, OriginatedSessionEvent};
-use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg};
+use crate::proxy::proxy_call::session::{
+    CallSession, OriginatedDialParams, OriginatedSessionEvent,
+};
+use crate::proxy::proxy_call::state::{
+    CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg,
+};
 use crate::proxy::server::SipServerRef;
 use anyhow::{Result, anyhow};
 use audio_codec::CodecType;
@@ -16,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::session::SessionActionInbox;
 
@@ -37,12 +41,16 @@ impl OriginatedRuntime {
         session.shared.transition_to_dialing();
 
         // Create the target leg now that we're about to dial
-        let offer_sdp = params.invite_option.offer.as_ref()
+        let offer_sdp = params
+            .invite_option
+            .offer
+            .as_ref()
             .map(|b| String::from_utf8_lossy(b).to_string());
         let target_media_builder = crate::media::MediaStreamBuilder::new()
             .with_id(format!("{}-callee", session.context.session_id))
             .with_cancel_token(session.cancel_token.child_token());
-        let target_peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(target_media_builder.build())));
+        let target_peer: Arc<dyn MediaPeer> =
+            Arc::new(VoiceEnginePeer::new(Arc::new(target_media_builder.build())));
         session.target_leg = Some(CallLeg::new(
             session.context.session_id.clone(),
             crate::proxy::proxy_call::call_leg::LegRole::Callee,
@@ -57,8 +65,7 @@ impl OriginatedRuntime {
 
         let (state_tx, mut state_rx) = mpsc::unbounded_channel();
         let dialog_layer = session.dialog_layer.clone();
-        let invite_future = dialog_layer
-            .do_invite(params.invite_option, state_tx);
+        let invite_future = dialog_layer.do_invite(params.invite_option, state_tx);
         tokio::pin!(invite_future);
 
         let mut timeout = tokio::time::sleep(Duration::from_secs(params.timeout_secs)).boxed();
@@ -248,11 +255,17 @@ impl OriginatedRuntime {
     pub async fn hold_callee(session: &mut CallSession, music_source: Option<&str>) -> Result<()> {
         use rsipstack::dialog::dialog::Dialog;
 
-        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session
+            .target_leg()
+            .sip
+            .connected_dialog_id
+            .as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for hold"))?
             .clone();
 
-        let dialog = session.dialog_layer.get_dialog(&callee_dialog_id)
+        let dialog = session
+            .dialog_layer
+            .get_dialog(&callee_dialog_id)
             .ok_or_else(|| anyhow!("callee dialog not found for hold"))?;
 
         let Dialog::ClientInvite(client_dialog) = dialog else {
@@ -290,12 +303,18 @@ impl OriginatedRuntime {
         let tracks = session.exported_leg.media.peer.get_tracks().await;
         if let Some(track) = tracks.first() {
             let guard = track.lock().await;
-            session.exported_leg.media.peer.suppress_forwarding(guard.id()).await;
+            session
+                .exported_leg
+                .media
+                .peer
+                .suppress_forwarding(guard.id())
+                .await;
         }
 
         // Play hold music if provided
         if let Some(audio_file) = music_source.filter(|s| !s.is_empty()) {
-            session.exported_leg
+            session
+                .exported_leg
                 .play_audio(
                     &session.context.session_id,
                     audio_file,
@@ -316,11 +335,17 @@ impl OriginatedRuntime {
     pub async fn unhold_callee(session: &mut CallSession) -> Result<()> {
         use rsipstack::dialog::dialog::Dialog;
 
-        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session
+            .target_leg()
+            .sip
+            .connected_dialog_id
+            .as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for unhold"))?
             .clone();
 
-        let dialog = session.dialog_layer.get_dialog(&callee_dialog_id)
+        let dialog = session
+            .dialog_layer
+            .get_dialog(&callee_dialog_id)
             .ok_or_else(|| anyhow!("callee dialog not found for unhold"))?;
 
         let Dialog::ClientInvite(client_dialog) = dialog else {
@@ -354,11 +379,21 @@ impl OriginatedRuntime {
         session.publish_exported_leg_media();
 
         // Remove hold music and resume forwarding
-        session.exported_leg.media.peer.remove_track("hold_music", true).await;
+        session
+            .exported_leg
+            .media
+            .peer
+            .remove_track("hold_music", true)
+            .await;
         let tracks = session.exported_leg.media.peer.get_tracks().await;
         if let Some(track) = tracks.first() {
             let guard = track.lock().await;
-            session.exported_leg.media.peer.resume_forwarding(guard.id()).await;
+            session
+                .exported_leg
+                .media
+                .peer
+                .resume_forwarding(guard.id())
+                .await;
         }
 
         Ok(())
@@ -371,11 +406,17 @@ impl OriginatedRuntime {
         let target_uri = Uri::try_from(target)
             .map_err(|e| anyhow!("invalid transfer target '{}': {}", target, e))?;
 
-        let callee_dialog_id = session.target_leg().sip.connected_dialog_id.as_ref()
+        let callee_dialog_id = session
+            .target_leg()
+            .sip
+            .connected_dialog_id
+            .as_ref()
             .ok_or_else(|| anyhow!("no connected callee dialog for transfer"))?
             .clone();
 
-        let dialog = session.dialog_layer.get_dialog(&callee_dialog_id)
+        let dialog = session
+            .dialog_layer
+            .get_dialog(&callee_dialog_id)
             .ok_or_else(|| anyhow!("callee dialog not found for transfer"))?;
 
         let Dialog::ClientInvite(client_dialog) = dialog else {
@@ -396,24 +437,25 @@ impl OriginatedRuntime {
                 );
                 Ok(())
             }
-            Some(resp) => {
-                Err(anyhow!(
-                    "REFER rejected with status {}",
-                    resp.status_code
-                ))
-            }
+            Some(resp) => Err(anyhow!("REFER rejected with status {}", resp.status_code)),
             None => Err(anyhow!("REFER returned no response")),
         }
     }
 
     /// Build a local SDP offer from the caller peer's first track with
     /// the specified media direction.
-    async fn build_local_offer_with_direction(session: &CallSession, direction: &str) -> Result<String> {
+    async fn build_local_offer_with_direction(
+        session: &CallSession,
+        direction: &str,
+    ) -> Result<String> {
         let tracks = session.exported_leg.media.peer.get_tracks().await;
-        let track = tracks.first()
+        let track = tracks
+            .first()
             .ok_or_else(|| anyhow!("no track on caller peer for SDP offer"))?;
         let guard = track.lock().await;
-        let offer = guard.local_description().await
+        let offer = guard
+            .local_description()
+            .await
             .map_err(|e| anyhow!("failed to get local description: {}", e))?;
 
         let dir = match direction {
@@ -463,12 +505,16 @@ impl OriginatedRuntime {
         callee_display: Option<String>,
         event_tx: Option<mpsc::UnboundedSender<OriginatedSessionEvent>>,
     ) -> (CallSessionHandle, CallSessionShared) {
-        use crate::call::{DialDirection, Dialplan, DialplanFlow, DialStrategy, MediaConfig};
+        use crate::call::{DialDirection, DialStrategy, Dialplan, DialplanFlow, MediaConfig};
         use crate::proxy::proxy_call::state::SessionKind;
 
         // Build a synthetic request for reporting — minimal INVITE with caller/callee URIs
-        let caller_uri_str = caller_display.clone().unwrap_or_else(|| "sip:rwi@local".to_string());
-        let callee_uri_str = callee_display.clone().unwrap_or_else(|| invite_option.callee.to_string());
+        let caller_uri_str = caller_display
+            .clone()
+            .unwrap_or_else(|| "sip:rwi@local".to_string());
+        let callee_uri_str = callee_display
+            .clone()
+            .unwrap_or_else(|| invite_option.callee.to_string());
         let synthetic_request = rsip::Request {
             method: rsip::Method::Invite,
             uri: invite_option.callee.clone(),

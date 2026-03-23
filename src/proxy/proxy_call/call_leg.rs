@@ -1,17 +1,14 @@
 use crate::call::app::ControllerEvent;
 use crate::proxy::proxy_call::media_endpoint::MediaEndpoint;
-use crate::proxy::proxy_call::media_peer::MediaPeer;
 use crate::proxy::proxy_call::playback_runtime;
 use crate::proxy::proxy_call::recording_runtime::{self, RecordingState};
 use crate::proxy::proxy_call::session::NegotiationState;
 use crate::proxy::proxy_call::sip_leg::SipLeg;
 use anyhow::Result;
-use audio_codec::CodecType;
-use crate::media::negotiate::CodecInfo;
 use rsip::StatusCode;
+use rsipstack::dialog::DialogId;
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::server_dialog::ServerInviteDialog;
-use rsipstack::dialog::DialogId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -57,64 +54,6 @@ impl CallLeg {
             media: MediaEndpoint::new(peer, offer_sdp),
             negotiation_state: NegotiationState::Idle,
         }
-    }
-
-    // ── SDP accessors ──
-
-    pub fn offer_sdp(&self) -> Option<&str> {
-        self.media.offer_sdp.as_deref()
-    }
-
-    pub fn answer_sdp(&self) -> Option<&str> {
-        self.media.answer_sdp.as_deref()
-    }
-
-    pub fn set_offer_sdp(&mut self, sdp: String) {
-        self.media.offer_sdp = Some(sdp);
-    }
-
-    pub fn set_answer_sdp(&mut self, sdp: String) {
-        self.media.answer_sdp = Some(sdp);
-    }
-
-    // ── Media state accessors ──
-
-    pub fn has_early_media(&self) -> bool {
-        self.media.early_media_sent
-    }
-
-    pub fn set_early_media_sent(&mut self) {
-        self.media.early_media_sent = true;
-    }
-
-    pub fn negotiated_audio(&self) -> Option<&(CodecType, rustrtc::RtpCodecParameters, Vec<CodecInfo>)> {
-        self.media.negotiated_audio.as_ref()
-    }
-
-    pub fn media_peer(&self) -> Arc<dyn MediaPeer> {
-        self.media.peer.clone()
-    }
-
-    // ── Dialog accessors ──
-
-    pub fn set_dialog_event_sender(&mut self, tx: mpsc::UnboundedSender<rsipstack::dialog::dialog::DialogState>) {
-        self.sip.dialog_event_tx = Some(tx);
-    }
-
-    pub fn add_dialog(&self, id: DialogId) {
-        self.sip.add_dialog(id);
-    }
-
-    pub fn set_connected_dialog(&mut self, id: DialogId) {
-        self.sip.set_connected_dialog(id);
-    }
-
-    pub fn connected_dialog_id(&self) -> Option<&DialogId> {
-        self.sip.connected_dialog_id.as_ref()
-    }
-
-    pub fn recorded_dialogs(&self) -> Vec<DialogId> {
-        self.sip.recorded_dialogs()
     }
 
     // ── Playback / recording ──
@@ -210,9 +149,7 @@ impl CallLeg {
         code: Option<StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
-        self.sip
-            .hangup_inbound_dialog(code, reason)
-            .await
+        self.sip.hangup_inbound_dialog(code, reason).await
     }
 
     /// Send a provisional response (180/183) on the inbound server dialog.
@@ -221,7 +158,10 @@ impl CallLeg {
         headers: Option<Vec<rsip::Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<()> {
-        let server_dialog = self.sip.server_dialog.as_ref()
+        let server_dialog = self
+            .sip
+            .server_dialog
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
         server_dialog.ringing(headers, body)?;
         Ok(())
@@ -233,39 +173,21 @@ impl CallLeg {
         headers: Option<Vec<rsip::Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<()> {
-        let server_dialog = self.sip.server_dialog.as_ref()
+        let server_dialog = self
+            .sip
+            .server_dialog
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
         server_dialog.accept(headers, body)?;
         Ok(())
     }
 
-    /// Send an INFO request on the inbound server dialog (e.g. for trickle ICE).
-    pub async fn send_info(
-        &self,
-        headers: Vec<rsip::Header>,
-        body: Option<Vec<u8>>,
-    ) -> Result<()> {
-        let server_dialog = self.sip.server_dialog.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
-        server_dialog.info(Some(headers), body).await?;
-        Ok(())
-    }
-
-    /// Send an UPDATE request on the inbound server dialog (e.g. for session timer refresh).
-    pub async fn send_update(
-        &self,
-        headers: Option<Vec<rsip::Header>>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<rsip::Response>> {
-        let server_dialog = self.sip.server_dialog.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
-        let result = server_dialog.update(headers, body).await?;
-        Ok(result)
-    }
-
     /// Send BYE on the inbound server dialog.
     pub async fn bye_inbound(&self) -> Result<()> {
-        let server_dialog = self.sip.server_dialog.as_ref()
+        let server_dialog = self
+            .sip
+            .server_dialog
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
         server_dialog.bye().await?;
         Ok(())
@@ -273,7 +195,10 @@ impl CallLeg {
 
     /// Reject the inbound server dialog with a status code.
     pub fn reject_inbound(&self, code: Option<StatusCode>, reason: Option<String>) -> Result<()> {
-        let server_dialog = self.sip.server_dialog.as_ref()
+        let server_dialog = self
+            .sip
+            .server_dialog
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No server dialog on this leg"))?;
         server_dialog.reject(code, reason)?;
         Ok(())
@@ -281,21 +206,27 @@ impl CallLeg {
 
     /// Check if the server dialog is terminated.
     pub fn is_server_dialog_terminated(&self) -> bool {
-        self.sip.server_dialog.as_ref()
+        self.sip
+            .server_dialog
+            .as_ref()
             .map(|d| d.state().is_terminated())
             .unwrap_or(true)
     }
 
     /// Check if the server dialog is confirmed.
     pub fn is_server_dialog_confirmed(&self) -> bool {
-        self.sip.server_dialog.as_ref()
+        self.sip
+            .server_dialog
+            .as_ref()
             .map(|d| d.state().is_confirmed())
             .unwrap_or(false)
     }
 
     /// Check if the server dialog is waiting for ACK.
     pub fn is_server_dialog_waiting_ack(&self) -> bool {
-        self.sip.server_dialog.as_ref()
+        self.sip
+            .server_dialog
+            .as_ref()
             .map(|d| d.state().waiting_ack())
             .unwrap_or(false)
     }

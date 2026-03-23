@@ -732,7 +732,10 @@ async fn test_list_calls() {
         "list_calls data must be an array, got: {v}"
     );
     let calls = v["data"].as_array().expect("data should be an array");
-    assert!(!calls.is_empty(), "list_calls should return at least one call");
+    assert!(
+        !calls.is_empty(),
+        "list_calls should return at least one call"
+    );
 
     ws.close(None).await.unwrap();
     bob.stop();

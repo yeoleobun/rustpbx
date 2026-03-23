@@ -73,7 +73,9 @@ impl AppRuntime {
                     .as_ref()
                     .and_then(|p| p.get("file"))
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("IVR application requires 'file' parameter in app_params"))?;
+                    .ok_or_else(|| {
+                        anyhow!("IVR application requires 'file' parameter in app_params")
+                    })?;
 
                 let app = crate::call::app::ivr::IvrApp::from_file(file)
                     .map_err(|e| anyhow!("Failed to build IvrApp: {}", e))?;
@@ -138,7 +140,8 @@ impl AppRuntime {
         let cancel_token = session.cancel_token.child_token();
         Self::spawn_dtmf_listener_if_needed(session, &event_tx, &cancel_token);
 
-        let event_loop = AppEventLoop::new(app, controller, app_context, cancel_token.clone(), timer_rx);
+        let event_loop =
+            AppEventLoop::new(app, controller, app_context, cancel_token.clone(), timer_rx);
         let mut event_loop_task = tokio::spawn(event_loop.run());
         let session_cancel = session.cancel_token.clone();
 
@@ -210,7 +213,12 @@ impl AppRuntime {
         let app_shared = CallSessionShared::new(
             session.context.session_id.clone(),
             session.context.dialplan.direction,
-            session.context.dialplan.caller.as_ref().map(|c| c.to_string()),
+            session
+                .context
+                .dialplan
+                .caller
+                .as_ref()
+                .map(|c| c.to_string()),
             session
                 .context
                 .dialplan
@@ -233,7 +241,10 @@ impl AppRuntime {
     }
 
     #[cfg(test)]
-    fn teardown_for_test(shared: &CallSessionShared, media: &mut crate::proxy::proxy_call::media_endpoint::MediaEndpoint) {
+    fn teardown_for_test(
+        shared: &CallSessionShared,
+        media: &mut crate::proxy::proxy_call::media_endpoint::MediaEndpoint,
+    ) {
         media.cancel_dtmf_listener();
         shared.set_dtmf_listener_cancel(None);
         shared.set_app_event_sender(None);
@@ -323,7 +334,8 @@ impl AppRuntime {
     ) {
         let caller_dtmf_codecs = session
             .exported_leg
-            .media.offer_sdp
+            .media
+            .offer_sdp
             .as_deref()
             .map(MediaNegotiator::extract_dtmf_codecs)
             .unwrap_or_default();
@@ -334,7 +346,10 @@ impl AppRuntime {
         let exported_peer = session.exported_leg.media.peer.clone();
         let dtmf_event_tx = event_tx.clone();
         let dtmf_cancel = cancel_token.child_token();
-        session.exported_leg.media.set_dtmf_listener_cancel(dtmf_cancel.clone());
+        session
+            .exported_leg
+            .media
+            .set_dtmf_listener_cancel(dtmf_cancel.clone());
         session
             .shared
             .set_dtmf_listener_cancel(Some(dtmf_cancel.clone()));
@@ -373,16 +388,20 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
 
         shared.set_app_event_sender(Some(tx));
-        assert!(shared.send_app_event(crate::call::app::ControllerEvent::Custom(
-            "probe".to_string(),
-            serde_json::json!({"ok": true}),
-        )));
+        assert!(
+            shared.send_app_event(crate::call::app::ControllerEvent::Custom(
+                "probe".to_string(),
+                serde_json::json!({"ok": true}),
+            ))
+        );
 
         shared.set_app_event_sender(None);
-        assert!(!shared.send_app_event(crate::call::app::ControllerEvent::Custom(
-            "probe".to_string(),
-            serde_json::json!({"ok": true}),
-        )));
+        assert!(
+            !shared.send_app_event(crate::call::app::ControllerEvent::Custom(
+                "probe".to_string(),
+                serde_json::json!({"ok": true}),
+            ))
+        );
     }
 
     #[tokio::test]
@@ -407,9 +426,11 @@ mod tests {
         media.set_dtmf_listener_cancel(token2.clone());
         AppRuntime::teardown_for_test(&shared, &mut media);
         assert!(token2.is_cancelled());
-        assert!(!shared.send_app_event(crate::call::app::ControllerEvent::Custom(
-            "probe".to_string(),
-            serde_json::json!({"ok": true}),
-        )));
+        assert!(
+            !shared.send_app_event(crate::call::app::ControllerEvent::Custom(
+                "probe".to_string(),
+                serde_json::json!({"ok": true}),
+            ))
+        );
     }
 }

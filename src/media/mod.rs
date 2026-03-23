@@ -9,8 +9,8 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 pub use transcoder::Transcoder;
@@ -99,7 +99,9 @@ pub trait Track: Send + Sync {
     ) -> Option<broadcast::Receiver<rustrtc::transports::ice::IceCandidate>> {
         None
     }
-    fn subscribe_ice_gathering_state(&self) -> Option<tokio::sync::watch::Receiver<IceGatheringState>> {
+    fn subscribe_ice_gathering_state(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<IceGatheringState>> {
         None
     }
     fn add_remote_ice_candidate(&self, _candidate_sdp: &str) -> Result<()> {

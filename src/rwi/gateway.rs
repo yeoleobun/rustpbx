@@ -1,8 +1,8 @@
+use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use crate::rwi::auth::RwiIdentity;
 use crate::rwi::call_leg::RwiCallLegHandle;
 use crate::rwi::proto::RwiEvent;
 use crate::rwi::session::{OwnershipMode, RwiSession, SupervisorMode};
-use crate::proxy::proxy_call::media_bridge::MediaBridge;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Arc as StdArc};
 use tokio::sync::{RwLock, mpsc};
@@ -297,7 +297,10 @@ impl RwiGateway {
                 }
             }
         } else {
-            debug!(session_id, "RWI send_event_to_session: no sender for session");
+            debug!(
+                session_id,
+                "RWI send_event_to_session: no sender for session"
+            );
         }
     }
 

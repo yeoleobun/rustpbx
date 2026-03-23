@@ -511,13 +511,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_list_calls_accepts_empty_params_object() {
-        let v = process_msg(
-            r#"{"action": "session.list_calls", "action_id": "req-2", "params": {}}"#,
-        )
-        .await;
+        let v =
+            process_msg(r#"{"action": "session.list_calls", "action_id": "req-2", "params": {}}"#)
+                .await;
         assert_eq!(v["response"], "success");
         assert_eq!(v["action_id"], "req-2");
-        assert!(v["data"].is_array(), "list_calls should return array data: {v}");
+        assert!(
+            v["data"].is_array(),
+            "list_calls should return array data: {v}"
+        );
     }
 
     #[tokio::test]

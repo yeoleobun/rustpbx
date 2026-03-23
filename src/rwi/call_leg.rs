@@ -4,7 +4,9 @@ use crate::proxy::proxy_call::media_peer::MediaPeer;
 use crate::proxy::proxy_call::session_timer::{
     HEADER_SESSION_EXPIRES, SessionRefresher, SessionTimerState, parse_session_expires,
 };
-use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction, SharedExportedLegMediaRef};
+use crate::proxy::proxy_call::state::{
+    CallSessionHandle, SessionAction, SharedExportedLegMediaRef,
+};
 use anyhow::{Result, anyhow};
 use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
@@ -128,7 +130,7 @@ impl RwiLegCommandHandle {
                     _ => {
                         return Err(anyhow!(
                             "command unsupported for standalone originated RWI leg"
-                        ))
+                        ));
                     }
                 };
                 tx.send(cmd).map_err(|e| anyhow!(e.to_string()))
@@ -146,7 +148,9 @@ impl RwiLegCommandHandle {
     #[allow(dead_code)]
     pub(crate) fn send_transfer(&self, target: String) -> Result<()> {
         match self {
-            Self::Session(handle) => handle.send_command(SessionAction::from_transfer_target(&target)),
+            Self::Session(handle) => {
+                handle.send_command(SessionAction::from_transfer_target(&target))
+            }
             Self::Standalone(tx) => tx
                 .send(LegCommand::Transfer { target })
                 .map_err(|e| anyhow!(e.to_string())),
@@ -277,8 +281,16 @@ impl RwiCallLeg {
             runtime: RwLock::new(RwiCallLegRuntime {
                 // For session-backed originated legs, media truth comes from shared_media.
                 // Runtime fields are only used as fallback if shared_media is None.
-                peer: if shared_media.is_some() { None } else { Some(peer) },
-                offer_sdp: if shared_media.is_some() { None } else { offer_sdp },
+                peer: if shared_media.is_some() {
+                    None
+                } else {
+                    Some(peer)
+                },
+                offer_sdp: if shared_media.is_some() {
+                    None
+                } else {
+                    offer_sdp
+                },
                 answer_sdp: None,
                 negotiated_audio: None,
                 dialog_ids: HashSet::new(),
@@ -302,8 +314,7 @@ impl RwiCallLeg {
     }
 
     pub(crate) fn session_handle(&self) -> Option<CallSessionHandle> {
-        self.command_handle.clone()
-            .session_handle()
+        self.command_handle.clone().session_handle()
     }
 
     pub(crate) fn supports_session_features(&self) -> bool {
@@ -493,7 +504,9 @@ impl RwiCallLeg {
         };
 
         if let Some(value) = headers.iter().find_map(|header| match header {
-            rsip::Header::Other(name, value) if name.eq_ignore_ascii_case(HEADER_SESSION_EXPIRES) => {
+            rsip::Header::Other(name, value)
+                if name.eq_ignore_ascii_case(HEADER_SESSION_EXPIRES) =>
+            {
                 Some(value.clone())
             }
             _ => None,
@@ -691,13 +704,15 @@ mod tests {
             Some("caller".to_string()),
             Some("callee".to_string()),
         );
-        leg.set_session_timer(Some(SessionTimerState::default())).await;
+        leg.set_session_timer(Some(SessionTimerState::default()))
+            .await;
 
         let response = rsip::Response::try_from(
             "SIP/2.0 200 OK\r\nSession-Expires: 120;refresher=uas\r\n\r\n",
         )
         .expect("response should parse");
-        leg.refresh_session_timer_from_headers(&response.headers).await;
+        leg.refresh_session_timer_from_headers(&response.headers)
+            .await;
 
         let timer = leg.session_timer().await.expect("timer should exist");
         assert!(timer.active);

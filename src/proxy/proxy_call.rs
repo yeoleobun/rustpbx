@@ -3,7 +3,6 @@ use crate::{
     call::MediaConfig,
     call::{Dialplan, TransactionCookie},
     callrecord::CallRecordSender,
-    proxy::proxy_call::session::CallSession,
     proxy::proxy_call::state::{CallContext, SessionKind},
     proxy::server::SipServerRef,
 };
@@ -15,30 +14,30 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) mod call_leg;
+pub(crate) mod answer_runtime;
+pub(crate) mod app_runtime;
 pub(crate) mod bridge_runtime;
-pub(crate) mod leg_command;
-pub(crate) mod leg_event;
+pub(crate) mod call_leg;
+pub(crate) mod caller_negotiation;
 pub(crate) mod dialplan_runtime;
 pub(crate) mod dtmf_listener;
-pub(crate) mod app_runtime;
-pub(crate) mod answer_runtime;
-pub(crate) mod originated_runtime;
-pub(crate) mod media_endpoint;
+pub(crate) mod leg_command;
+pub(crate) mod leg_event;
 pub(crate) mod media_bridge;
+pub(crate) mod media_endpoint;
 pub(crate) mod media_peer;
-pub(crate) mod caller_negotiation;
+pub(crate) mod originated_runtime;
 pub(crate) mod playback_runtime;
+pub(crate) mod proxy_runtime;
 pub(crate) mod queue_flow;
 pub(crate) mod recording_runtime;
 pub(crate) mod reporter;
 pub(crate) mod session;
+pub(crate) mod session_loop_runtime;
 pub(crate) mod session_timer;
 pub(crate) mod sip_leg;
 pub(crate) mod state;
-pub(crate) mod session_loop_runtime;
 pub(crate) mod target_runtime;
-pub(crate) mod proxy_runtime;
 
 #[cfg(test)]
 pub(crate) mod test_util;
@@ -139,8 +138,13 @@ impl CallSessionBuilder {
         };
 
         crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime::serve(
-            server, context, tx, cancel_token, self.call_record_sender,
-        ).await
+            server,
+            context,
+            tx,
+            cancel_token,
+            self.call_record_sender,
+        )
+        .await
     }
 
     pub fn report_failure(
@@ -215,7 +219,8 @@ impl CallSessionBuilder {
             server_dialog_id: DialogId::try_from((
                 dialplan.original.as_ref(),
                 TransactionRole::Server,
-            )).ok(),
+            ))
+            .ok(),
             extensions: dialplan.extensions.clone(),
         };
 
