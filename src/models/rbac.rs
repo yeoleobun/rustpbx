@@ -286,7 +286,7 @@ impl MigrationTrait for Migration {
                             .unique_key()
                             .not_null(),
                     )
-                    .col(string(Column::Description).char_len(500))
+                    .col(string(Column::Description).char_len(255))
                     .col(boolean(Column::IsSystem).default(false))
                     .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))
                     .col(timestamp(Column::UpdatedAt).default(Expr::current_timestamp()))
