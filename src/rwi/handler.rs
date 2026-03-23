@@ -91,24 +91,19 @@ async fn handle_websocket(
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let processor = {
-        let p = RwiCommandProcessor::new(call_registry, gateway.clone());
-        let p = if let Some(server) = sip_server {
-            p.with_sip_server(server)
-        } else {
-            p
-        };
-        Arc::new(p)
+    let p = RwiCommandProcessor::new(call_registry, gateway.clone());
+    let p = if let Some(server) = sip_server {
+        p.with_sip_server(server)
+    } else {
+        p
     };
+    let processor = Arc::new(p);
 
-    let (session_id, mut event_rx) = {
-        let mut gw = gateway.write().await;
-        let session = gw.create_session(identity.clone());
-        let id = session.read().await.id.clone();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
-        gw.set_session_event_sender(&id, event_tx);
-        (id, event_rx)
-    };
+    let mut gw = gateway.write().await;
+    let session = gw.create_session(identity.clone());
+    let session_id = session.read().await.id.clone();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    gw.set_session_event_sender(&session_id, event_tx);
 
     loop {
         tokio::select! {
@@ -121,7 +116,8 @@ async fn handle_websocket(
                             &session_id,
                             gateway.clone(),
                         )
-                        .await;
+                        .await
+                        .unwrap_or_else(HandleTextMessageError::into_response);
                         if let Ok(json) = serde_json::to_string(&response) {
                             if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                 break;
@@ -154,37 +150,31 @@ async fn handle_websocket(
 
 /// Process one text frame from the WebSocket.
 ///
-/// Returns the typed response to send back (always — even for errors).
+/// Returns the typed response or a typed protocol error.
 async fn handle_text_message(
     text: &str,
     processor: Arc<RwiCommandProcessor>,
     session_id: &str,
     gateway: Arc<RwLock<RwiGateway>>,
-) -> RwiResponse {
-    let request: RwiRequestEnvelope = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response("", RwiErrorCode::ParseError, e.to_string());
-        }
-    };
-
-    let action = match request.action.as_deref() {
-        Some(a) => a.to_string(),
-        None => {
-            return error_response("", RwiErrorCode::MissingAction, "action field required");
-        }
-    };
+) -> Result<RwiResponse, HandleTextMessageError> {
+    let request: RwiRequestEnvelope = serde_json::from_str(text)
+        .map_err(|e| HandleTextMessageError::new("", RwiErrorCode::ParseError, e.to_string()))?;
 
     let action_id = request
         .action_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let command = match parse_action(&action, request.params.as_ref()) {
-        Ok(cmd) => cmd,
-        Err(msg) => {
-            return error_response(&action_id, RwiErrorCode::UnknownAction, msg);
-        }
-    };
+    let action = request.action.ok_or_else(|| {
+        HandleTextMessageError::new(
+            action_id.clone(),
+            RwiErrorCode::MissingAction,
+            "action field required",
+        )
+    })?;
+
+    let command = parse_action(&action, request.params.as_ref()).map_err(|msg| {
+        HandleTextMessageError::new(action_id.clone(), RwiErrorCode::UnknownAction, msg)
+    })?;
 
     match &command {
         RwiCommandPayload::Subscribe { contexts } => {
@@ -208,114 +198,113 @@ async fn handle_text_message(
         _ => {}
     }
 
-    let result = processor.process_command(command).await;
+    let cmd_result = processor.process_command(command).await.map_err(|e| {
+        let err_code = match &e {
+            crate::rwi::processor::CommandError::CallNotFound(_) => RwiErrorCode::NotFound,
+            crate::rwi::processor::CommandError::CommandFailed(_) => RwiErrorCode::CommandFailed,
+            crate::rwi::processor::CommandError::NotImplemented(_) => RwiErrorCode::NotImplemented,
+        };
+        HandleTextMessageError::new(action_id.clone(), err_code, e.to_string())
+    })?;
 
-    let resp = match result {
-        Ok(cmd_result) => {
-            let data = match cmd_result {
-                crate::rwi::processor::CommandResult::ListCalls(calls) => {
-                    Some(RwiResponseData::CallList(calls))
-                }
-                crate::rwi::processor::CommandResult::CallFound { call_id } => {
-                    Some(RwiResponseData::CallId(CallIdData { call_id }))
-                }
-                crate::rwi::processor::CommandResult::Originated { call_id } => {
-                    {
-                        let mut gw = gateway.write().await;
-                        let _ = gw
-                            .claim_call_ownership(
-                                &session_id.to_string(),
-                                call_id.clone(),
-                                OwnershipMode::Control,
-                            )
-                            .await;
-                    }
-                    Some(RwiResponseData::CallId(CallIdData { call_id }))
-                }
-                crate::rwi::processor::CommandResult::MediaPlay { track_id } => {
-                    Some(RwiResponseData::TrackId(TrackIdData { track_id }))
-                }
-                crate::rwi::processor::CommandResult::TransferAttended {
-                    original_call_id,
-                    consultation_call_id,
-                } => Some(RwiResponseData::TransferAttended(TransferAttendedData {
-                    original_call_id,
-                    consultation_call_id,
-                })),
-                crate::rwi::processor::CommandResult::ConferenceCreated { conf_id } => {
-                    Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
-                }
-                crate::rwi::processor::CommandResult::ConferenceMemberAdded {
-                    conf_id,
-                    call_id,
-                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
-                    conf_id,
-                    call_id,
-                })),
-                crate::rwi::processor::CommandResult::ConferenceMemberRemoved {
-                    conf_id,
-                    call_id,
-                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
-                    conf_id,
-                    call_id,
-                })),
-                crate::rwi::processor::CommandResult::ConferenceMemberMuted {
-                    conf_id,
-                    call_id,
-                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
-                    conf_id,
-                    call_id,
-                })),
-                crate::rwi::processor::CommandResult::ConferenceMemberUnmuted {
-                    conf_id,
-                    call_id,
-                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
-                    conf_id,
-                    call_id,
-                })),
-                crate::rwi::processor::CommandResult::ConferenceDestroyed { conf_id } => {
-                    Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
-                }
-                crate::rwi::processor::CommandResult::Success => None,
-            };
-            RwiResponse {
-                action_id,
-                response: ResponseStatus::Success,
-                data,
-                error: None,
-            }
+    let data = match cmd_result {
+        crate::rwi::processor::CommandResult::ListCalls(calls) => {
+            Some(RwiResponseData::CallList(calls))
         }
-        Err(e) => {
-            let err_code = match &e {
-                crate::rwi::processor::CommandError::CallNotFound(_) => RwiErrorCode::NotFound,
-                crate::rwi::processor::CommandError::CommandFailed(_) => {
-                    RwiErrorCode::CommandFailed
-                }
-                crate::rwi::processor::CommandError::NotImplemented(_) => {
-                    RwiErrorCode::NotImplemented
-                }
-            };
-            RwiResponse {
-                action_id,
-                response: ResponseStatus::Error,
-                data: None,
-                error: Some(RwiError::new(err_code, e.to_string())),
-            }
+        crate::rwi::processor::CommandResult::CallFound { call_id } => {
+            Some(RwiResponseData::CallId(CallIdData { call_id }))
         }
+        crate::rwi::processor::CommandResult::Originated { call_id } => {
+            {
+                let mut gw = gateway.write().await;
+                let _ = gw
+                    .claim_call_ownership(
+                        &session_id.to_string(),
+                        call_id.clone(),
+                        OwnershipMode::Control,
+                    )
+                    .await;
+            }
+            Some(RwiResponseData::CallId(CallIdData { call_id }))
+        }
+        crate::rwi::processor::CommandResult::MediaPlay { track_id } => {
+            Some(RwiResponseData::TrackId(TrackIdData { track_id }))
+        }
+        crate::rwi::processor::CommandResult::TransferAttended {
+            original_call_id,
+            consultation_call_id,
+        } => Some(RwiResponseData::TransferAttended(TransferAttendedData {
+            original_call_id,
+            consultation_call_id,
+        })),
+        crate::rwi::processor::CommandResult::ConferenceCreated { conf_id } => {
+            Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
+        }
+        crate::rwi::processor::CommandResult::ConferenceMemberAdded { conf_id, call_id } => {
+            Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                conf_id,
+                call_id,
+            }))
+        }
+        crate::rwi::processor::CommandResult::ConferenceMemberRemoved { conf_id, call_id } => {
+            Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                conf_id,
+                call_id,
+            }))
+        }
+        crate::rwi::processor::CommandResult::ConferenceMemberMuted { conf_id, call_id } => {
+            Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                conf_id,
+                call_id,
+            }))
+        }
+        crate::rwi::processor::CommandResult::ConferenceMemberUnmuted { conf_id, call_id } => {
+            Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                conf_id,
+                call_id,
+            }))
+        }
+        crate::rwi::processor::CommandResult::ConferenceDestroyed { conf_id } => {
+            Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
+        }
+        crate::rwi::processor::CommandResult::Success => None,
     };
-    resp
+
+    Ok(RwiResponse {
+        action_id,
+        response: ResponseStatus::Success,
+        data,
+        error: None,
+    })
 }
 
-fn error_response(
-    action_id: &str,
-    code: RwiErrorCode,
-    message: impl Into<String>,
-) -> RwiResponse {
+fn error_response(action_id: &str, code: RwiErrorCode, message: impl Into<String>) -> RwiResponse {
     RwiResponse {
         action_id: action_id.to_string(),
         response: ResponseStatus::Error,
         data: None,
         error: Some(RwiError::new(code, message)),
+    }
+}
+
+#[derive(Debug)]
+struct HandleTextMessageError {
+    action_id: String,
+    code: RwiErrorCode,
+    message: String,
+}
+
+impl HandleTextMessageError {
+    fn new(action_id: impl Into<String>, code: RwiErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            action_id: action_id.into(),
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> RwiResponse {
+        error_response(&self.action_id, self.code, self.message)
     }
 }
 fn parse_action(
@@ -340,7 +329,8 @@ fn parse_action(
     }
 
     let req: crate::rwi::session::RwiRequest =
-        serde_json::from_value(serde_json::Value::Object(request_map)).map_err(|e| e.to_string())?;
+        serde_json::from_value(serde_json::Value::Object(request_map))
+            .map_err(|e| e.to_string())?;
 
     Ok(req.into())
 }
@@ -361,7 +351,9 @@ mod tests {
     async fn process_msg(json: &str) -> serde_json::Value {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = handle_text_message(json, processor, "test-session", gateway).await;
+        let resp = handle_text_message(json, processor, "test-session", gateway)
+            .await
+            .unwrap_or_else(HandleTextMessageError::into_response);
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
@@ -461,7 +453,9 @@ mod tests {
     async fn test_invalid_json_returns_error() {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = handle_text_message("not json", processor, "sess", gateway).await;
+        let resp = handle_text_message("not json", processor, "sess", gateway)
+            .await
+            .unwrap_or_else(HandleTextMessageError::into_response);
         let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");
