@@ -5,7 +5,7 @@ use crate::rwi::auth::{RwiAuth, RwiIdentity};
 use crate::rwi::gateway::RwiGateway;
 use crate::rwi::processor::RwiCommandProcessor;
 use crate::rwi::proto::{ResponseStatus, RwiError, RwiResponse};
-use crate::rwi::session::{OwnershipMode, RwiCommandMessage, RwiCommandPayload};
+use crate::rwi::session::{OwnershipMode, RwiCommandPayload};
 use axum::{
     Extension,
     extract::Query,
@@ -76,16 +76,9 @@ fn extract_token(
 
 /// Single unified WebSocket session loop.
 ///
-/// Architecture:
-/// ```text
-///   ws_receiver -> [recv_task]
-///                      | parse + process command
-///                      | build RwiResponse JSON
-///                      v
-///                  [ws_tx channel]  <- gateway event fan-out also writes here
-///                      |
-///                  [write_task] -> ws_sender
-/// ```
+/// One loop owns the websocket sender/receiver and multiplexes:
+/// - client text frames -> command processing -> response write
+/// - gateway event channel -> event serialization -> event write
 async fn handle_websocket(
     socket: WebSocket,
     identity: RwiIdentity,
@@ -94,8 +87,6 @@ async fn handle_websocket(
     sip_server: Option<SipServerRef>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
 
     let processor = {
         let p = RwiCommandProcessor::new(call_registry, gateway.clone());
@@ -107,63 +98,51 @@ async fn handle_websocket(
         Arc::new(p)
     };
 
-    let session_id = {
+    let (session_id, mut event_rx) = {
         let mut gw = gateway.write().await;
         let session = gw.create_session(identity.clone());
         let id = session.read().await.id.clone();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
-        let ws_tx_clone = ws_tx.clone();
-        tokio::spawn(async move {
-            while let Some(v) = event_rx.recv().await {
-                if let Ok(s) = serde_json::to_string(&v) {
-                    let _ = ws_tx_clone.send(s);
-                }
-            }
-        });
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
         gw.set_session_event_sender(&id, event_tx);
-        id
+        (id, event_rx)
     };
 
-    let write_task = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let (command_tx, _command_rx) = mpsc::unbounded_channel::<RwiCommandMessage>();
-
-    let session_id_clone = session_id.clone();
-    let gateway_clone = gateway.clone();
-    let ws_tx_resp = ws_tx.clone();
-    let recv_task = tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let text = text.to_string();
-                    let response_json = handle_text_message(
-                        &text,
-                        &command_tx,
-                        processor.clone(),
-                        &session_id_clone,
-                        gateway_clone.clone(),
-                    )
-                    .await;
-                    if let Some(json) = response_json {
-                        let _ = ws_tx_resp.send(json);
+    loop {
+        tokio::select! {
+            ws_msg = ws_receiver.next() => {
+                match ws_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let response_json = handle_text_message(
+                            text.as_ref(),
+                            processor.clone(),
+                            &session_id,
+                            gateway.clone(),
+                        )
+                        .await;
+                        if let Some(json) = response_json {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
                 }
-                Ok(Message::Close(_)) => break,
-                Err(_) => break,
-                _ => {}
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Some(value) => {
+                        if let Ok(json) = serde_json::to_string(&value) {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => break,
+                }
             }
         }
-    });
-
-    tokio::select! {
-        _ = write_task => {}
-        _ = recv_task => {}
     }
 
     let mut gw = gateway.write().await;
@@ -175,7 +154,6 @@ async fn handle_websocket(
 /// Returns the JSON string to send back as a response (always — even for errors).
 async fn handle_text_message(
     text: &str,
-    command_tx: &mpsc::UnboundedSender<RwiCommandMessage>,
     processor: Arc<RwiCommandProcessor>,
     session_id: &str,
     gateway: Arc<RwLock<RwiGateway>>,
@@ -231,15 +209,7 @@ async fn handle_text_message(
         _ => {}
     }
 
-    let call_id = extract_call_id(&command);
-
     let result = processor.process_command(command).await;
-
-    let _ = command_tx.send(RwiCommandMessage {
-        id: action_id.clone(),
-        call_id,
-        command: RwiCommandPayload::ListCalls,
-    });
 
     let resp = match result {
         Ok(cmd_result) => {
@@ -363,74 +333,12 @@ fn parse_action(action: &str, params: &serde_json::Value) -> Result<RwiCommandPa
     Ok(req.into())
 }
 
-fn extract_call_id(cmd: &RwiCommandPayload) -> Option<String> {
-    match cmd {
-        RwiCommandPayload::Subscribe { .. } => None,
-        RwiCommandPayload::Unsubscribe { .. } => None,
-        RwiCommandPayload::ListCalls => None,
-        RwiCommandPayload::AttachCall { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::DetachCall { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::Originate(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::Answer { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::Reject { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::Ring { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::Hangup { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::Bridge { leg_a, .. } => Some(leg_a.clone()),
-        RwiCommandPayload::Unbridge { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::Transfer { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::TransferAttended { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::TransferComplete { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::TransferCancel {
-            consultation_call_id,
-        } => Some(consultation_call_id.clone()),
-        RwiCommandPayload::CallHold { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::CallUnhold { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::SetRingbackSource { target_call_id, .. } => Some(target_call_id.clone()),
-        RwiCommandPayload::MediaPlay(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::MediaStop { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::MediaStreamStart(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::MediaStreamStop { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::MediaInjectStart(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::MediaInjectStop { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::RecordStart(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::RecordPause { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::RecordResume { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::RecordStop { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::RecordMaskSegment { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::QueueEnqueue(r) => Some(r.call_id.clone()),
-        RwiCommandPayload::QueueDequeue { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::QueueHold { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::QueueUnhold { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::QueueSetPriority { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::QueueAssignAgent { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::QueueRequeue { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::SupervisorListen { target_call_id, .. } => Some(target_call_id.clone()),
-        RwiCommandPayload::SupervisorWhisper { target_call_id, .. } => Some(target_call_id.clone()),
-        RwiCommandPayload::SupervisorBarge { target_call_id, .. } => Some(target_call_id.clone()),
-        RwiCommandPayload::SupervisorStop { target_call_id, .. } => Some(target_call_id.clone()),
-        RwiCommandPayload::SupervisorTakeover { target_call_id, .. } => {
-            Some(target_call_id.clone())
-        }
-        RwiCommandPayload::SipMessage { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::SipNotify { call_id, .. } => Some(call_id.clone()),
-        RwiCommandPayload::SipOptionsPing { call_id } => Some(call_id.clone()),
-        RwiCommandPayload::ConferenceCreate(req) => Some(req.conf_id.clone()),
-        RwiCommandPayload::ConferenceAdd { conf_id, .. } => Some(conf_id.clone()),
-        RwiCommandPayload::ConferenceRemove { conf_id, .. } => Some(conf_id.clone()),
-        RwiCommandPayload::ConferenceMute { conf_id, .. } => Some(conf_id.clone()),
-        RwiCommandPayload::ConferenceUnmute { conf_id, .. } => Some(conf_id.clone()),
-        RwiCommandPayload::ConferenceDestroy { conf_id } => Some(conf_id.clone()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
     use crate::rwi::processor::RwiCommandProcessor;
-    use crate::rwi::session::RwiCommandPayload;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     fn create_test_processor() -> Arc<RwiCommandProcessor> {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
@@ -439,10 +347,9 @@ mod tests {
     }
 
     async fn process_msg(json: &str) -> serde_json::Value {
-        let (tx, _rx) = mpsc::unbounded_channel();
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp_json = handle_text_message(json, &tx, processor, "test-session", gateway)
+        let resp_json = handle_text_message(json, processor, "test-session", gateway)
             .await
             .expect("should return response JSON");
         serde_json::from_str(&resp_json).expect("response should be valid JSON")
