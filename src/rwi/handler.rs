@@ -4,8 +4,11 @@ use crate::proxy::server::SipServerRef;
 use crate::rwi::auth::{RwiAuth, RwiIdentity};
 use crate::rwi::gateway::RwiGateway;
 use crate::rwi::processor::RwiCommandProcessor;
-use crate::rwi::proto::{ResponseStatus, RwiError, RwiResponse};
-use crate::rwi::session::{OwnershipMode, RwiCommandPayload};
+use crate::rwi::proto::{
+    CallIdData, ConferenceIdData, ConferenceMemberData, ResponseStatus, RwiError, RwiErrorCode,
+    RwiResponse, RwiResponseData, TrackIdData, TransferAttendedData,
+};
+use crate::rwi::session::{OwnershipMode, RwiCommandPayload, RwiRequestEnvelope};
 use axum::{
     Extension,
     extract::Query,
@@ -112,14 +115,14 @@ async fn handle_websocket(
             ws_msg = ws_receiver.next() => {
                 match ws_msg {
                     Some(Ok(Message::Text(text))) => {
-                        let response_json = handle_text_message(
+                        let response = handle_text_message(
                             text.as_ref(),
                             processor.clone(),
                             &session_id,
                             gateway.clone(),
                         )
                         .await;
-                        if let Some(json) = response_json {
+                        if let Ok(json) = serde_json::to_string(&response) {
                             if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
@@ -151,39 +154,35 @@ async fn handle_websocket(
 
 /// Process one text frame from the WebSocket.
 ///
-/// Returns the JSON string to send back as a response (always — even for errors).
+/// Returns the typed response to send back (always — even for errors).
 async fn handle_text_message(
     text: &str,
     processor: Arc<RwiCommandProcessor>,
     session_id: &str,
     gateway: Arc<RwLock<RwiGateway>>,
-) -> Option<String> {
-    let value: serde_json::Value = match serde_json::from_str(text) {
+) -> RwiResponse {
+    let request: RwiRequestEnvelope = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            return error_response("", "parse_error", e.to_string());
+            return error_response("", RwiErrorCode::ParseError, e.to_string());
         }
     };
 
-    let action = match value.get("action").and_then(|v| v.as_str()) {
+    let action = match request.action.as_deref() {
         Some(a) => a.to_string(),
         None => {
-            return error_response("", "missing_action", "action field required");
+            return error_response("", RwiErrorCode::MissingAction, "action field required");
         }
     };
 
-    let action_id = value
-        .get("action_id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    let action_id = request
+        .action_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let params = value.get("params").unwrap_or(&serde_json::Value::Null);
-
-    let command = match parse_action(&action, params) {
+    let command = match parse_action(&action, request.params.as_ref()) {
         Ok(cmd) => cmd,
         Err(msg) => {
-            return error_response(&action_id, "unknown_action", msg);
+            return error_response(&action_id, RwiErrorCode::UnknownAction, msg);
         }
     };
 
@@ -215,10 +214,10 @@ async fn handle_text_message(
         Ok(cmd_result) => {
             let data = match cmd_result {
                 crate::rwi::processor::CommandResult::ListCalls(calls) => {
-                    serde_json::to_value(calls).ok()
+                    Some(RwiResponseData::CallList(calls))
                 }
                 crate::rwi::processor::CommandResult::CallFound { call_id } => {
-                    Some(serde_json::json!({ "call_id": call_id }))
+                    Some(RwiResponseData::CallId(CallIdData { call_id }))
                 }
                 crate::rwi::processor::CommandResult::Originated { call_id } => {
                     {
@@ -231,39 +230,51 @@ async fn handle_text_message(
                             )
                             .await;
                     }
-                    Some(serde_json::json!({ "call_id": call_id }))
+                    Some(RwiResponseData::CallId(CallIdData { call_id }))
                 }
                 crate::rwi::processor::CommandResult::MediaPlay { track_id } => {
-                    Some(serde_json::json!({ "track_id": track_id }))
+                    Some(RwiResponseData::TrackId(TrackIdData { track_id }))
                 }
                 crate::rwi::processor::CommandResult::TransferAttended {
                     original_call_id,
                     consultation_call_id,
-                } => Some(serde_json::json!({
-                    "original_call_id": original_call_id,
-                    "consultation_call_id": consultation_call_id,
+                } => Some(RwiResponseData::TransferAttended(TransferAttendedData {
+                    original_call_id,
+                    consultation_call_id,
                 })),
                 crate::rwi::processor::CommandResult::ConferenceCreated { conf_id } => {
-                    Some(serde_json::json!({ "conf_id": conf_id }))
+                    Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
                 }
                 crate::rwi::processor::CommandResult::ConferenceMemberAdded {
                     conf_id,
                     call_id,
-                } => Some(serde_json::json!({ "conf_id": conf_id, "call_id": call_id })),
+                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                    conf_id,
+                    call_id,
+                })),
                 crate::rwi::processor::CommandResult::ConferenceMemberRemoved {
                     conf_id,
                     call_id,
-                } => Some(serde_json::json!({ "conf_id": conf_id, "call_id": call_id })),
+                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                    conf_id,
+                    call_id,
+                })),
                 crate::rwi::processor::CommandResult::ConferenceMemberMuted {
                     conf_id,
                     call_id,
-                } => Some(serde_json::json!({ "conf_id": conf_id, "call_id": call_id })),
+                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                    conf_id,
+                    call_id,
+                })),
                 crate::rwi::processor::CommandResult::ConferenceMemberUnmuted {
                     conf_id,
                     call_id,
-                } => Some(serde_json::json!({ "conf_id": conf_id, "call_id": call_id })),
+                } => Some(RwiResponseData::ConferenceMember(ConferenceMemberData {
+                    conf_id,
+                    call_id,
+                })),
                 crate::rwi::processor::CommandResult::ConferenceDestroyed { conf_id } => {
-                    Some(serde_json::json!({ "conf_id": conf_id }))
+                    Some(RwiResponseData::ConferenceId(ConferenceIdData { conf_id }))
                 }
                 crate::rwi::processor::CommandResult::Success => None,
             };
@@ -276,9 +287,13 @@ async fn handle_text_message(
         }
         Err(e) => {
             let err_code = match &e {
-                crate::rwi::processor::CommandError::CallNotFound(_) => "not_found",
-                crate::rwi::processor::CommandError::CommandFailed(_) => "command_failed",
-                crate::rwi::processor::CommandError::NotImplemented(_) => "not_implemented",
+                crate::rwi::processor::CommandError::CallNotFound(_) => RwiErrorCode::NotFound,
+                crate::rwi::processor::CommandError::CommandFailed(_) => {
+                    RwiErrorCode::CommandFailed
+                }
+                crate::rwi::processor::CommandError::NotImplemented(_) => {
+                    RwiErrorCode::NotImplemented
+                }
             };
             RwiResponse {
                 action_id,
@@ -288,47 +303,44 @@ async fn handle_text_message(
             }
         }
     };
-
-    serde_json::to_string(&resp).ok()
+    resp
 }
 
-fn error_response(action_id: &str, code: &str, message: impl Into<String>) -> Option<String> {
-    let resp = RwiResponse {
+fn error_response(
+    action_id: &str,
+    code: RwiErrorCode,
+    message: impl Into<String>,
+) -> RwiResponse {
+    RwiResponse {
         action_id: action_id.to_string(),
         response: ResponseStatus::Error,
         data: None,
         error: Some(RwiError::new(code, message)),
-    };
-    serde_json::to_string(&resp).ok()
+    }
 }
+fn parse_action(
+    action: &str,
+    params: Option<&serde_json::Value>,
+) -> Result<RwiCommandPayload, String> {
+    let mut request_map = serde_json::Map::new();
+    request_map.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
 
-fn parse_action(action: &str, params: &serde_json::Value) -> Result<RwiCommandPayload, String> {
-    // Build JSON with action tag for serde enum deserialization
-    // For unit variants (like ListCalls), params should be absent/null, not empty object
-    let json = if params.is_null() {
-        serde_json::json!({
-            "action": action,
-        })
-    } else if let serde_json::Value::Object(obj) = params {
-        if obj.is_empty() {
-            serde_json::json!({
-                "action": action,
-            })
-        } else {
-            serde_json::json!({
-                "action": action,
-                "params": params
-            })
+    if let Some(params) = params {
+        let include_params = match params {
+            serde_json::Value::Null => false,
+            serde_json::Value::Object(obj) => !obj.is_empty(),
+            _ => true,
+        };
+        if include_params {
+            request_map.insert("params".to_string(), params.clone());
         }
-    } else {
-        serde_json::json!({
-            "action": action,
-            "params": params
-        })
-    };
+    }
 
     let req: crate::rwi::session::RwiRequest =
-        serde_json::from_value(json).map_err(|e| e.to_string())?;
+        serde_json::from_value(serde_json::Value::Object(request_map)).map_err(|e| e.to_string())?;
 
     Ok(req.into())
 }
@@ -349,10 +361,8 @@ mod tests {
     async fn process_msg(json: &str) -> serde_json::Value {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp_json = handle_text_message(json, processor, "test-session", gateway)
-            .await
-            .expect("should return response JSON");
-        serde_json::from_str(&resp_json).expect("response should be valid JSON")
+        let resp = handle_text_message(json, processor, "test-session", gateway).await;
+        serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
     #[test]
@@ -449,12 +459,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_returns_error() {
-        let (tx, _rx) = mpsc::unbounded_channel();
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = handle_text_message("not json", &tx, processor, "sess", gateway).await;
-        assert!(resp.is_some());
-        let v: serde_json::Value = serde_json::from_str(&resp.unwrap()).unwrap();
+        let resp = handle_text_message("not json", processor, "sess", gateway).await;
+        let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");
     }
@@ -471,29 +479,6 @@ mod tests {
         let v =
             process_msg(r#"{"action": "session.list_calls", "action_id": "my-custom-id"}"#).await;
         assert_eq!(v["action_id"], "my-custom-id");
-    }
-
-    #[test]
-    fn test_extract_call_id_answer() {
-        let cmd = RwiCommandPayload::Answer {
-            call_id: "c1".into(),
-        };
-        assert_eq!(extract_call_id(&cmd), Some("c1".into()));
-    }
-
-    #[test]
-    fn test_extract_call_id_bridge() {
-        let cmd = RwiCommandPayload::Bridge {
-            leg_a: "a".into(),
-            leg_b: "b".into(),
-        };
-        assert_eq!(extract_call_id(&cmd), Some("a".into()));
-    }
-
-    #[test]
-    fn test_extract_call_id_subscribe_none() {
-        let cmd = RwiCommandPayload::Subscribe { contexts: vec![] };
-        assert_eq!(extract_call_id(&cmd), None);
     }
 
     #[tokio::test]
@@ -536,7 +521,7 @@ mod tests {
             "direction": "sendonly",
             "format": { "codec": "PCMA", "sample_rate": 16000, "channels": 2, "ptime_ms": 20 }
         });
-        let cmd = parse_action("media.stream_start", &params).unwrap();
+        let cmd = parse_action("media.stream_start", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::MediaStreamStart(r) => {
                 assert_eq!(r.call_id, "c1");
@@ -553,7 +538,7 @@ mod tests {
     #[test]
     fn test_media_stream_start_defaults() {
         let params = serde_json::json!({ "call_id": "c1" });
-        let cmd = parse_action("media.stream_start", &params).unwrap();
+        let cmd = parse_action("media.stream_start", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::MediaStreamStart(r) => {
                 assert_eq!(r.direction, "sendrecv");
@@ -579,7 +564,7 @@ mod tests {
     #[test]
     fn test_media_stream_stop_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "c2" });
-        let cmd = parse_action("media.stream_stop", &params).unwrap();
+        let cmd = parse_action("media.stream_stop", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::MediaStreamStop { call_id } if call_id == "c2"));
     }
 
@@ -599,7 +584,7 @@ mod tests {
             "call_id": "c3",
             "format": { "codec": "PCMU", "sample_rate": 8000, "channels": 1 }
         });
-        let cmd = parse_action("media.inject_start", &params).unwrap();
+        let cmd = parse_action("media.inject_start", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::MediaInjectStart(r) => {
                 assert_eq!(r.call_id, "c3");
@@ -623,7 +608,7 @@ mod tests {
     #[test]
     fn test_media_inject_stop_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "c4" });
-        let cmd = parse_action("media.inject_stop", &params).unwrap();
+        let cmd = parse_action("media.inject_stop", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::MediaInjectStop { call_id } if call_id == "c4"));
     }
 
@@ -646,7 +631,7 @@ mod tests {
             "max_duration_secs": 3600,
             "storage": { "backend": "s3", "path": "bucket/key" }
         });
-        let cmd = parse_action("record.start", &params).unwrap();
+        let cmd = parse_action("record.start", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::RecordStart(r) => {
                 assert_eq!(r.call_id, "r1");
@@ -663,7 +648,7 @@ mod tests {
     #[test]
     fn test_record_start_storage_defaults() {
         let params = serde_json::json!({ "call_id": "r1" });
-        let cmd = parse_action("record.start", &params).unwrap();
+        let cmd = parse_action("record.start", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::RecordStart(r) => {
                 assert_eq!(r.mode, "mixed");
@@ -688,7 +673,7 @@ mod tests {
     #[test]
     fn test_record_pause_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "r2" });
-        let cmd = parse_action("record.pause", &params).unwrap();
+        let cmd = parse_action("record.pause", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::RecordPause { call_id } if call_id == "r2"));
     }
 
@@ -704,7 +689,7 @@ mod tests {
     #[test]
     fn test_record_resume_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "r3" });
-        let cmd = parse_action("record.resume", &params).unwrap();
+        let cmd = parse_action("record.resume", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::RecordResume { call_id } if call_id == "r3"));
     }
 
@@ -720,7 +705,7 @@ mod tests {
     #[test]
     fn test_record_stop_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "r4" });
-        let cmd = parse_action("record.stop", &params).unwrap();
+        let cmd = parse_action("record.stop", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::RecordStop { call_id } if call_id == "r4"));
     }
 
@@ -742,7 +727,7 @@ mod tests {
             "skills": ["en", "tech"],
             "max_wait_secs": 120
         });
-        let cmd = parse_action("queue.enqueue", &params).unwrap();
+        let cmd = parse_action("queue.enqueue", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::QueueEnqueue(r) => {
                 assert_eq!(r.call_id, "q1");
@@ -762,7 +747,7 @@ mod tests {
             "queue_id": "billing",
             "skills": ["billing", "french", "vip"]
         });
-        let cmd = parse_action("queue.enqueue", &params).unwrap();
+        let cmd = parse_action("queue.enqueue", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::QueueEnqueue(r) => {
                 let skills = r.skills.expect("skills should be Some");
@@ -788,7 +773,7 @@ mod tests {
     #[test]
     fn test_queue_dequeue_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "q3" });
-        let cmd = parse_action("queue.dequeue", &params).unwrap();
+        let cmd = parse_action("queue.dequeue", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::QueueDequeue { call_id } if call_id == "q3"));
     }
 
@@ -804,7 +789,7 @@ mod tests {
     #[test]
     fn test_queue_hold_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "q4" });
-        let cmd = parse_action("queue.hold", &params).unwrap();
+        let cmd = parse_action("queue.hold", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::QueueHold { call_id } if call_id == "q4"));
     }
 
@@ -820,7 +805,7 @@ mod tests {
     #[test]
     fn test_queue_unhold_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "q5" });
-        let cmd = parse_action("queue.unhold", &params).unwrap();
+        let cmd = parse_action("queue.unhold", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::QueueUnhold { call_id } if call_id == "q5"));
     }
 
@@ -839,7 +824,7 @@ mod tests {
             "supervisor_call_id": "sup1",
             "target_call_id": "tgt1"
         });
-        let cmd = parse_action("supervisor.listen", &params).unwrap();
+        let cmd = parse_action("supervisor.listen", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SupervisorListen {
                 supervisor_call_id,
@@ -870,7 +855,7 @@ mod tests {
             "target_call_id": "tgt2",
             "agent_leg": "leg-a"
         });
-        let cmd = parse_action("supervisor.whisper", &params).unwrap();
+        let cmd = parse_action("supervisor.whisper", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SupervisorWhisper {
                 supervisor_call_id,
@@ -903,7 +888,7 @@ mod tests {
             "target_call_id": "tgt3",
             "agent_leg": "leg-b"
         });
-        let cmd = parse_action("supervisor.barge", &params).unwrap();
+        let cmd = parse_action("supervisor.barge", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SupervisorBarge {
                 supervisor_call_id,
@@ -935,7 +920,7 @@ mod tests {
             "supervisor_call_id": "sup4",
             "target_call_id": "tgt4"
         });
-        let cmd = parse_action("supervisor.stop", &params).unwrap();
+        let cmd = parse_action("supervisor.stop", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SupervisorStop {
                 supervisor_call_id,
@@ -967,7 +952,7 @@ mod tests {
             "content_type": "text/html",
             "body": "<b>hello</b>"
         });
-        let cmd = parse_action("sip.message", &params).unwrap();
+        let cmd = parse_action("sip.message", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SipMessage {
                 call_id,
@@ -985,7 +970,7 @@ mod tests {
     #[test]
     fn test_sip_message_defaults() {
         let params = serde_json::json!({ "call_id": "sip1" });
-        let cmd = parse_action("sip.message", &params).unwrap();
+        let cmd = parse_action("sip.message", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SipMessage {
                 content_type, body, ..
@@ -1017,7 +1002,7 @@ mod tests {
             "content_type": "application/pidf+xml",
             "body": "<pidf/>"
         });
-        let cmd = parse_action("sip.notify", &params).unwrap();
+        let cmd = parse_action("sip.notify", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SipNotify {
                 call_id,
@@ -1037,7 +1022,7 @@ mod tests {
     #[test]
     fn test_sip_notify_defaults() {
         let params = serde_json::json!({ "call_id": "sip2" });
-        let cmd = parse_action("sip.notify", &params).unwrap();
+        let cmd = parse_action("sip.notify", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::SipNotify {
                 event,
@@ -1068,7 +1053,7 @@ mod tests {
     #[test]
     fn test_sip_options_ping_parses_to_correct_variant() {
         let params = serde_json::json!({ "call_id": "sip3" });
-        let cmd = parse_action("sip.options_ping", &params).unwrap();
+        let cmd = parse_action("sip.options_ping", Some(&params)).unwrap();
         assert!(matches!(cmd, RwiCommandPayload::SipOptionsPing { call_id } if call_id == "sip3"));
     }
 
@@ -1100,7 +1085,7 @@ mod tests {
             "target": "sip:agent@local",
             "timeout_secs": 30
         });
-        let cmd = parse_action("call.transfer.attended", &params).unwrap();
+        let cmd = parse_action("call.transfer.attended", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::TransferAttended {
                 call_id,
@@ -1118,7 +1103,7 @@ mod tests {
     #[test]
     fn test_transfer_attended_optional_timeout() {
         let params = serde_json::json!({ "call_id": "c1", "target": "sip:x@y" });
-        let cmd = parse_action("call.transfer.attended", &params).unwrap();
+        let cmd = parse_action("call.transfer.attended", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::TransferAttended { timeout_secs, .. } => {
                 assert_eq!(timeout_secs, None);
@@ -1144,7 +1129,7 @@ mod tests {
             "call_id": "orig-2",
             "consultation_call_id": "consult-42"
         });
-        let cmd = parse_action("call.transfer.complete", &params).unwrap();
+        let cmd = parse_action("call.transfer.complete", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::TransferComplete {
                 call_id,
@@ -1171,7 +1156,7 @@ mod tests {
     #[test]
     fn test_transfer_cancel_parses_to_correct_variant() {
         let params = serde_json::json!({ "consultation_call_id": "consult-99" });
-        let cmd = parse_action("call.transfer.cancel", &params).unwrap();
+        let cmd = parse_action("call.transfer.cancel", Some(&params)).unwrap();
         match cmd {
             RwiCommandPayload::TransferCancel {
                 consultation_call_id,

@@ -530,11 +530,69 @@ pub struct CallIncomingData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallInfo {
+    pub session_id: String,
+    pub caller: Option<String>,
+    pub callee: Option<String>,
+    pub direction: String,
+    pub status: String,
+    pub started_at: String,
+    pub answered_at: Option<String>,
+    pub state: Option<CallStateInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallStateInfo {
+    pub phase: String,
+    pub caller: Option<String>,
+    pub callee: Option<String>,
+    pub hangup_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallIdData {
+    pub call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackIdData {
+    pub track_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferAttendedData {
+    pub original_call_id: String,
+    pub consultation_call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConferenceIdData {
+    pub conf_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConferenceMemberData {
+    pub conf_id: String,
+    pub call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RwiResponseData {
+    CallList(Vec<CallInfo>),
+    CallId(CallIdData),
+    TrackId(TrackIdData),
+    TransferAttended(TransferAttendedData),
+    ConferenceId(ConferenceIdData),
+    ConferenceMember(ConferenceMemberData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RwiResponse {
     pub action_id: String,
     pub response: ResponseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
+    pub data: Option<RwiResponseData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RwiError>,
 }
@@ -546,38 +604,53 @@ pub enum ResponseStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RwiErrorCode {
+    ParseError,
+    MissingAction,
+    UnknownAction,
+    InvalidState,
+    NotFound,
+    AlreadyOwned,
+    Forbidden,
+    RateLimited,
+    CommandFailed,
+    NotImplemented,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RwiError {
-    pub code: String,
+    pub code: RwiErrorCode,
     pub message: String,
 }
 
 impl RwiError {
-    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: RwiErrorCode, message: impl Into<String>) -> Self {
         Self {
-            code: code.into(),
+            code,
             message: message.into(),
         }
     }
 
     pub fn invalid_state(message: impl Into<String>) -> Self {
-        Self::new("invalid_state", message)
+        Self::new(RwiErrorCode::InvalidState, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new("not_found", message)
+        Self::new(RwiErrorCode::NotFound, message)
     }
 
     pub fn already_owned() -> Self {
-        Self::new("already_owned", "call is owned by another session")
+        Self::new(RwiErrorCode::AlreadyOwned, "call is owned by another session")
     }
 
     pub fn forbidden() -> Self {
-        Self::new("forbidden", "insufficient scope for this action")
+        Self::new(RwiErrorCode::Forbidden, "insufficient scope for this action")
     }
 
     pub fn rate_limited() -> Self {
-        Self::new("rate_limited", "too many requests")
+        Self::new(RwiErrorCode::RateLimited, "too many requests")
     }
 }
 
@@ -594,20 +667,20 @@ mod tests {
     #[test]
     fn test_rwi_error_factory_methods() {
         let err = RwiError::invalid_state("call is not ringing");
-        assert_eq!(err.code, "invalid_state");
+        assert_eq!(err.code, RwiErrorCode::InvalidState);
         assert_eq!(err.message, "call is not ringing");
 
         let err = RwiError::not_found("call not found");
-        assert_eq!(err.code, "not_found");
+        assert_eq!(err.code, RwiErrorCode::NotFound);
 
         let err = RwiError::already_owned();
-        assert_eq!(err.code, "already_owned");
+        assert_eq!(err.code, RwiErrorCode::AlreadyOwned);
 
         let err = RwiError::forbidden();
-        assert_eq!(err.code, "forbidden");
+        assert_eq!(err.code, RwiErrorCode::Forbidden);
 
         let err = RwiError::rate_limited();
-        assert_eq!(err.code, "rate_limited");
+        assert_eq!(err.code, RwiErrorCode::RateLimited);
     }
 
     #[test]
@@ -707,7 +780,9 @@ mod tests {
         let response = RwiResponse {
             action_id: "test-id".to_string(),
             response: ResponseStatus::Success,
-            data: Some(serde_json::json!("call_id")),
+            data: Some(RwiResponseData::CallId(CallIdData {
+                call_id: "call_id".to_string(),
+            })),
             error: None,
         };
         assert!(matches!(response.response, ResponseStatus::Success));

@@ -13,4 +13,8 @@ pub use handler::*;
 pub use processor::*;
 pub use session::*;
 
-pub use proto::{CallIncomingData, ResponseStatus, RwiCommand, RwiError, RwiEvent, RwiResponse};
+pub use proto::{
+    CallIdData, CallIncomingData, CallInfo, CallStateInfo, ConferenceIdData,
+    ConferenceMemberData, ResponseStatus, RwiCommand, RwiError, RwiErrorCode, RwiEvent,
+    RwiResponse, RwiResponseData, TrackIdData, TransferAttendedData,
+};

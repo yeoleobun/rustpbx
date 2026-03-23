@@ -5,7 +5,7 @@ use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::proxy::proxy_call::state::{CallSessionHandle, SessionAction};
 use crate::proxy::server::SipServerRef;
 use crate::rwi::gateway::RwiGateway;
-use crate::rwi::proto::RwiEvent;
+use crate::rwi::proto::{CallInfo, RwiEvent};
 use crate::rwi::session::{
     ConferenceCreateRequest, OriginateRequest, QueueEnqueueRequest, RecordStartRequest,
     RwiCommandPayload, SupervisorMode,
@@ -2098,26 +2098,6 @@ pub enum CommandResult {
     ConferenceDestroyed {
         conf_id: String,
     },
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CallInfo {
-    pub session_id: String,
-    pub caller: Option<String>,
-    pub callee: Option<String>,
-    pub direction: String,
-    pub status: String,
-    pub started_at: String,
-    pub answered_at: Option<String>,
-    pub state: Option<CallStateInfo>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CallStateInfo {
-    pub phase: String,
-    pub caller: Option<String>,
-    pub callee: Option<String>,
-    pub hangup_reason: Option<String>,
 }
 
 #[derive(Debug)]
