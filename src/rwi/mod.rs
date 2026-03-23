@@ -16,9 +16,9 @@ pub use session::*;
 pub use types::*;
 
 pub use proto::{
-    CallIdData, CallIncomingData, CallInfo, CallStateInfo, ConferenceIdData,
-    ConferenceMemberData, ResponseStatus, RwiCommand, RwiError, RwiErrorCode, RwiEvent,
-    RwiResponse, RwiResponseData, TrackIdData, TransferAttendedData,
+    CallIdData, CallIncomingData, CallInfo, CallStateInfo, ConferenceIdData, ConferenceMemberData,
+    ResponseStatus, RwiCommand, RwiError, RwiErrorCode, RwiEvent, RwiResponse, RwiResponseData,
+    TrackIdData, TransferAttendedData,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

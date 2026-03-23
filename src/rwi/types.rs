@@ -122,9 +122,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         match self {
             Error::Auth(error) => error.into_response(),
-            Error::Message(error) => {
-                (StatusCode::BAD_REQUEST, error.to_string()).into_response()
-            }
+            Error::Message(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         }
     }
 }

@@ -169,7 +169,10 @@ mod tests {
         let auth = RwiAuth::new(&config);
 
         let identity = auth.validate_token("invalid-token");
-        assert!(matches!(identity, Err(crate::rwi::Error::Auth(AuthError::InvalidToken))));
+        assert!(matches!(
+            identity,
+            Err(crate::rwi::Error::Auth(AuthError::InvalidToken))
+        ));
     }
 
     #[test]

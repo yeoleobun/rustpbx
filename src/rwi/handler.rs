@@ -304,8 +304,9 @@ mod tests {
     async fn process_msg(json: &str) -> serde_json::Value {
         let mut processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp =
-            RwiWireResponse(handle_text_message(json, &mut processor, "test-session", gateway).await);
+        let resp = RwiWireResponse(
+            handle_text_message(json, &mut processor, "test-session", gateway).await,
+        );
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 

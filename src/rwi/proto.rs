@@ -642,11 +642,17 @@ impl RwiError {
     }
 
     pub fn already_owned() -> Self {
-        Self::new(RwiErrorCode::AlreadyOwned, "call is owned by another session")
+        Self::new(
+            RwiErrorCode::AlreadyOwned,
+            "call is owned by another session",
+        )
     }
 
     pub fn forbidden() -> Self {
-        Self::new(RwiErrorCode::Forbidden, "insufficient scope for this action")
+        Self::new(
+            RwiErrorCode::Forbidden,
+            "insufficient scope for this action",
+        )
     }
 
     pub fn rate_limited() -> Self {
