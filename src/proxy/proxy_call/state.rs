@@ -8,8 +8,10 @@ use crate::rwi::SupervisorMode;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rsip::StatusCode;
+use rsipstack::dialog::dialog::TransactionHandle;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +27,22 @@ pub struct CallContext {
     pub original_caller: String,
     pub original_callee: String,
     pub max_forwards: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MidDialogLeg {
+    Caller,
+    Callee,
+}
+
+impl MidDialogLeg {
+    fn pending_key(&self, dialog_id: &str) -> String {
+        let leg = match self {
+            Self::Caller => "caller",
+            Self::Callee => "callee",
+        };
+        format!("{leg}:{dialog_id}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,7 +83,12 @@ pub enum SessionAction {
         code: Option<u16>,
         initiator: Option<String>,
     },
-    HandleReInvite(String, String), // (method, sdp)
+    HandleReInvite {
+        leg: MidDialogLeg,
+        method: String,
+        sdp: Option<String>,
+        dialog_id: String,
+    },
     HandleTrickleIce(String),
     RefreshSession,
     MuteTrack(String),
@@ -140,6 +163,7 @@ pub struct CallSessionShared {
     events: Arc<RwLock<Option<ProxyCallEventSender>>>,
     app_event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<crate::call::app::ControllerEvent>>>>,
     dtmf_listener_cancel: Arc<RwLock<Option<CancellationToken>>>,
+    pending_mid_dialog_replies: Arc<Mutex<HashMap<String, TransactionHandle>>>,
 }
 
 impl CallSessionShared {
@@ -173,6 +197,7 @@ impl CallSessionShared {
             events: Arc::new(RwLock::new(None)),
             app_event_tx: Arc::new(RwLock::new(None)),
             dtmf_listener_cancel: Arc::new(RwLock::new(None)),
+            pending_mid_dialog_replies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,6 +241,28 @@ impl CallSessionShared {
         if let Some(cancel) = cancel {
             cancel.cancel();
         }
+    }
+
+    pub fn store_mid_dialog_reply(
+        &self,
+        leg: MidDialogLeg,
+        dialog_id: &str,
+        handle: TransactionHandle,
+    ) {
+        if let Ok(mut replies) = self.pending_mid_dialog_replies.lock() {
+            replies.insert(leg.pending_key(dialog_id), handle);
+        }
+    }
+
+    pub fn take_mid_dialog_reply(
+        &self,
+        leg: MidDialogLeg,
+        dialog_id: &str,
+    ) -> Option<TransactionHandle> {
+        self.pending_mid_dialog_replies
+            .lock()
+            .ok()
+            .and_then(|mut replies| replies.remove(&leg.pending_key(dialog_id)))
     }
 
     pub fn snapshot(&self) -> CallSessionSnapshot {
