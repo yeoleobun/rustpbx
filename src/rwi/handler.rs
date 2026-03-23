@@ -31,14 +31,12 @@ pub async fn rwi_ws_handler(
     Extension(sip_server): Extension<Option<SipServerRef>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let token = extract_token(&headers, &params);
-
-    let identity = match token {
-        Some(t) => {
+    let identity = match extract_token(&headers, &params) {
+        Ok(Some(token)) => {
             let auth = auth.read().await;
-            auth.validate_token(&t)
+            auth.validate_token(&token)
         }
-        None => None,
+        Ok(None) | Err(_) => None,
     };
 
     let identity = match identity {
@@ -65,16 +63,22 @@ pub async fn rwi_ws_handler(
 fn extract_token(
     headers: &HeaderMap,
     query_params: &std::collections::HashMap<String, String>,
-) -> Option<String> {
+) -> Result<Option<String>, ExtractTokenError> {
     if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                return Some(auth_str[7..].to_string());
-            }
+        let auth_str = auth_header
+            .to_str()
+            .map_err(|_| ExtractTokenError::InvalidAuthorizationHeader)?;
+        if let Some(token) = auth_str.strip_prefix("Bearer ") {
+            return Ok(Some(token.to_string()));
         }
     }
 
-    query_params.get("token").cloned()
+    Ok(query_params.get("token").cloned())
+}
+
+#[derive(Debug)]
+enum ExtractTokenError {
+    InvalidAuthorizationHeader,
 }
 
 /// Single unified WebSocket session loop.
@@ -363,7 +367,7 @@ mod tests {
         headers.insert("authorization", "Bearer test-token-123".parse().unwrap());
         let params = std::collections::HashMap::new();
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Some("test-token-123".to_string()));
+        assert_eq!(token, Ok(Some("test-token-123".to_string())));
     }
 
     #[test]
@@ -372,7 +376,7 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("token".to_string(), "query-token-456".to_string());
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Some("query-token-456".to_string()));
+        assert_eq!(token, Ok(Some("query-token-456".to_string())));
     }
 
     #[test]
@@ -382,14 +386,14 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("token".to_string(), "query-token".to_string());
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Some("header-token".to_string()));
+        assert_eq!(token, Ok(Some("header-token".to_string())));
     }
 
-    #[test]
+        #[test]
     fn test_extract_token_missing() {
         let headers = axum::http::HeaderMap::new();
         let params = std::collections::HashMap::new();
-        assert_eq!(extract_token(&headers, &params), None);
+        assert_eq!(extract_token(&headers, &params), Ok(None));
     }
 
     // ---- Command processing tests ----
