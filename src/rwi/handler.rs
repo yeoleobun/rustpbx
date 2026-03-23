@@ -16,7 +16,7 @@ use axum::{
     extract::Query,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::HeaderMap,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -35,12 +35,9 @@ pub async fn rwi_ws_handler(
 ) -> Result<Response> {
     let identity = authenticate_request(&headers, &params, auth).await?;
 
-    Ok(ws
-        .protocols(["rwi-v1"])
-        .on_upgrade(async move |socket| {
-            handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
-        })
-        .into_response())
+    Ok(ws.protocols(["rwi-v1"]).on_upgrade(async move |socket| {
+        handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
+    }))
 }
 
 fn extract_token(
@@ -296,8 +293,8 @@ fn parse_action(
 mod tests {
     use super::*;
     use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
-    use crate::rwi::processor::RwiCommandProcessor;
     use crate::rwi::AuthError;
+    use crate::rwi::processor::RwiCommandProcessor;
     use std::sync::Arc;
 
     fn create_test_processor() -> Arc<RwiCommandProcessor> {
@@ -309,7 +306,8 @@ mod tests {
     async fn process_msg(json: &str) -> serde_json::Value {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = RwiWireResponse(handle_text_message(json, processor, "test-session", gateway).await);
+        let resp =
+            RwiWireResponse(handle_text_message(json, processor, "test-session", gateway).await);
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
@@ -412,7 +410,8 @@ mod tests {
     async fn test_invalid_json_returns_error() {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = RwiWireResponse(handle_text_message("not json", processor, "sess", gateway).await);
+        let resp =
+            RwiWireResponse(handle_text_message("not json", processor, "sess", gateway).await);
         let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");

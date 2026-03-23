@@ -5,6 +5,7 @@ use crate::rwi::gateway::{RwiGateway, SessionId};
 use crate::rwi::proto::RwiEvent;
 use crate::rwi::session::OwnershipMode;
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -13,6 +14,71 @@ pub const RWI_APP_NAME: &str = "rwi";
 #[derive(Clone)]
 pub struct RwiAddon {
     gateway: Arc<RwLock<RwiGateway>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RwiAppParams {
+    #[serde(default = "default_context_name", deserialize_with = "deserialize_string_or_default")]
+    context: String,
+    #[serde(default, deserialize_with = "deserialize_option_string")]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MediaPlayEventData {
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
+    audio_file: String,
+    #[serde(default = "default_track_id", deserialize_with = "deserialize_string_or_default")]
+    track_id: String,
+    #[serde(default, deserialize_with = "deserialize_bool_or_default")]
+    interrupt_on_dtmf: bool,
+    #[serde(
+        rename = "loop",
+        default,
+        deserialize_with = "deserialize_bool_or_default"
+    )]
+    loop_playback: bool,
+}
+
+fn default_context_name() -> String {
+    "default".to_string()
+}
+
+fn default_track_id() -> String {
+    "default".to_string()
+}
+
+fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(value)) => value,
+        _ => String::new(),
+    })
+}
+
+fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(value)) => Some(value),
+        _ => None,
+    })
+}
+
+fn deserialize_bool_or_default<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Bool(value)) => value,
+        _ => false,
+    })
 }
 
 impl RwiAddon {
@@ -33,20 +99,11 @@ impl crate::call::CallAppFactory for RwiAddon {
             return None;
         }
 
-        let context_name = params
-            .get("context")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
-
-        let session_id = params
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let parsed = serde_json::from_value::<RwiAppParams>(params.clone()).unwrap_or_default();
 
         Some(Box::new(RwiApp::new(
-            context_name,
-            session_id,
+            parsed.context,
+            parsed.session_id,
             self.gateway.clone(),
         )))
     }
@@ -122,13 +179,11 @@ impl CallApp for RwiApp {
         .await;
 
         if let Some(session_id) = &self.session_id {
-            let claim_ok = {
-                let mut gateway = self.gateway.write().await;
-                gateway
-                    .claim_call_ownership(session_id, call_id.clone(), OwnershipMode::Control)
-                    .await
-                    .is_ok()
-            };
+            let mut gateway = self.gateway.write().await;
+            let claim_ok = gateway
+                .claim_call_ownership(session_id, call_id.clone(), OwnershipMode::Control)
+                .await
+                .is_ok();
 
             if claim_ok {
                 self.owned = true;
@@ -197,39 +252,26 @@ impl CallApp for RwiApp {
     ) -> anyhow::Result<AppAction> {
         match event {
             AppEvent::Custom { ref name, ref data } if name == "media.play" => {
-                let audio_file = data
-                    .get("audio_file")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let track_id = data
-                    .get("track_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
-                let interrupt_on_dtmf = data
-                    .get("interrupt_on_dtmf")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let loop_playback = data.get("loop").and_then(|v| v.as_bool()).unwrap_or(false);
+                let media_play = serde_json::from_value::<MediaPlayEventData>(data.clone())
+                    .unwrap_or_default();
 
-                if !audio_file.is_empty() {
+                if !media_play.audio_file.is_empty() {
                     match controller
                         .play_audio_with_options(
-                            &audio_file,
-                            Some(track_id.clone()),
-                            loop_playback,
-                            interrupt_on_dtmf,
+                            &media_play.audio_file,
+                            Some(media_play.track_id.clone()),
+                            media_play.loop_playback,
+                            media_play.interrupt_on_dtmf,
                         )
                         .await
                     {
                         Ok(_handle) => {
-                            self.current_track_id = Some(track_id);
-                            self.interrupt_on_dtmf = interrupt_on_dtmf;
+                            self.current_track_id = Some(media_play.track_id);
+                            self.interrupt_on_dtmf = media_play.interrupt_on_dtmf;
                         }
                         Err(e) => {
                             tracing::warn!(
-                                track_id = %track_id,
+                                track_id = %media_play.track_id,
                                 error = %e,
                                 "RwiApp: media.play failed"
                             );
