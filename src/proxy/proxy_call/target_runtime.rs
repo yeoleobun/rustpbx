@@ -1,6 +1,5 @@
-use crate::call::{CallForwardingMode, Location};
+use crate::call::Location;
 use crate::config::RouteResult;
-use crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime;
 use crate::proxy::proxy_call::session::{ActionInbox, CallSession, ParallelEvent};
 use crate::proxy::proxy_call::state::SessionAction;
 use anyhow::{Result, anyhow};
@@ -681,63 +680,4 @@ impl TargetRuntime {
         Ok(())
     }
 
-    pub(crate) async fn handle_failure(session: &mut CallSession, inbox: ActionInbox<'_>) -> Result<()> {
-        if session.failure_is_busy() {
-            if let Some(config) = session.forwarding_config().cloned() {
-                if matches!(config.mode, CallForwardingMode::WhenBusy) {
-                    info!(
-                        session_id = %session.context.session_id,
-                        endpoint = ?config.endpoint,
-                        "Call forwarding (busy) engaged"
-                    );
-                    return ProxySessionRuntime::transfer_to_endpoint(session, &config.endpoint, inbox).await;
-                }
-            }
-            if session.context.dialplan.voicemail_enabled {
-                info!(
-                    session_id = %session.context.session_id,
-                    callee = %session.context.original_callee,
-                    "busy: routing to voicemail"
-                );
-                let params = serde_json::json!({
-                    "extension": session.context.original_callee,
-                    "caller_id": session.context.original_caller,
-                });
-                return session.run_application("voicemail", Some(params), true).await;
-            }
-        } else if session.failure_is_no_answer() {
-            if let Some(config) = session.forwarding_config().cloned() {
-                if matches!(config.mode, CallForwardingMode::WhenNoAnswer) {
-                    info!(
-                        session_id = %session.context.session_id,
-                        endpoint = ?config.endpoint,
-                        "Call forwarding (no answer) engaged"
-                    );
-                    return ProxySessionRuntime::transfer_to_endpoint(session, &config.endpoint, inbox).await;
-                }
-            }
-            if session.context.dialplan.voicemail_enabled {
-                info!(
-                    session_id = %session.context.session_id,
-                    callee = %session.context.original_callee,
-                    "no-answer: routing to voicemail"
-                );
-                let params = serde_json::json!({
-                    "extension": session.context.original_callee,
-                    "caller_id": session.context.original_caller,
-                });
-                return session.run_application("voicemail", Some(params), true).await;
-            }
-        }
-
-        if let Some((code, reason)) = session.last_error.clone() {
-            session.report_failure(code, reason)?;
-        } else {
-            session.report_failure(
-                StatusCode::ServerInternalError,
-                Some("Unknown error".to_string()),
-            )?;
-        }
-        Err(anyhow!("Call failed"))
-    }
 }
