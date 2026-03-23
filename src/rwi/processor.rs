@@ -10,6 +10,7 @@ use crate::rwi::session::{
     ConferenceCreateRequest, OriginateRequest, QueueEnqueueRequest, RecordStartRequest,
     RwiCommandPayload, SupervisorMode,
 };
+use crate::rwi::types::HandleTextMessageError;
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -124,8 +125,18 @@ impl RwiCommandProcessor {
 
     pub async fn process_command(
         &self,
+        action_id: &str,
         command: RwiCommandPayload,
-    ) -> Result<CommandResult, CommandError> {
+    ) -> crate::rwi::Result<CommandResult> {
+        self.execute_command(command)
+            .await
+            .map_err(|error| HandleTextMessageError::from_command(action_id, error).into())
+    }
+
+    async fn execute_command(
+        &self,
+        command: RwiCommandPayload,
+    ) -> std::result::Result<CommandResult, CommandError> {
         match command {
             RwiCommandPayload::ListCalls => {
                 let calls = self.list_calls().await;
@@ -2117,6 +2128,16 @@ impl std::fmt::Display for CommandError {
     }
 }
 
+impl CommandError {
+    pub fn rwi_code(&self) -> crate::rwi::RwiErrorCode {
+        match self {
+            CommandError::CallNotFound(_) => crate::rwi::RwiErrorCode::NotFound,
+            CommandError::CommandFailed(_) => crate::rwi::RwiErrorCode::CommandFailed,
+            CommandError::NotImplemented(_) => crate::rwi::RwiErrorCode::NotImplemented,
+        }
+    }
+}
+
 impl serde::Serialize for CommandError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -2227,7 +2248,7 @@ mod tests {
     async fn test_list_calls_empty() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::ListCalls)
+            .execute_command(RwiCommandPayload::ListCalls)
             .await;
         assert!(result.is_ok());
         if let Ok(CommandResult::ListCalls(calls)) = result {
@@ -2239,7 +2260,7 @@ mod tests {
     async fn test_answer_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Answer {
+            .execute_command(RwiCommandPayload::Answer {
                 call_id: "nonexistent".into(),
             })
             .await;
@@ -2251,7 +2272,7 @@ mod tests {
     async fn test_ring_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Ring {
+            .execute_command(RwiCommandPayload::Ring {
                 call_id: "nonexistent".into(),
             })
             .await;
@@ -2263,7 +2284,7 @@ mod tests {
     async fn test_reject_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Reject {
+            .execute_command(RwiCommandPayload::Reject {
                 call_id: "nonexistent".into(),
                 reason: None,
             })
@@ -2276,7 +2297,7 @@ mod tests {
     async fn test_attach_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::AttachCall {
+            .execute_command(RwiCommandPayload::AttachCall {
                 call_id: "nonexistent".into(),
                 mode: crate::rwi::session::OwnershipMode::Control,
             })
@@ -2289,7 +2310,7 @@ mod tests {
     async fn test_detach_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::DetachCall {
+            .execute_command(RwiCommandPayload::DetachCall {
                 call_id: "nonexistent".into(),
             })
             .await;
@@ -2311,7 +2332,7 @@ mod tests {
 
         // Detach should succeed
         let result = processor
-            .process_command(RwiCommandPayload::DetachCall {
+            .execute_command(RwiCommandPayload::DetachCall {
                 call_id: "call-to-detach".into(),
             })
             .await;
@@ -2327,7 +2348,7 @@ mod tests {
     async fn test_hangup_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Hangup {
+            .execute_command(RwiCommandPayload::Hangup {
                 call_id: "nonexistent".into(),
                 reason: Some("normal".into()),
                 code: Some(16),
@@ -2341,7 +2362,7 @@ mod tests {
     async fn test_transfer_call_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Transfer {
+            .execute_command(RwiCommandPayload::Transfer {
                 call_id: "nonexistent".into(),
                 target: "sip:target@local".into(),
             })
@@ -2353,7 +2374,7 @@ mod tests {
     async fn test_bridge_not_found_leg_a() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Bridge {
+            .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "missing-a".into(),
                 leg_b: "missing-b".into(),
             })
@@ -2369,7 +2390,7 @@ mod tests {
         create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
 
         let result = processor
-            .process_command(RwiCommandPayload::Bridge {
+            .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a".into(),
                 leg_b: "leg-b-missing".into(),
             })
@@ -2388,7 +2409,7 @@ mod tests {
         // Both calls exist; bridge command should succeed (channel may be closed in test
         // but lookup succeeds)
         let result = processor
-            .process_command(RwiCommandPayload::Bridge {
+            .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a".into(),
                 leg_b: "leg-b".into(),
             })
@@ -2405,7 +2426,7 @@ mod tests {
     async fn test_unbridge_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Unbridge {
+            .execute_command(RwiCommandPayload::Unbridge {
                 call_id: "nope".into(),
             })
             .await;
@@ -2417,7 +2438,7 @@ mod tests {
     async fn test_subscribe_success() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Subscribe {
+            .execute_command(RwiCommandPayload::Subscribe {
                 contexts: vec!["ctx1".into()],
             })
             .await;
@@ -2428,7 +2449,7 @@ mod tests {
     async fn test_unsubscribe_success() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Unsubscribe {
+            .execute_command(RwiCommandPayload::Unsubscribe {
                 contexts: vec!["ctx1".into()],
             })
             .await;
@@ -2439,7 +2460,7 @@ mod tests {
     async fn test_media_play_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::MediaPlay(
+            .execute_command(RwiCommandPayload::MediaPlay(
                 crate::rwi::session::MediaPlayRequest {
                     call_id: "missing".into(),
                     source: crate::rwi::session::MediaSource {
@@ -2460,7 +2481,7 @@ mod tests {
         // Without a SIP server wired in, originate should return CommandFailed
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Originate(
+            .execute_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
                     call_id: "new-call".into(),
                     destination: "sip:test@local".into(),
@@ -2490,7 +2511,7 @@ mod tests {
         // URI-parse errors are caught in the same method after the server check.
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::Originate(
+            .execute_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
                     call_id: "new-call-2".into(),
                     destination: "not-a-sip-uri".into(),
@@ -2530,7 +2551,7 @@ mod tests {
         assert!(registry.get_handle("call-001").is_some());
 
         let result = processor
-            .process_command(RwiCommandPayload::Answer {
+            .execute_command(RwiCommandPayload::Answer {
                 call_id: "call-001".into(),
             })
             .await;
@@ -2554,7 +2575,7 @@ mod tests {
         );
 
         let result = processor
-            .process_command(RwiCommandPayload::Hangup {
+            .execute_command(RwiCommandPayload::Hangup {
                 call_id: "call-001".into(),
                 reason: Some("normal".into()),
                 code: Some(16),
@@ -2577,7 +2598,7 @@ mod tests {
         create_test_call(&registry, "call-3", "1003", "2002", DialDirection::Inbound);
 
         let result = processor
-            .process_command(RwiCommandPayload::ListCalls)
+            .execute_command(RwiCommandPayload::ListCalls)
             .await;
         assert!(result.is_ok());
         if let Ok(CommandResult::ListCalls(calls)) = result {
@@ -2617,7 +2638,7 @@ mod tests {
         );
 
         let result = processor
-            .process_command(RwiCommandPayload::ListCalls)
+            .execute_command(RwiCommandPayload::ListCalls)
             .await;
         if let Ok(CommandResult::ListCalls(calls)) = result {
             let inbound: Vec<_> = calls.iter().filter(|c| c.direction == "inbound").collect();
@@ -2659,7 +2680,7 @@ mod tests {
 
         // Bridge should send BridgeTo and then emit CallBridged to owner of leg-a
         let result = processor
-            .process_command(RwiCommandPayload::Bridge {
+            .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a".into(),
                 leg_b: "leg-b".into(),
             })
@@ -2682,7 +2703,7 @@ mod tests {
     async fn test_media_stop_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::MediaStop {
+            .execute_command(RwiCommandPayload::MediaStop {
                 call_id: "ghost".into(),
             })
             .await;
@@ -2703,7 +2724,7 @@ mod tests {
         );
 
         let result = processor
-            .process_command(RwiCommandPayload::MediaStop {
+            .execute_command(RwiCommandPayload::MediaStop {
                 call_id: "call-stop".into(),
             })
             .await;
@@ -2733,7 +2754,7 @@ mod tests {
         );
 
         let result = processor
-            .process_command(RwiCommandPayload::Unbridge {
+            .execute_command(RwiCommandPayload::Unbridge {
                 call_id: "call-unb".into(),
             })
             .await;
@@ -2758,7 +2779,7 @@ mod tests {
         let _hb = create_test_call(&registry, "leg-b2", "1001", "2002", DialDirection::Outbound);
 
         let result = processor
-            .process_command(RwiCommandPayload::Bridge {
+            .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a2".into(),
                 leg_b: "leg-b2".into(),
             })
@@ -2807,7 +2828,7 @@ mod tests {
         }
 
         let result = processor
-            .process_command(RwiCommandPayload::Unbridge {
+            .execute_command(RwiCommandPayload::Unbridge {
                 call_id: "call-ev".into(),
             })
             .await;
@@ -2844,7 +2865,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SetRingbackSource {
+            .execute_command(RwiCommandPayload::SetRingbackSource {
                 target_call_id: "call-target".into(),
                 source_call_id: "call-source".into(),
             })
@@ -2865,7 +2886,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SetRingbackSource {
+            .execute_command(RwiCommandPayload::SetRingbackSource {
                 target_call_id: "nonexistent".into(),
                 source_call_id: "call-source".into(),
             })
@@ -2887,7 +2908,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SetRingbackSource {
+            .execute_command(RwiCommandPayload::SetRingbackSource {
                 target_call_id: "call-target".into(),
                 source_call_id: "nonexistent".into(),
             })
@@ -2909,7 +2930,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordStart(
+            .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
                     call_id: "call-rec".into(),
                     mode: "local".into(),
@@ -2935,7 +2956,7 @@ mod tests {
     async fn test_record_start_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::RecordStart(
+            .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
                     call_id: "nonexistent".into(),
                     mode: "local".into(),
@@ -2965,7 +2986,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::RecordStart(
+            .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
                     call_id: "call-rec-p".into(),
                     mode: "local".into(),
@@ -2981,7 +3002,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordPause {
+            .execute_command(RwiCommandPayload::RecordPause {
                 call_id: "call-rec-p".into(),
             })
             .await;
@@ -3004,7 +3025,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordPause {
+            .execute_command(RwiCommandPayload::RecordPause {
                 call_id: "call-norec".into(),
             })
             .await;
@@ -3025,7 +3046,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::RecordStart(
+            .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
                     call_id: "call-rec-r".into(),
                     mode: "local".into(),
@@ -3041,14 +3062,14 @@ mod tests {
             .unwrap();
 
         processor
-            .process_command(RwiCommandPayload::RecordPause {
+            .execute_command(RwiCommandPayload::RecordPause {
                 call_id: "call-rec-r".into(),
             })
             .await
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordResume {
+            .execute_command(RwiCommandPayload::RecordResume {
                 call_id: "call-rec-r".into(),
             })
             .await;
@@ -3071,7 +3092,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordResume {
+            .execute_command(RwiCommandPayload::RecordResume {
                 call_id: "call-norec2".into(),
             })
             .await;
@@ -3092,7 +3113,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::RecordStart(
+            .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
                     call_id: "call-rec-s".into(),
                     mode: "local".into(),
@@ -3108,7 +3129,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordStop {
+            .execute_command(RwiCommandPayload::RecordStop {
                 call_id: "call-rec-s".into(),
             })
             .await;
@@ -3137,7 +3158,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::RecordStop {
+            .execute_command(RwiCommandPayload::RecordStop {
                 call_id: "call-norec3".into(),
             })
             .await;
@@ -3162,7 +3183,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueEnqueue(
+            .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
                     call_id: "call-q".into(),
                     queue_id: "support".into(),
@@ -3181,7 +3202,7 @@ mod tests {
     async fn test_queue_enqueue_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::QueueEnqueue(
+            .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
                     call_id: "nonexistent".into(),
                     queue_id: "support".into(),
@@ -3208,7 +3229,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(
+            .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
                     call_id: "call-dq".into(),
                     queue_id: "support".into(),
@@ -3221,7 +3242,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueDequeue {
+            .execute_command(RwiCommandPayload::QueueDequeue {
                 call_id: "call-dq".into(),
             })
             .await;
@@ -3234,7 +3255,7 @@ mod tests {
     async fn test_queue_dequeue_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::QueueDequeue {
+            .execute_command(RwiCommandPayload::QueueDequeue {
                 call_id: "nonexistent".into(),
             })
             .await;
@@ -3255,7 +3276,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(
+            .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
                     call_id: "call-hold".into(),
                     queue_id: "support".into(),
@@ -3268,7 +3289,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueHold {
+            .execute_command(RwiCommandPayload::QueueHold {
                 call_id: "call-hold".into(),
             })
             .await;
@@ -3291,7 +3312,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueHold {
+            .execute_command(RwiCommandPayload::QueueHold {
                 call_id: "call-noq".into(),
             })
             .await;
@@ -3317,7 +3338,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(
+            .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
                     call_id: "call-unhold".into(),
                     queue_id: "support".into(),
@@ -3330,14 +3351,14 @@ mod tests {
             .unwrap();
 
         processor
-            .process_command(RwiCommandPayload::QueueHold {
+            .execute_command(RwiCommandPayload::QueueHold {
                 call_id: "call-unhold".into(),
             })
             .await
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueUnhold {
+            .execute_command(RwiCommandPayload::QueueUnhold {
                 call_id: "call-unhold".into(),
             })
             .await;
@@ -3360,7 +3381,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::QueueUnhold {
+            .execute_command(RwiCommandPayload::QueueUnhold {
                 call_id: "call-noq2".into(),
             })
             .await;
@@ -3388,7 +3409,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SupervisorListen {
+            .execute_command(RwiCommandPayload::SupervisorListen {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
             })
@@ -3407,7 +3428,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SupervisorListen {
+            .execute_command(RwiCommandPayload::SupervisorListen {
                 supervisor_call_id: "nonexistent".into(),
                 target_call_id: "call-1".into(),
             })
@@ -3431,7 +3452,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SupervisorWhisper {
+            .execute_command(RwiCommandPayload::SupervisorWhisper {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
                 agent_leg: "agent-1".into(),
@@ -3459,7 +3480,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SupervisorBarge {
+            .execute_command(RwiCommandPayload::SupervisorBarge {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
                 agent_leg: "agent-1".into(),
@@ -3479,7 +3500,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::SupervisorStop {
+            .execute_command(RwiCommandPayload::SupervisorStop {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
             })
@@ -3494,7 +3515,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::MediaStreamStart(
+            .execute_command(RwiCommandPayload::MediaStreamStart(
                 crate::rwi::session::MediaStreamRequest {
                     call_id: "call-1".into(),
                     direction: "playback".into(),
@@ -3514,7 +3535,7 @@ mod tests {
     async fn test_media_stream_start_not_found() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::MediaStreamStart(
+            .execute_command(RwiCommandPayload::MediaStreamStart(
                 crate::rwi::session::MediaStreamRequest {
                     call_id: "nonexistent".into(),
                     direction: "playback".into(),
@@ -3538,7 +3559,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::MediaStreamStart(
+            .execute_command(RwiCommandPayload::MediaStreamStart(
                 crate::rwi::session::MediaStreamRequest {
                     call_id: "call-1".into(),
                     direction: "playback".into(),
@@ -3554,7 +3575,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::MediaStreamStop {
+            .execute_command(RwiCommandPayload::MediaStreamStop {
                 call_id: "call-1".into(),
             })
             .await;
@@ -3568,7 +3589,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         let result = processor
-            .process_command(RwiCommandPayload::MediaInjectStart(
+            .execute_command(RwiCommandPayload::MediaInjectStart(
                 crate::rwi::session::MediaInjectRequest {
                     call_id: "call-1".into(),
                     format: crate::rwi::session::MediaFormat {
@@ -3590,7 +3611,7 @@ mod tests {
         let processor = create_test_processor_with_registry(registry);
 
         processor
-            .process_command(RwiCommandPayload::MediaInjectStart(
+            .execute_command(RwiCommandPayload::MediaInjectStart(
                 crate::rwi::session::MediaInjectRequest {
                     call_id: "call-1".into(),
                     format: crate::rwi::session::MediaFormat {
@@ -3605,7 +3626,7 @@ mod tests {
             .unwrap();
 
         let result = processor
-            .process_command(RwiCommandPayload::MediaInjectStop {
+            .execute_command(RwiCommandPayload::MediaInjectStop {
                 call_id: "call-1".into(),
             })
             .await;
@@ -3616,7 +3637,7 @@ mod tests {
     async fn test_sip_message_no_server() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::SipMessage {
+            .execute_command(RwiCommandPayload::SipMessage {
                 call_id: "call-1".into(),
                 content_type: "text/plain".into(),
                 body: "Hello".into(),
@@ -3635,7 +3656,7 @@ mod tests {
     async fn test_sip_notify_no_server() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::SipNotify {
+            .execute_command(RwiCommandPayload::SipNotify {
                 call_id: "call-1".into(),
                 event: "check-sync".into(),
                 content_type: "application/simple-message-summary".into(),
@@ -3655,7 +3676,7 @@ mod tests {
     async fn test_sip_options_ping_no_server() {
         let processor = create_test_processor();
         let result = processor
-            .process_command(RwiCommandPayload::SipOptionsPing {
+            .execute_command(RwiCommandPayload::SipOptionsPing {
                 call_id: "call-1".into(),
             })
             .await;
@@ -3676,7 +3697,7 @@ mod tests {
         let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
 
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3703,7 +3724,7 @@ mod tests {
 
         // Create first conference
         processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3717,7 +3738,7 @@ mod tests {
 
         // Try to create duplicate
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3738,7 +3759,7 @@ mod tests {
         let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
 
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "external".to_string(),
@@ -3764,7 +3785,7 @@ mod tests {
         let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
 
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceAdd {
+            .execute_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
                 call_id: "call-1".into(),
             })
@@ -3782,7 +3803,7 @@ mod tests {
 
         // Create conference
         processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3796,7 +3817,7 @@ mod tests {
 
         // Destroy it
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceDestroy {
+            .execute_command(RwiCommandPayload::ConferenceDestroy {
                 conf_id: "room-1".into(),
             })
             .await;
@@ -3816,7 +3837,7 @@ mod tests {
         let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
 
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceDestroy {
+            .execute_command(RwiCommandPayload::ConferenceDestroy {
                 conf_id: "nonexistent".into(),
             })
             .await;
@@ -3832,7 +3853,7 @@ mod tests {
 
         // Create conference but don't add any calls
         processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3846,7 +3867,7 @@ mod tests {
 
         // Try to mute a call that's not in the conference
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceMute {
+            .execute_command(RwiCommandPayload::ConferenceMute {
                 conf_id: "room-1".into(),
                 call_id: "call-1".into(),
             })
@@ -3868,7 +3889,7 @@ mod tests {
 
         // Create conference with max 2 members
         processor
-            .process_command(RwiCommandPayload::ConferenceCreate(
+            .execute_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
                     conf_id: "room-1".into(),
                     backend: "internal".to_string(),
@@ -3884,7 +3905,7 @@ mod tests {
         let _handle1 =
             create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceAdd {
+            .execute_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
                 call_id: "call-1".into(),
             })
@@ -3895,7 +3916,7 @@ mod tests {
         let _handle2 =
             create_test_call(&registry, "call-2", "1002", "2001", DialDirection::Inbound);
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceAdd {
+            .execute_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
                 call_id: "call-2".into(),
             })
@@ -3906,7 +3927,7 @@ mod tests {
         let _handle3 =
             create_test_call(&registry, "call-3", "1003", "2002", DialDirection::Inbound);
         let result = processor
-            .process_command(RwiCommandPayload::ConferenceAdd {
+            .execute_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
                 call_id: "call-3".into(),
             })
@@ -3925,7 +3946,7 @@ mod tests {
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
+            .execute_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
                 call_id: "call-1".into(),
                 queue_id: "support".into(),
                 priority: None,
@@ -3937,7 +3958,7 @@ mod tests {
 
         // Set priority
         let result = processor
-            .process_command(RwiCommandPayload::QueueSetPriority {
+            .execute_command(RwiCommandPayload::QueueSetPriority {
                 call_id: "call-1".into(),
                 priority: 10,
             })
@@ -3956,7 +3977,7 @@ mod tests {
 
         // Try to set priority - should fail
         let result = processor
-            .process_command(RwiCommandPayload::QueueSetPriority {
+            .execute_command(RwiCommandPayload::QueueSetPriority {
                 call_id: "call-1".into(),
                 priority: 10,
             })
@@ -3974,7 +3995,7 @@ mod tests {
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
+            .execute_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
                 call_id: "call-1".into(),
                 queue_id: "support".into(),
                 priority: None,
@@ -3986,7 +4007,7 @@ mod tests {
 
         // Assign agent
         let result = processor
-            .process_command(RwiCommandPayload::QueueAssignAgent {
+            .execute_command(RwiCommandPayload::QueueAssignAgent {
                 call_id: "call-1".into(),
                 agent_id: "agent-42".into(),
             })
@@ -4003,7 +4024,7 @@ mod tests {
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
-            .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
+            .execute_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
                 call_id: "call-1".into(),
                 queue_id: "support".into(),
                 priority: None,
@@ -4015,7 +4036,7 @@ mod tests {
 
         // Requeue to different queue
         let result = processor
-            .process_command(RwiCommandPayload::QueueRequeue {
+            .execute_command(RwiCommandPayload::QueueRequeue {
                 call_id: "call-1".into(),
                 queue_id: "sales".into(),
                 priority: Some(5),
@@ -4048,7 +4069,7 @@ mod tests {
 
         // Mask a segment
         let result = processor
-            .process_command(RwiCommandPayload::RecordMaskSegment {
+            .execute_command(RwiCommandPayload::RecordMaskSegment {
                 call_id: "call-1".into(),
                 recording_id: "rec-1".into(),
                 start_secs: 30,
@@ -4069,7 +4090,7 @@ mod tests {
 
         // Try to mask segment - should fail
         let result = processor
-            .process_command(RwiCommandPayload::RecordMaskSegment {
+            .execute_command(RwiCommandPayload::RecordMaskSegment {
                 call_id: "call-1".into(),
                 recording_id: "rec-1".into(),
                 start_secs: 30,

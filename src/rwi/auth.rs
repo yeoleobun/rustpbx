@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::rwi::{AuthError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,11 +111,14 @@ impl RwiAuth {
         Self { tokens, contexts }
     }
 
-    pub fn validate_token(&self, token: &str) -> Option<RwiIdentity> {
-        self.tokens.get(token).map(|t| RwiIdentity {
-            token: t.token.clone(),
-            scopes: t.scopes.clone(),
-        })
+    pub fn validate_token(&self, token: &str) -> Result<RwiIdentity> {
+        self.tokens
+            .get(token)
+            .map(|t| RwiIdentity {
+                token: t.token.clone(),
+                scopes: t.scopes.clone(),
+            })
+            .ok_or(AuthError::InvalidToken.into())
     }
 
     pub fn get_context(&self, name: &str) -> Option<&RwiContextConfig> {
@@ -175,9 +179,7 @@ mod tests {
         let config = create_test_config();
         let auth = RwiAuth::new(&config);
 
-        let identity = auth.validate_token("token1");
-        assert!(identity.is_some());
-        let identity = identity.unwrap();
+        let identity = auth.validate_token("token1").unwrap();
         assert_eq!(identity.token, "token1");
         assert_eq!(identity.scopes, vec!["call.control"]);
     }
@@ -188,7 +190,7 @@ mod tests {
         let auth = RwiAuth::new(&config);
 
         let identity = auth.validate_token("invalid-token");
-        assert!(identity.is_none());
+        assert!(matches!(identity, Err(crate::rwi::Error::Auth(AuthError::InvalidToken))));
     }
 
     #[test]

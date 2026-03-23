@@ -45,16 +45,6 @@ pub struct RwiCommandMessage {
     pub command: RwiCommandPayload,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RwiRequestEnvelope {
-    #[serde(rename = "rwi")]
-    pub version: Option<String>,
-    pub action_id: Option<String>,
-    pub action: Option<String>,
-    #[serde(default)]
-    pub params: Option<serde_json::Value>,
-}
-
 #[derive(Debug, Clone)]
 pub enum RwiCommandPayload {
     Subscribe {
