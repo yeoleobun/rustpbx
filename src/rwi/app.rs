@@ -16,27 +16,22 @@ pub struct RwiAddon {
     gateway: Arc<RwLock<RwiGateway>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RwiAppParams {
-    #[serde(default = "default_context_name", deserialize_with = "deserialize_string_or_default")]
+    #[serde(default = "default_context_name")]
     context: String,
-    #[serde(default, deserialize_with = "deserialize_option_string")]
+    #[serde(default)]
     session_id: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MediaPlayEventData {
-    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     audio_file: String,
-    #[serde(default = "default_track_id", deserialize_with = "deserialize_string_or_default")]
+    #[serde(default = "default_track_id")]
     track_id: String,
-    #[serde(default, deserialize_with = "deserialize_bool_or_default")]
+    #[serde(default)]
     interrupt_on_dtmf: bool,
-    #[serde(
-        rename = "loop",
-        default,
-        deserialize_with = "deserialize_bool_or_default"
-    )]
+    #[serde(rename = "loop", default)]
     loop_playback: bool,
 }
 
@@ -46,39 +41,6 @@ fn default_context_name() -> String {
 
 fn default_track_id() -> String {
     "default".to_string()
-}
-
-fn deserialize_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::String(value)) => value,
-        _ => String::new(),
-    })
-}
-
-fn deserialize_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::String(value)) => Some(value),
-        _ => None,
-    })
-}
-
-fn deserialize_bool_or_default<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::Bool(value)) => value,
-        _ => false,
-    })
 }
 
 impl RwiAddon {
@@ -99,7 +61,7 @@ impl crate::call::CallAppFactory for RwiAddon {
             return None;
         }
 
-        let parsed = serde_json::from_value::<RwiAppParams>(params.clone()).unwrap_or_default();
+        let parsed = serde_json::from_value::<RwiAppParams>(params.clone()).ok()?;
 
         Some(Box::new(RwiApp::new(
             parsed.context,
@@ -252,8 +214,10 @@ impl CallApp for RwiApp {
     ) -> anyhow::Result<AppAction> {
         match event {
             AppEvent::Custom { ref name, ref data } if name == "media.play" => {
-                let media_play = serde_json::from_value::<MediaPlayEventData>(data.clone())
-                    .unwrap_or_default();
+                let media_play = match serde_json::from_value::<MediaPlayEventData>(data.clone()) {
+                    Ok(media_play) => media_play,
+                    Err(_) => return Ok(AppAction::Continue),
+                };
 
                 if !media_play.audio_file.is_empty() {
                     match controller
