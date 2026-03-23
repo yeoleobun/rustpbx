@@ -2,15 +2,20 @@ use crate::callrecord::CallRecordHangupReason;
 use crate::proxy::proxy_call::call_leg::{CallLeg, CallLegDirection};
 use crate::proxy::proxy_call::media_endpoint::MediaEndpoint;
 use crate::proxy::proxy_call::media_peer::{MediaPeer, VoiceEnginePeer};
-use crate::proxy::proxy_call::session::{CallSession, OriginatedSessionEvent};
-use crate::proxy::proxy_call::state::MidDialogLeg;
+use crate::proxy::proxy_call::reporter::CallReporter;
+use crate::proxy::proxy_call::session::{CallSession, OriginatedDialParams, OriginatedSessionEvent};
+use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared, MidDialogLeg};
+use crate::proxy::server::SipServerRef;
 use anyhow::{Result, anyhow};
+use audio_codec::CodecType;
 use rsip::StatusCode;
 use rsip::Uri;
 use rsipstack::dialog::dialog::DialogState;
+use rsipstack::dialog::invitation::InviteOption;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::session::SessionActionInbox;
@@ -438,5 +443,160 @@ impl OriginatedRuntime {
         if let Some(tx) = tx {
             let _ = tx.send(event);
         }
+    }
+
+    // ── Bootstrap ────────────────────────────────────────────────────
+
+    /// Bootstrap an RWI-originated session: no inbound server dialog,
+    /// single outbound target dialed directly.
+    ///
+    /// Returns the session handle and shared state so the RWI layer can
+    /// send commands and observe state.
+    pub async fn serve(
+        server: SipServerRef,
+        call_id: String,
+        invite_option: InviteOption,
+        exported_peer: Arc<VoiceEnginePeer>,
+        cancel_token: CancellationToken,
+        timeout_secs: u64,
+        caller_display: Option<String>,
+        callee_display: Option<String>,
+        event_tx: Option<mpsc::UnboundedSender<OriginatedSessionEvent>>,
+    ) -> (CallSessionHandle, CallSessionShared) {
+        use crate::call::{DialDirection, Dialplan, DialplanFlow, DialStrategy, MediaConfig};
+        use crate::proxy::proxy_call::state::SessionKind;
+
+        // Build a synthetic request for reporting — minimal INVITE with caller/callee URIs
+        let caller_uri_str = caller_display.clone().unwrap_or_else(|| "sip:rwi@local".to_string());
+        let callee_uri_str = callee_display.clone().unwrap_or_else(|| invite_option.callee.to_string());
+        let synthetic_request = rsip::Request {
+            method: rsip::Method::Invite,
+            uri: invite_option.callee.clone(),
+            version: rsip::Version::V2,
+            headers: rsip::Headers::from(vec![
+                rsip::Header::From(format!("<{}>", caller_uri_str).into()),
+                rsip::Header::To(format!("<{}>", callee_uri_str).into()),
+                rsip::Header::CallId(call_id.clone().into()),
+            ]),
+            body: invite_option.offer.clone().unwrap_or_default(),
+        };
+
+        let dialplan = Arc::new(Dialplan {
+            direction: DialDirection::Outbound,
+            session_id: Some(call_id.clone()),
+            call_id: Some(call_id.clone()),
+            original: Arc::new(synthetic_request),
+            caller_display_name: caller_display.clone(),
+            caller: rsip::Uri::try_from(caller_uri_str.as_str()).ok(),
+            caller_contact: None,
+            flow: DialplanFlow::Targets(DialStrategy::Sequential(vec![])),
+            max_ring_time: timeout_secs as u32,
+            recording: Default::default(),
+            ringback: Default::default(),
+            media: MediaConfig {
+                proxy_mode: server.proxy_config.media_proxy,
+                external_ip: server.rtp_config.external_ip.clone(),
+                rtp_start_port: server.rtp_config.start_port,
+                rtp_end_port: server.rtp_config.end_port,
+                webrtc_port_start: server.rtp_config.webrtc_start_port,
+                webrtc_port_end: server.rtp_config.webrtc_end_port,
+                ice_servers: server.rtp_config.ice_servers.clone(),
+                enable_latching: server.proxy_config.enable_latching,
+            },
+            max_call_duration: Some(Duration::from_secs(3600)),
+            call_timeout: Duration::from_secs(timeout_secs),
+            failure_action: Default::default(),
+            enable_sipflow: true,
+            call_forwarding: None,
+            voicemail_enabled: false,
+            route_invite: None,
+            with_original_headers: false,
+            extensions: http::Extensions::new(),
+            allow_codecs: vec![
+                CodecType::G729,
+                CodecType::G722,
+                CodecType::PCMU,
+                CodecType::PCMA,
+                #[cfg(feature = "opus")]
+                CodecType::Opus,
+                CodecType::TelephoneEvent,
+            ],
+            passthrough_failure: false,
+        });
+
+        let context = CallContext {
+            session_id: call_id.clone(),
+            kind: SessionKind::RwiSingleLeg,
+            dialplan: dialplan.clone(),
+            cookie: crate::call::cookie::TransactionCookie::default(),
+            start_time: Instant::now(),
+            media_config: dialplan.media.clone(),
+            original_caller: caller_display.unwrap_or_default(),
+            original_callee: callee_display.unwrap_or_default(),
+            max_forwards: 70,
+        };
+
+        let reporter = CallReporter {
+            server: server.clone(),
+            context: context.clone(),
+            call_record_sender: None,
+        };
+
+        let session_shared = CallSessionShared::new(
+            call_id.clone(),
+            DialDirection::Outbound,
+            context.dialplan.caller.as_ref().map(|c| c.to_string()),
+            Some(invite_option.callee.to_string()),
+            Some(server.active_call_registry.clone()),
+        );
+
+        let offer_sdp_string = invite_option
+            .offer
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).to_string());
+
+        let mut session = Box::new(CallSession::new(
+            server.clone(),
+            server.dialog_layer.clone(),
+            cancel_token.clone(),
+            None,
+            context,
+            None, // no server dialog for originated calls
+            true, // use_media_proxy — originated calls always proxy media
+            None, // no recorder option
+            exported_peer,
+            None, // no target leg yet — created during dial
+            session_shared.clone(),
+            Some(reporter),
+        ));
+
+        // Set offer SDP on exported leg only (target doesn't exist yet)
+        if let Some(ref sdp) = offer_sdp_string {
+            session.exported_leg.media.offer_sdp = Some(sdp.clone());
+        }
+
+        // Store originated dial params for process() to use
+        session.originated_dial_params = Some(OriginatedDialParams {
+            invite_option,
+            timeout_secs,
+            event_tx,
+        });
+
+        let (handle, action_rx) = CallSessionHandle::with_shared(session_shared.clone());
+        session.register_active_call(handle.clone());
+
+        // Create target event channel — target_state_tx stored for dial to set on leg
+        let (target_state_tx, target_state_rx) = mpsc::unbounded_channel();
+        session.target_dialog_event_tx = Some(target_state_tx);
+
+        let action_inbox = SessionActionInbox::new(action_rx);
+
+        crate::utils::spawn(async move {
+            session
+                .process(None, target_state_rx, action_inbox, None)
+                .await
+        });
+
+        (handle, session_shared)
     }
 }

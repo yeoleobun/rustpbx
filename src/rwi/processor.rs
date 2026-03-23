@@ -592,7 +592,7 @@ impl RwiCommandProcessor {
         // Create event channel for originated session lifecycle events
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let (handle, shared) = CallSession::serve_originated(
+        let (handle, shared) = crate::proxy::proxy_call::originated_runtime::OriginatedRuntime::serve(
             server.clone(),
             call_id.clone(),
             invite_option,

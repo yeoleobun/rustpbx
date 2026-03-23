@@ -1,14 +1,25 @@
+use crate::call::sip::ServerDialogGuard;
 use crate::call::{CallForwardingMode, DialStrategy, Location, TransferEndpoint};
+use crate::callrecord::CallRecordSender;
 use crate::config::RouteResult;
+use crate::proxy::proxy_call::media_peer::VoiceEnginePeer;
 use crate::proxy::proxy_call::queue_flow::QueueFlow;
-use crate::proxy::proxy_call::session::{ActionInbox, CallSession};
+use crate::proxy::proxy_call::reporter::CallReporter;
+use crate::proxy::proxy_call::session::{ActionInbox, CallSession, SessionActionInbox};
+use crate::proxy::proxy_call::sip_leg::SipLeg;
+use crate::proxy::proxy_call::state::{CallContext, CallSessionHandle, CallSessionShared};
 use crate::proxy::proxy_call::target_runtime::TargetRuntime;
 use crate::proxy::routing::matcher::RouteResourceLookup;
+use crate::proxy::server::SipServerRef;
 use anyhow::{Result, anyhow};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rsip::StatusCode;
 use rsip::Uri;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Proxy-mode runtime helper. Contains orchestration logic specific to
@@ -19,6 +30,189 @@ use tracing::{debug, info, warn};
 pub(crate) struct ProxySessionRuntime;
 
 impl ProxySessionRuntime {
+    // ── Bootstrap ────────────────────────────────────────────────────
+
+    /// Proxy-mode session bootstrap: validate SDP, create server dialog,
+    /// build session, and spawn the process task with server dialog event loop.
+    pub async fn serve(
+        server: SipServerRef,
+        context: CallContext,
+        tx: &mut rsipstack::transaction::transaction::Transaction,
+        cancel_token: CancellationToken,
+        call_record_sender: Option<CallRecordSender>,
+    ) -> Result<()> {
+        if tx.original.body.is_empty() {
+            info!(
+                session_id = %context.session_id,
+                "Rejecting call with 488 Not Acceptable Here due to missing SDP"
+            );
+            tx.reply(StatusCode::NotAcceptableHere).await?;
+            return Ok(());
+        }
+        let (state_tx, state_rx) = mpsc::unbounded_channel();
+        let local_contact = context
+            .dialplan
+            .caller_contact
+            .as_ref()
+            .map(|c| c.uri.clone())
+            .or_else(|| server.default_contact_uri());
+
+        let server_dialog = server.dialog_layer.get_or_create_server_invite(
+            tx,
+            state_tx,
+            None,
+            local_contact.clone(),
+        )?;
+
+        info!(
+            session_id = %context.session_id,
+            dialog_id = %server_dialog.id(),
+            "Server dialog created"
+        );
+
+        let initial_request = server_dialog.initial_request();
+        let offer_sdp = String::from_utf8_lossy(initial_request.body()).to_string();
+
+        if !offer_sdp.trim().is_empty() {
+            if let Err(e) = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer_sdp)
+            {
+                info!(
+                    session_id = %context.session_id,
+                    error = %e,
+                    "Rejecting call with 400 Bad Request due to malformed SDP"
+                );
+                let _ = server_dialog.reject(Some(StatusCode::BadRequest), None);
+                return Ok(());
+            }
+        }
+
+        let all_webrtc_target = context.dialplan.all_webrtc_target();
+        let use_media_proxy = CallSession::check_media_proxy(
+            &context,
+            &offer_sdp,
+            &server.proxy_config.media_proxy,
+            all_webrtc_target,
+        );
+
+        info!(
+            session_id = %context.session_id,
+            server_dialog_id = %server_dialog.id(),
+            use_media_proxy,
+            all_webrtc_target,
+            "starting proxy call processing"
+        );
+
+        // Only create recorder when:
+        // 1. Recording is enabled and auto_start is true
+        // 2. AND no sipflow backend is configured (to avoid duplicate storage)
+        let has_sipflow_backend = server
+            .sip_flow
+            .as_ref()
+            .and_then(|sf| sf.backend())
+            .is_some();
+
+        let recorder_option = if context.dialplan.recording.enabled
+            && context.dialplan.recording.auto_start
+            && !has_sipflow_backend
+        {
+            context.dialplan.recording.option.clone()
+        } else {
+            None
+        };
+
+        let reporter = CallReporter {
+            server: server.clone(),
+            context: context.clone(),
+            call_record_sender: call_record_sender.clone(),
+        };
+
+        let exported_media_builder = crate::media::MediaStreamBuilder::new()
+            .with_id(format!("{}-caller", context.session_id))
+            .with_cancel_token(cancel_token.child_token());
+        let exported_peer = Arc::new(VoiceEnginePeer::new(Arc::new(exported_media_builder.build())));
+
+        let session_shared = CallSessionShared::new(
+            context.session_id.clone(),
+            context.dialplan.direction,
+            context.dialplan.caller.as_ref().map(|c| c.to_string()),
+            context
+                .dialplan
+                .first_target()
+                .map(|location| location.aor.to_string()),
+            Some(server.active_call_registry.clone()),
+        );
+
+        let mut session = Box::new(CallSession::new(
+            server.clone(),
+            server.dialog_layer.clone(),
+            cancel_token.clone(),
+            call_record_sender.clone(),
+            context.clone(),
+            Some(server_dialog.clone()),
+            use_media_proxy,
+            recorder_option,
+            exported_peer,
+            None, // target leg created lazily via ensure_target_leg()
+            session_shared.clone(),
+            Some(reporter),
+        ));
+
+        session.exported_leg.sip.supports_trickle_ice =
+            SipLeg::has_trickle_ice_support(&initial_request.headers);
+
+        // Store caller offer SDP; target offer will be set when target leg is created
+        session.exported_leg.media.offer_sdp = Some(offer_sdp);
+
+        // In serve(), the server dialog was just created above — safe to expect.
+        let caller_dialog_id = session.exported_leg.server_dialog_id()
+            .expect("serve() always creates a server dialog");
+        let dialog_guard =
+            ServerDialogGuard::new(server.dialog_layer.clone(), caller_dialog_id);
+        let (handle, action_rx) = CallSessionHandle::with_shared(session_shared.clone());
+        session.register_active_call(handle);
+
+        let (target_state_tx, target_state_rx) = mpsc::unbounded_channel();
+        session.target_dialog_event_tx = Some(target_state_tx);
+
+        let action_inbox = SessionActionInbox::new(action_rx);
+
+        let mut server_dialog_clone = session.exported_leg.clone_server_dialog()
+            .expect("serve() always creates a server dialog");
+        crate::utils::spawn(async move {
+            session
+                .process(Some(state_rx), target_state_rx, action_inbox, Some(dialog_guard))
+                .await
+        });
+        let ring_time_secs = context.dialplan.max_ring_time.clamp(30, 120);
+        let max_setup_duration = Duration::from_secs(ring_time_secs as u64);
+        let teardown_duration = Duration::from_secs(2);
+        let mut timeout = tokio::time::sleep(max_setup_duration).boxed();
+        let mut canceld = false;
+        loop {
+            tokio::select! {
+                r = server_dialog_clone.handle(tx) => {
+                    debug!(session_id = %context.session_id, "Server dialog handle returned");
+                    if let Err(ref e) = r {
+                        warn!(session_id = %context.session_id, error = %e, "Server dialog handle returned error, cancelling call");
+                        cancel_token.cancel();
+                    }
+                    break;
+                }
+                _ = cancel_token.cancelled(), if !canceld => {
+                    debug!(session_id = %context.session_id, "Call cancelled via token during setup");
+                    canceld = true;
+                    timeout = tokio::time::sleep(teardown_duration).boxed();
+                }
+                _ = &mut timeout => {
+                     warn!(session_id = %context.session_id, "Call setup timed out (180s), forcing cancellation");
+                     cancel_token.cancel();
+                     break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ── Target orchestration ──────────────────────────────────────────
 
     /// Run targets according to the dial strategy (sequential or parallel).

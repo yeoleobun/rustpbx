@@ -138,7 +138,9 @@ impl CallSessionBuilder {
             max_forwards: self.max_forwards,
         };
 
-        CallSession::serve(server, context, tx, cancel_token, self.call_record_sender).await
+        crate::proxy::proxy_call::proxy_runtime::ProxySessionRuntime::serve(
+            server, context, tx, cancel_token, self.call_record_sender,
+        ).await
     }
 
     pub fn report_failure(
