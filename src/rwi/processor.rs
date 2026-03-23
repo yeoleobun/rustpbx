@@ -400,106 +400,108 @@ impl RwiCommandProcessor {
                 registry.upsert(entry, handle);
             }
 
-            // Drain state_rx events until the invitation resolves or times out
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs as u64)) => {
-                    let gw = gateway.read().await;
-                    gw.send_event_to_call_owner(&call_id, &RwiEvent::CallNoAnswer { call_id: call_id.clone() });
-                    registry.remove(&call_id);
-                }
-                result = async {
-                    loop {
-                        tokio::select! {
-                            res = &mut invitation => {
-                                break res;
-                            }
-                            state = state_rx.recv() => {
-                                match state {
-                                    Some(rsipstack::dialog::dialog::DialogState::Calling(_)) => {
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallRinging { call_id: call_id.clone() },
-                                        );
-                                    }
-                                    Some(rsipstack::dialog::dialog::DialogState::Early(_, _)) => {
-                                        let gw = gateway.read().await;
-                                        gw.send_event_to_call_owner(
-                                            &call_id,
-                                            &RwiEvent::CallEarlyMedia { call_id: call_id.clone() },
-                                        );
-                                    }
-                                    Some(rsipstack::dialog::dialog::DialogState::Terminated(_, _)) => {
-                                        // Will be handled when invitation resolves
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+            let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs as u64));
+            tokio::pin!(timeout);
+
+            loop {
+                tokio::select! {
+                    _ = &mut timeout => {
+                        let gw = gateway.read().await;
+                        gw.send_event_to_call_owner(
+                            &call_id,
+                            &RwiEvent::CallNoAnswer { call_id: call_id.clone() },
+                        );
+                        registry.remove(&call_id);
+                        break;
                     }
-                } => {
-                    match result {
-                        Ok((_dialog_id, Some(resp))) if resp.status_code.kind() == rsip::StatusCodeKind::Successful => {
-                            {
-                                use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
-                                use crate::proxy::proxy_call::state::{CallSessionHandle, CallSessionShared};
-                                use crate::call::DialDirection;
-                                let shared = CallSessionShared::new(
-                                    call_id.clone(),
-                                    DialDirection::Outbound,
-                                    Some(caller_display.clone()),
-                                    Some(callee_display.clone()),
-                                    Some(registry.clone()),
-                                );
-                                let (handle, _action_rx) = CallSessionHandle::with_shared(shared);
-                                let entry = ActiveProxyCallEntry {
-                                    session_id: call_id.clone(),
-                                    caller: Some(caller_display),
-                                    callee: Some(callee_display),
-                                    direction: "outbound".to_string(),
-                                    started_at: chrono::Utc::now(),
-                                    answered_at: Some(chrono::Utc::now()),
-                                    status: ActiveProxyCallStatus::Talking,
-                                };
-                                registry.upsert(entry, handle);
-                            }
-                            let gw = gateway.read().await;
-                            gw.send_event_to_call_owner(
-                                &call_id,
-                                &RwiEvent::CallAnswered { call_id: call_id.clone() },
-                            );
-                        }
-                        Ok((_dialog_id, resp_opt)) => {
-                            let sip_status = resp_opt.as_ref().map(|r| r.status_code.code());
-                            let gw = gateway.read().await;
-                            if sip_status == Some(486) || sip_status == Some(600) {
+                    result = &mut invitation => {
+                        match result {
+                            Ok((_dialog_id, Some(resp))) if resp.status_code.kind() == rsip::StatusCodeKind::Successful => {
+                                {
+                                    use crate::call::DialDirection;
+                                    use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
+                                    use crate::proxy::proxy_call::state::{CallSessionHandle, CallSessionShared};
+
+                                    let shared = CallSessionShared::new(
+                                        call_id.clone(),
+                                        DialDirection::Outbound,
+                                        Some(caller_display.clone()),
+                                        Some(callee_display.clone()),
+                                        Some(registry.clone()),
+                                    );
+                                    let (handle, _action_rx) = CallSessionHandle::with_shared(shared);
+                                    let entry = ActiveProxyCallEntry {
+                                        session_id: call_id.clone(),
+                                        caller: Some(caller_display),
+                                        callee: Some(callee_display),
+                                        direction: "outbound".to_string(),
+                                        started_at: chrono::Utc::now(),
+                                        answered_at: Some(chrono::Utc::now()),
+                                        status: ActiveProxyCallStatus::Talking,
+                                    };
+                                    registry.upsert(entry, handle);
+                                }
+                                let gw = gateway.read().await;
                                 gw.send_event_to_call_owner(
                                     &call_id,
-                                    &RwiEvent::CallBusy { call_id: call_id.clone() },
+                                    &RwiEvent::CallAnswered { call_id: call_id.clone() },
                                 );
-                            } else {
+                            }
+                            Ok((_dialog_id, resp_opt)) => {
+                                let sip_status = resp_opt.as_ref().map(|r| r.status_code.code());
+                                let gw = gateway.read().await;
+                                if sip_status == Some(486) || sip_status == Some(600) {
+                                    gw.send_event_to_call_owner(
+                                        &call_id,
+                                        &RwiEvent::CallBusy { call_id: call_id.clone() },
+                                    );
+                                } else {
+                                    gw.send_event_to_call_owner(
+                                        &call_id,
+                                        &RwiEvent::CallHangup {
+                                            call_id: call_id.clone(),
+                                            reason: Some("originate_failed".to_string()),
+                                            sip_status,
+                                        },
+                                    );
+                                }
+                                registry.remove(&call_id);
+                            }
+                            Err(e) => {
+                                let gw = gateway.read().await;
                                 gw.send_event_to_call_owner(
                                     &call_id,
                                     &RwiEvent::CallHangup {
                                         call_id: call_id.clone(),
-                                        reason: Some("originate_failed".to_string()),
-                                        sip_status,
+                                        reason: Some(e.to_string()),
+                                        sip_status: None,
                                     },
                                 );
+                                registry.remove(&call_id);
                             }
-                            registry.remove(&call_id);
                         }
-                        Err(e) => {
-                            let gw = gateway.read().await;
-                            gw.send_event_to_call_owner(
-                                &call_id,
-                                &RwiEvent::CallHangup {
-                                    call_id: call_id.clone(),
-                                    reason: Some(e.to_string()),
-                                    sip_status: None,
-                                },
-                            );
-                            registry.remove(&call_id);
+                        break;
+                    }
+                    state = state_rx.recv() => {
+                        match state {
+                            Some(rsipstack::dialog::dialog::DialogState::Calling(_)) => {
+                                let gw = gateway.read().await;
+                                gw.send_event_to_call_owner(
+                                    &call_id,
+                                    &RwiEvent::CallRinging { call_id: call_id.clone() },
+                                );
+                            }
+                            Some(rsipstack::dialog::dialog::DialogState::Early(_, _)) => {
+                                let gw = gateway.read().await;
+                                gw.send_event_to_call_owner(
+                                    &call_id,
+                                    &RwiEvent::CallEarlyMedia { call_id: call_id.clone() },
+                                );
+                            }
+                            Some(rsipstack::dialog::dialog::DialogState::Terminated(_, _)) | None => {
+                                // Final outcome is handled by invitation resolution.
+                            }
+                            _ => {}
                         }
                     }
                 }
