@@ -1,7 +1,6 @@
 use crate::rwi::auth::RwiIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -11,7 +10,6 @@ pub struct RwiSession {
     pub subscribed_contexts: HashSet<String>,
     pub owned_calls: HashMap<String, CallOwnership>,
     pub supervisor_targets: HashMap<String, SupervisorMode>,
-    pub command_tx: mpsc::UnboundedSender<RwiCommandMessage>,
     pub created_at: std::time::Instant,
 }
 
@@ -36,13 +34,6 @@ pub enum SupervisorMode {
     Listen,
     Whisper,
     Barge,
-}
-
-#[derive(Debug, Clone)]
-pub struct RwiCommandMessage {
-    pub id: String,
-    pub call_id: Option<String>,
-    pub command: RwiCommandPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -880,17 +871,13 @@ impl From<RwiRequest> for RwiCommandPayload {
 }
 
 impl RwiSession {
-    pub fn new(
-        identity: RwiIdentity,
-        command_tx: mpsc::UnboundedSender<RwiCommandMessage>,
-    ) -> Self {
+    pub fn new(identity: RwiIdentity) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             identity,
             subscribed_contexts: HashSet::new(),
             owned_calls: HashMap::new(),
             supervisor_targets: HashMap::new(),
-            command_tx,
             created_at: std::time::Instant::now(),
         }
     }
@@ -971,7 +958,6 @@ impl RwiSession {
 mod tests {
     use super::*;
     use crate::rwi::auth::RwiIdentity;
-    use tokio::sync::mpsc;
 
     fn create_test_identity() -> RwiIdentity {
         RwiIdentity {
@@ -980,18 +966,15 @@ mod tests {
         }
     }
 
-    fn create_test_session() -> (RwiSession, mpsc::UnboundedReceiver<RwiCommandMessage>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn create_test_session() -> RwiSession {
         let identity = create_test_identity();
-        let session = RwiSession::new(identity, tx);
-        (session, rx)
+        RwiSession::new(identity)
     }
 
     #[test]
     fn test_session_creation() {
         let identity = create_test_identity();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = RwiSession::new(identity.clone(), tx);
+        let session = RwiSession::new(identity.clone());
 
         assert!(!session.id.is_empty());
         assert_eq!(session.identity.token, "test-token");
@@ -1001,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_subscribe() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
         session.subscribe(vec!["context1".to_string(), "context2".to_string()]);
 
         assert!(session.subscribed_contexts.contains("context1"));
@@ -1011,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_unsubscribe() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
         session.subscribe(vec!["context1".to_string(), "context2".to_string()]);
         session.unsubscribe(&["context1".to_string()]);
 

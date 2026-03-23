@@ -53,8 +53,7 @@ impl RwiGateway {
     /// Create a new RWI session and return the Arc handle.
     /// The caller must call [`set_session_event_sender`] with the WS sender after this.
     pub fn create_session(&mut self, identity: RwiIdentity) -> Arc<RwLock<RwiSession>> {
-        let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
-        let session = RwiSession::new(identity, command_tx);
+        let session = RwiSession::new(identity);
         let session_id = session.id.clone();
         let session = Arc::new(RwLock::new(session));
         self.sessions.insert(session_id.clone(), session.clone());

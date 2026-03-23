@@ -27,7 +27,7 @@ pub async fn rwi_ws_handler(
     _client_addr: ClientAddr,
     ws: WebSocketUpgrade,
     Query(params): Query<std::collections::HashMap<String, String>>,
-    Extension(auth): Extension<Arc<RwLock<RwiAuth>>>,
+    Extension(auth): Extension<Arc<RwiAuth>>,
     Extension(gateway): Extension<Arc<RwLock<RwiGateway>>>,
     Extension(call_registry): Extension<Arc<ActiveProxyCallRegistry>>,
     Extension(sip_server): Extension<Option<SipServerRef>>,
@@ -62,10 +62,9 @@ fn extract_token(
 async fn authenticate_request(
     headers: &HeaderMap,
     query_params: &std::collections::HashMap<String, String>,
-    auth: Arc<RwLock<RwiAuth>>,
+    auth: Arc<RwiAuth>,
 ) -> Result<RwiIdentity> {
     let token = extract_token(headers, query_params)?;
-    let auth = auth.read().await;
     auth.validate_token(&token)
 }
 

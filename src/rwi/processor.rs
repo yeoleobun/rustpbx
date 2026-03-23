@@ -20,56 +20,54 @@ use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct QueueState {
     queue_id: String,
-    _priority: Option<u32>,
-    _skills: Option<Vec<String>>,
-    _max_wait_secs: Option<u32>,
+    priority: Option<u32>,
+    skills: Option<Vec<String>>,
+    max_wait_secs: Option<u32>,
     is_hold: bool,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct RecordState {
     recording_id: String,
-    _mode: String,
-    _path: String,
+    mode: String,
+    path: String,
     is_paused: bool,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct RingbackState {
-    _target_call_id: String,
-    _source_call_id: String,
+    target_call_id: String,
+    source_call_id: String,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SupervisorState {
-    _supervisor_call_id: String,
-    _target_call_id: String,
-    _mode: SupervisorMode,
+    supervisor_call_id: String,
+    target_call_id: String,
+    mode: SupervisorMode,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct MediaStreamState {
-    #[allow(dead_code)]
     call_id: String,
-    #[allow(dead_code)]
     stream_id: String,
-    #[allow(dead_code)]
     direction: String,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct MediaInjectState {
-    #[allow(dead_code)]
     call_id: String,
-    #[allow(dead_code)]
     stream_id: String,
-    #[allow(dead_code)]
     codec: String,
-    #[allow(dead_code)]
     sample_rate: u32,
-    #[allow(dead_code)]
     channels: u32,
 }
 
@@ -856,9 +854,9 @@ impl RwiCommandProcessor {
         handle.set_queue_name(Some(req.queue_id.clone()));
         let queue_state = QueueState {
             queue_id: req.queue_id.clone(),
-            _priority: req.priority,
-            _skills: req.skills,
-            _max_wait_secs: req.max_wait_secs,
+            priority: req.priority,
+            skills: req.skills,
+            max_wait_secs: req.max_wait_secs,
             is_hold: false,
         };
         let mut states = self.queue_states.write().await;
@@ -963,7 +961,7 @@ impl RwiCommandProcessor {
         {
             let mut states = self.queue_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
-                state._priority = Some(priority);
+                state.priority = Some(priority);
             }
         }
 
@@ -1020,7 +1018,7 @@ impl RwiCommandProcessor {
                 let old = state.queue_id.clone();
                 state.queue_id = queue_id.to_string();
                 if let Some(p) = priority {
-                    state._priority = Some(p);
+                    state.priority = Some(p);
                 }
                 old
             } else {
@@ -1097,8 +1095,8 @@ impl RwiCommandProcessor {
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
         let record_state = RecordState {
             recording_id: recording_id.clone(),
-            _mode: req.mode,
-            _path: path,
+            mode: req.mode,
+            path,
             is_paused: false,
         };
         let mut states = self.record_states.write().await;
@@ -1582,8 +1580,8 @@ impl RwiCommandProcessor {
         self.get_handle(target_call_id).await?;
         self.get_handle(source_call_id).await?;
         let ringback_state = RingbackState {
-            _target_call_id: target_call_id.to_string(),
-            _source_call_id: source_call_id.to_string(),
+            target_call_id: target_call_id.to_string(),
+            source_call_id: source_call_id.to_string(),
         };
         let mut states = self.ringback_states.write().await;
         states.insert(target_call_id.to_string(), ringback_state);
@@ -1679,9 +1677,9 @@ impl RwiCommandProcessor {
         );
 
         let state = SupervisorState {
-            _supervisor_call_id: supervisor_call_id.to_string(),
-            _target_call_id: target_call_id.to_string(),
-            _mode: SupervisorMode::Listen,
+            supervisor_call_id: supervisor_call_id.to_string(),
+            target_call_id: target_call_id.to_string(),
+            mode: SupervisorMode::Listen,
         };
         let mut states = self.supervisor_states.write().await;
         states.insert(supervisor_call_id.to_string(), state);
@@ -1768,9 +1766,9 @@ impl RwiCommandProcessor {
         );
 
         let state = SupervisorState {
-            _supervisor_call_id: supervisor_call_id.to_string(),
-            _target_call_id: target_call_id.to_string(),
-            _mode: SupervisorMode::Whisper,
+            supervisor_call_id: supervisor_call_id.to_string(),
+            target_call_id: target_call_id.to_string(),
+            mode: SupervisorMode::Whisper,
         };
         let mut states = self.supervisor_states.write().await;
         states.insert(supervisor_call_id.to_string(), state);
@@ -1859,9 +1857,9 @@ impl RwiCommandProcessor {
         );
 
         let state = SupervisorState {
-            _supervisor_call_id: supervisor_call_id.to_string(),
-            _target_call_id: target_call_id.to_string(),
-            _mode: SupervisorMode::Barge,
+            supervisor_call_id: supervisor_call_id.to_string(),
+            target_call_id: target_call_id.to_string(),
+            mode: SupervisorMode::Barge,
         };
         let mut states = self.supervisor_states.write().await;
         states.insert(supervisor_call_id.to_string(), state);
@@ -1953,9 +1951,9 @@ impl RwiCommandProcessor {
 
         // Track supervisor state
         let state = SupervisorState {
-            _supervisor_call_id: supervisor_call_id.to_string(),
-            _target_call_id: target_call_id.to_string(),
-            _mode: SupervisorMode::Barge,
+            supervisor_call_id: supervisor_call_id.to_string(),
+            target_call_id: target_call_id.to_string(),
+            mode: SupervisorMode::Barge,
         };
         {
             let mut states = self.supervisor_states.write().await;
@@ -4060,8 +4058,8 @@ mod tests {
                 "call-1".to_string(),
                 RecordState {
                     recording_id: "rec-1".to_string(),
-                    _mode: "mixed".to_string(),
-                    _path: "/tmp/recording.wav".to_string(),
+                    mode: "mixed".to_string(),
+                    path: "/tmp/recording.wav".to_string(),
                     is_paused: false,
                 },
             );

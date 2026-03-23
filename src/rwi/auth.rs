@@ -3,7 +3,6 @@ use crate::rwi::{AuthError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RwiTokenConfig {
@@ -20,20 +19,16 @@ pub struct RwiContextConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RwiConfig {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_rwi_max_connections")]
     pub max_connections: usize,
-    #[serde(default = "default_rwi_max_calls_per_connection")]
     pub max_calls_per_connection: usize,
-    #[serde(default = "default_orphan_hold_secs")]
     pub orphan_hold_secs: u32,
-    #[serde(default = "default_originate_rate_limit")]
     pub originate_rate_limit: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<RwiTokenConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<RwiContextConfig>,
 }
 
@@ -41,30 +36,14 @@ impl Default for RwiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_connections: default_rwi_max_connections(),
-            max_calls_per_connection: default_rwi_max_calls_per_connection(),
-            orphan_hold_secs: default_orphan_hold_secs(),
-            originate_rate_limit: default_originate_rate_limit(),
+            max_connections: 2000,
+            max_calls_per_connection: 200,
+            orphan_hold_secs: 30,
+            originate_rate_limit: 10,
             tokens: Vec::new(),
             contexts: Vec::new(),
         }
     }
-}
-
-fn default_rwi_max_connections() -> usize {
-    2000
-}
-
-fn default_rwi_max_calls_per_connection() -> usize {
-    200
-}
-
-fn default_orphan_hold_secs() -> u32 {
-    30
-}
-
-fn default_originate_rate_limit() -> usize {
-    10
 }
 
 impl RwiConfig {
@@ -130,10 +109,10 @@ impl RwiAuth {
     }
 }
 
-pub type RwiAuthRef = Arc<RwLock<RwiAuth>>;
+pub type RwiAuthRef = Arc<RwiAuth>;
 
 pub fn create_rwi_auth(config: &Config) -> Option<RwiAuthRef> {
-    RwiConfig::from_config(config).map(|cfg| Arc::new(RwLock::new(RwiAuth::new(cfg))))
+    RwiConfig::from_config(config).map(|cfg| Arc::new(RwiAuth::new(cfg)))
 }
 
 #[cfg(test)]
