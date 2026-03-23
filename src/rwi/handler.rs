@@ -14,10 +14,11 @@ use axum::{
     extract::Query,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
@@ -30,55 +31,67 @@ pub async fn rwi_ws_handler(
     Extension(call_registry): Extension<Arc<ActiveProxyCallRegistry>>,
     Extension(sip_server): Extension<Option<SipServerRef>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let identity = match extract_token(&headers, &params) {
-        Ok(Some(token)) => {
-            let auth = auth.read().await;
-            auth.validate_token(&token)
-        }
-        Ok(None) | Err(_) => None,
-    };
+) -> Result<Response, AuthError> {
+    let identity = authenticate_request(&headers, &params, auth).await?;
 
-    let identity = match identity {
-        Some(i) => i,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(
-                    header::WWW_AUTHENTICATE,
-                    r#"Bearer realm="rwi", error="invalid_token""#,
-                )],
-            )
-                .into_response();
-        }
-    };
-
-    ws.protocols(["rwi-v1"])
+    Ok(ws
+        .protocols(["rwi-v1"])
         .on_upgrade(async move |socket| {
             handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
         })
-        .into_response()
+        .into_response())
 }
 
 fn extract_token(
     headers: &HeaderMap,
     query_params: &std::collections::HashMap<String, String>,
-) -> Result<Option<String>, ExtractTokenError> {
+) -> Result<String, AuthError> {
     if let Some(auth_header) = headers.get("authorization") {
         let auth_str = auth_header
             .to_str()
-            .map_err(|_| ExtractTokenError::InvalidAuthorizationHeader)?;
+            .map_err(|_| AuthError::InvalidAuthorizationHeader)?;
         if let Some(token) = auth_str.strip_prefix("Bearer ") {
-            return Ok(Some(token.to_string()));
+            return Ok(token.to_string());
         }
     }
 
-    Ok(query_params.get("token").cloned())
+    query_params
+        .get("token")
+        .cloned()
+        .ok_or(AuthError::MissingToken)
 }
 
-#[derive(Debug)]
-enum ExtractTokenError {
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("missing token")]
+    MissingToken,
+    #[error("invalid authorization header")]
     InvalidAuthorizationHeader,
+    #[error("invalid token")]
+    InvalidToken,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                header::WWW_AUTHENTICATE,
+                r#"Bearer realm="rwi", error="invalid_token""#,
+            )],
+        )
+            .into_response()
+    }
+}
+
+async fn authenticate_request(
+    headers: &HeaderMap,
+    query_params: &std::collections::HashMap<String, String>,
+    auth: Arc<RwLock<RwiAuth>>,
+) -> Result<RwiIdentity, AuthError> {
+    let token = extract_token(headers, query_params)?;
+    let auth = auth.read().await;
+    auth.validate_token(&token).ok_or(AuthError::InvalidToken)
 }
 
 /// Single unified WebSocket session loop.
@@ -121,7 +134,7 @@ async fn handle_websocket(
                             gateway.clone(),
                         )
                         .await
-                        .unwrap_or_else(HandleTextMessageError::into_response);
+                        .unwrap_or_else(Into::into);
                         if let Ok(json) = serde_json::to_string(&response) {
                             if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                 break;
@@ -291,7 +304,8 @@ fn error_response(action_id: &str, code: RwiErrorCode, message: impl Into<String
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{message}")]
 struct HandleTextMessageError {
     action_id: String,
     code: RwiErrorCode,
@@ -309,6 +323,12 @@ impl HandleTextMessageError {
 
     fn into_response(self) -> RwiResponse {
         error_response(&self.action_id, self.code, self.message)
+    }
+}
+
+impl From<HandleTextMessageError> for RwiResponse {
+    fn from(value: HandleTextMessageError) -> Self {
+        value.into_response()
     }
 }
 fn parse_action(
@@ -357,7 +377,7 @@ mod tests {
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
         let resp = handle_text_message(json, processor, "test-session", gateway)
             .await
-            .unwrap_or_else(HandleTextMessageError::into_response);
+            .unwrap_or_else(Into::into);
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
@@ -367,7 +387,7 @@ mod tests {
         headers.insert("authorization", "Bearer test-token-123".parse().unwrap());
         let params = std::collections::HashMap::new();
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Ok(Some("test-token-123".to_string())));
+        assert_eq!(token, Ok("test-token-123".to_string()));
     }
 
     #[test]
@@ -376,7 +396,7 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("token".to_string(), "query-token-456".to_string());
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Ok(Some("query-token-456".to_string())));
+        assert_eq!(token, Ok("query-token-456".to_string()));
     }
 
     #[test]
@@ -386,14 +406,14 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("token".to_string(), "query-token".to_string());
         let token = extract_token(&headers, &params);
-        assert_eq!(token, Ok(Some("header-token".to_string())));
+        assert_eq!(token, Ok("header-token".to_string()));
     }
 
         #[test]
     fn test_extract_token_missing() {
         let headers = axum::http::HeaderMap::new();
         let params = std::collections::HashMap::new();
-        assert_eq!(extract_token(&headers, &params), Ok(None));
+        assert!(matches!(extract_token(&headers, &params), Err(AuthError::MissingToken)));
     }
 
     // ---- Command processing tests ----
@@ -459,7 +479,7 @@ mod tests {
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
         let resp = handle_text_message("not json", processor, "sess", gateway)
             .await
-            .unwrap_or_else(HandleTextMessageError::into_response);
+            .unwrap_or_else(Into::into);
         let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");
