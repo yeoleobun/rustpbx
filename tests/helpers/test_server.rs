@@ -97,7 +97,7 @@ impl TestPbx {
             }],
             ..Default::default()
         };
-        let auth: RwiAuthRef = Arc::new(tokio::sync::RwLock::new(RwiAuth::new(&rwi_config)));
+        let auth: RwiAuthRef = Arc::new(RwiAuth::new(&rwi_config));
         let gateway: RwiGatewayRef = Arc::new(tokio::sync::RwLock::new(RwiGateway::new()));
 
         // ── Build Axum router with RWI endpoint ──────────────────────────────

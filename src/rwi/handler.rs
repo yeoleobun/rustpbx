@@ -82,13 +82,12 @@ async fn handle_websocket(
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let p = RwiCommandProcessor::new(call_registry, gateway.clone());
-    let p = if let Some(server) = sip_server {
-        p.with_sip_server(server)
+    let processor = RwiCommandProcessor::new(call_registry, gateway.clone());
+    let mut processor = if let Some(server) = sip_server {
+        processor.with_sip_server(server)
     } else {
-        p
+        processor
     };
-    let processor = Arc::new(p);
 
     let mut gw = gateway.write().await;
     let session = gw.create_session(identity.clone());
@@ -103,7 +102,7 @@ async fn handle_websocket(
                     Some(Ok(Message::Text(text))) => {
                         let response = RwiWireResponse(handle_text_message(
                             text.as_ref(),
-                            processor.clone(),
+                            &mut processor,
                             &session_id,
                             gateway.clone(),
                         )
@@ -143,7 +142,7 @@ async fn handle_websocket(
 /// Returns the typed response or a typed protocol error.
 async fn handle_text_message(
     text: &str,
-    processor: Arc<RwiCommandProcessor>,
+    processor: &mut RwiCommandProcessor,
     session_id: &str,
     gateway: Arc<RwLock<RwiGateway>>,
 ) -> Result<RwiResponse> {
@@ -296,17 +295,17 @@ mod tests {
     use crate::rwi::processor::RwiCommandProcessor;
     use std::sync::Arc;
 
-    fn create_test_processor() -> Arc<RwiCommandProcessor> {
+    fn create_test_processor() -> RwiCommandProcessor {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        Arc::new(RwiCommandProcessor::new(registry, gateway))
+        RwiCommandProcessor::new(registry, gateway)
     }
 
     async fn process_msg(json: &str) -> serde_json::Value {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
         let resp =
-            RwiWireResponse(handle_text_message(json, processor, "test-session", gateway).await);
+            RwiWireResponse(handle_text_message(json, &mut processor, "test-session", gateway).await);
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
@@ -407,10 +406,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_returns_error() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
         let resp =
-            RwiWireResponse(handle_text_message("not json", processor, "sess", gateway).await);
+            RwiWireResponse(handle_text_message("not json", &mut processor, "sess", gateway).await);
         let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");

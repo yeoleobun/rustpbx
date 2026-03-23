@@ -52,7 +52,7 @@ fn make_auth() -> RwiAuthRef {
         }],
         ..Default::default()
     };
-    Arc::new(tokio::sync::RwLock::new(RwiAuth::new(&config)))
+    Arc::new(RwiAuth::new(&config))
 }
 
 /// Start an in-process Axum server on an OS-assigned port.

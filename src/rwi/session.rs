@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_claim_call() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         let result = session.claim_call("call-001".to_string(), OwnershipMode::Control);
         assert!(result);
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_claim_call_in_mode() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.claim_call("call-001".to_string(), OwnershipMode::Control);
         assert!(session.owns_call_in_mode("call-001", &OwnershipMode::Control));
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_release_call() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.claim_call("call-001".to_string(), OwnershipMode::Control);
         assert!(session.owns_call("call-001"));
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_list_owned_calls() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.claim_call("call-001".to_string(), OwnershipMode::Control);
         session.claim_call("call-002".to_string(), OwnershipMode::Listen);
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_can_control_call() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.claim_call("call-001".to_string(), OwnershipMode::Control);
         assert!(session.can_control_call("call-001"));
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_supervisor_targets() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.add_supervisor_target("call-001".to_string(), SupervisorMode::Listen);
         assert!(session.is_supervisor_of("call-001"));
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_can_listen_to_call() {
-        let (mut session, _rx) = create_test_session();
+        let mut session = create_test_session();
 
         session.claim_call("call-001".to_string(), OwnershipMode::Control);
         assert!(session.can_listen_to_call("call-001"));

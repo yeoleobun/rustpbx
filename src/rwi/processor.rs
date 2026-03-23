@@ -86,14 +86,14 @@ pub struct RwiCommandProcessor {
     call_registry: Arc<ActiveProxyCallRegistry>,
     gateway: Arc<RwLock<RwiGateway>>,
     sip_server: Option<SipServerRef>,
-    queue_states: Arc<RwLock<HashMap<String, QueueState>>>,
-    record_states: Arc<RwLock<HashMap<String, RecordState>>>,
-    ringback_states: Arc<RwLock<HashMap<String, RingbackState>>>,
-    supervisor_states: Arc<RwLock<HashMap<String, SupervisorState>>>,
-    media_stream_states: Arc<RwLock<HashMap<String, MediaStreamState>>>,
-    media_inject_states: Arc<RwLock<HashMap<String, MediaInjectState>>>,
+    queue_states: HashMap<String, QueueState>,
+    record_states: HashMap<String, RecordState>,
+    ringback_states: HashMap<String, RingbackState>,
+    supervisor_states: HashMap<String, SupervisorState>,
+    media_stream_states: HashMap<String, MediaStreamState>,
+    media_inject_states: HashMap<String, MediaInjectState>,
     mixer_registry: Arc<media::mixer_registry::MixerRegistry>,
-    conference_states: Arc<RwLock<HashMap<String, ConferenceState>>>,
+    conference_states: HashMap<String, ConferenceState>,
 }
 
 impl RwiCommandProcessor {
@@ -105,14 +105,14 @@ impl RwiCommandProcessor {
             call_registry,
             gateway,
             sip_server: None,
-            queue_states: Arc::new(RwLock::new(HashMap::new())),
-            record_states: Arc::new(RwLock::new(HashMap::new())),
-            ringback_states: Arc::new(RwLock::new(HashMap::new())),
-            supervisor_states: Arc::new(RwLock::new(HashMap::new())),
-            media_stream_states: Arc::new(RwLock::new(HashMap::new())),
-            media_inject_states: Arc::new(RwLock::new(HashMap::new())),
+            queue_states: HashMap::new(),
+            record_states: HashMap::new(),
+            ringback_states: HashMap::new(),
+            supervisor_states: HashMap::new(),
+            media_stream_states: HashMap::new(),
+            media_inject_states: HashMap::new(),
             mixer_registry: Arc::new(media::mixer_registry::MixerRegistry::new()),
-            conference_states: Arc::new(RwLock::new(HashMap::new())),
+            conference_states: HashMap::new(),
         }
     }
 
@@ -122,7 +122,7 @@ impl RwiCommandProcessor {
     }
 
     pub async fn process_command(
-        &self,
+        &mut self,
         action_id: &str,
         command: RwiCommandPayload,
     ) -> crate::rwi::Result<CommandResult> {
@@ -132,7 +132,7 @@ impl RwiCommandProcessor {
     }
 
     async fn execute_command(
-        &self,
+        &mut self,
         command: RwiCommandPayload,
     ) -> std::result::Result<CommandResult, CommandError> {
         match command {
@@ -849,7 +849,10 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn queue_enqueue(&self, req: QueueEnqueueRequest) -> Result<CommandResult, CommandError> {
+    async fn queue_enqueue(
+        &mut self,
+        req: QueueEnqueueRequest,
+    ) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(&req.call_id).await?;
         handle.set_queue_name(Some(req.queue_id.clone()));
         let queue_state = QueueState {
@@ -859,8 +862,7 @@ impl RwiCommandProcessor {
             max_wait_secs: req.max_wait_secs,
             is_hold: false,
         };
-        let mut states = self.queue_states.write().await;
-        states.insert(req.call_id.clone(), queue_state);
+        self.queue_states.insert(req.call_id.clone(), queue_state);
         let event = RwiEvent::QueueJoined {
             call_id: req.call_id.clone(),
             queue_id: req.queue_id,
@@ -870,15 +872,11 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn queue_dequeue(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn queue_dequeue(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        let queue_id = {
-            let states = self.queue_states.read().await;
-            states.get(call_id).map(|s| s.queue_id.clone())
-        };
+        let queue_id = self.queue_states.get(call_id).map(|s| s.queue_id.clone());
         handle.set_queue_name(None);
-        let mut states = self.queue_states.write().await;
-        states.remove(call_id);
+        self.queue_states.remove(call_id);
         if let Some(qid) = queue_id {
             let event = RwiEvent::QueueLeft {
                 call_id: call_id.to_string(),
@@ -891,15 +889,12 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn queue_hold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn queue_hold(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        {
-            let mut states = self.queue_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                state.is_hold = true;
-            } else {
-                return Err(CommandError::CommandFailed("Call not in queue".to_string()));
-            }
+        if let Some(state) = self.queue_states.get_mut(call_id) {
+            state.is_hold = true;
+        } else {
+            return Err(CommandError::CommandFailed("Call not in queue".to_string()));
         }
         handle
             .send_command(SessionAction::PlayPrompt {
@@ -919,15 +914,12 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn queue_unhold(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn queue_unhold(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        {
-            let mut states = self.queue_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                state.is_hold = false;
-            } else {
-                return Err(CommandError::CommandFailed("Call not in queue".to_string()));
-            }
+        if let Some(state) = self.queue_states.get_mut(call_id) {
+            state.is_hold = false;
+        } else {
+            return Err(CommandError::CommandFailed("Call not in queue".to_string()));
         }
         handle
             .send_command(SessionAction::StopPlayback)
@@ -942,7 +934,7 @@ impl RwiCommandProcessor {
 
     /// Set priority for a call in queue
     async fn queue_set_priority(
-        &self,
+        &mut self,
         call_id: &str,
         priority: u32,
     ) -> Result<CommandResult, CommandError> {
@@ -950,19 +942,13 @@ impl RwiCommandProcessor {
         self.get_handle(call_id).await?;
 
         // Check if call is in queue
-        {
-            let states = self.queue_states.read().await;
-            if !states.contains_key(call_id) {
-                return Err(CommandError::CommandFailed("Call not in queue".to_string()));
-            }
+        if !self.queue_states.contains_key(call_id) {
+            return Err(CommandError::CommandFailed("Call not in queue".to_string()));
         }
 
         // Update priority in state
-        {
-            let mut states = self.queue_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                state.priority = Some(priority);
-            }
+        if let Some(state) = self.queue_states.get_mut(call_id) {
+            state.priority = Some(priority);
         }
 
         info!(call_id = %call_id, priority = %priority, "Queue priority updated");
@@ -971,7 +957,7 @@ impl RwiCommandProcessor {
 
     /// Assign agent to a call in queue
     async fn queue_assign_agent(
-        &self,
+        &mut self,
         call_id: &str,
         agent_id: &str,
     ) -> Result<CommandResult, CommandError> {
@@ -979,13 +965,10 @@ impl RwiCommandProcessor {
         self.get_handle(call_id).await?;
 
         // Check if call is in queue
-        let queue_id = {
-            let states = self.queue_states.read().await;
-            if let Some(state) = states.get(call_id) {
-                state.queue_id.clone()
-            } else {
-                return Err(CommandError::CommandFailed("Call not in queue".to_string()));
-            }
+        let queue_id = if let Some(state) = self.queue_states.get(call_id) {
+            state.queue_id.clone()
+        } else {
+            return Err(CommandError::CommandFailed("Call not in queue".to_string()));
         };
 
         // Emit agent assigned event
@@ -1003,7 +986,7 @@ impl RwiCommandProcessor {
 
     /// Requeue a call to a different queue
     async fn queue_requeue(
-        &self,
+        &mut self,
         call_id: &str,
         queue_id: &str,
         priority: Option<u32>,
@@ -1012,18 +995,15 @@ impl RwiCommandProcessor {
         self.get_handle(call_id).await?;
 
         // Check if call is in queue
-        let old_queue_id = {
-            let mut states = self.queue_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                let old = state.queue_id.clone();
-                state.queue_id = queue_id.to_string();
-                if let Some(p) = priority {
-                    state.priority = Some(p);
-                }
-                old
-            } else {
-                return Err(CommandError::CommandFailed("Call not in queue".to_string()));
+        let old_queue_id = if let Some(state) = self.queue_states.get_mut(call_id) {
+            let old = state.queue_id.clone();
+            state.queue_id = queue_id.to_string();
+            if let Some(p) = priority {
+                state.priority = Some(p);
             }
+            old
+        } else {
+            return Err(CommandError::CommandFailed("Call not in queue".to_string()));
         };
 
         // Emit requeue event
@@ -1080,7 +1060,10 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn record_start(&self, req: RecordStartRequest) -> Result<CommandResult, CommandError> {
+    async fn record_start(
+        &mut self,
+        req: RecordStartRequest,
+    ) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(&req.call_id).await?;
         let recording_id = Uuid::new_v4().to_string();
         let path = req.storage.path.clone();
@@ -1099,8 +1082,7 @@ impl RwiCommandProcessor {
             path,
             is_paused: false,
         };
-        let mut states = self.record_states.write().await;
-        states.insert(req.call_id.clone(), record_state);
+        self.record_states.insert(req.call_id.clone(), record_state);
         let event = RwiEvent::RecordStarted {
             call_id: req.call_id.clone(),
             recording_id,
@@ -1110,25 +1092,19 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn record_pause(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn record_pause(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        {
-            let mut states = self.record_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                state.is_paused = true;
-            } else {
-                return Err(CommandError::CommandFailed(
-                    "No recording in progress".to_string(),
-                ));
-            }
+        if let Some(state) = self.record_states.get_mut(call_id) {
+            state.is_paused = true;
+        } else {
+            return Err(CommandError::CommandFailed(
+                "No recording in progress".to_string(),
+            ));
         }
         handle
             .send_command(SessionAction::PauseRecording)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let recording_id = {
-            let states = self.record_states.read().await;
-            states.get(call_id).map(|s| s.recording_id.clone())
-        };
+        let recording_id = self.record_states.get(call_id).map(|s| s.recording_id.clone());
         if let Some(rid) = recording_id {
             let event = RwiEvent::RecordPaused {
                 call_id: call_id.to_string(),
@@ -1140,25 +1116,19 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn record_resume(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn record_resume(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        {
-            let mut states = self.record_states.write().await;
-            if let Some(state) = states.get_mut(call_id) {
-                state.is_paused = false;
-            } else {
-                return Err(CommandError::CommandFailed(
-                    "No recording in progress".to_string(),
-                ));
-            }
+        if let Some(state) = self.record_states.get_mut(call_id) {
+            state.is_paused = false;
+        } else {
+            return Err(CommandError::CommandFailed(
+                "No recording in progress".to_string(),
+            ));
         }
         handle
             .send_command(SessionAction::ResumeRecording)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
-        let recording_id = {
-            let states = self.record_states.read().await;
-            states.get(call_id).map(|s| s.recording_id.clone())
-        };
+        let recording_id = self.record_states.get(call_id).map(|s| s.recording_id.clone());
         if let Some(rid) = recording_id {
             let event = RwiEvent::RecordResumed {
                 call_id: call_id.to_string(),
@@ -1170,15 +1140,12 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn record_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn record_stop(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         let handle = self.get_handle(call_id).await?;
-        let (recording_id, duration) = {
-            let mut states = self.record_states.write().await;
-            if let Some(state) = states.remove(call_id) {
-                (Some(state.recording_id), None)
-            } else {
-                (None, None)
-            }
+        let (recording_id, duration) = if let Some(state) = self.record_states.remove(call_id) {
+            (Some(state.recording_id), None)
+        } else {
+            (None, None)
         };
         handle
             .send_command(SessionAction::StopRecording)
@@ -1197,7 +1164,7 @@ impl RwiCommandProcessor {
 
     /// Mask a segment of a recording (for PCI compliance)
     async fn record_mask_segment(
-        &self,
+        &mut self,
         call_id: &str,
         recording_id: &str,
         start_secs: u64,
@@ -1207,13 +1174,10 @@ impl RwiCommandProcessor {
         self.get_handle(call_id).await?;
 
         // Check if recording exists
-        {
-            let states = self.record_states.read().await;
-            if !states.contains_key(call_id) {
-                return Err(CommandError::CommandFailed(
-                    "No active recording for this call".to_string(),
-                ));
-            }
+        if !self.record_states.contains_key(call_id) {
+            return Err(CommandError::CommandFailed(
+                "No active recording for this call".to_string(),
+            ));
         }
 
         // Emit segment masked event (in a real implementation, this would trigger the actual masking)
@@ -1292,20 +1256,17 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_create(
-        &self,
+        &mut self,
         req: ConferenceCreateRequest,
     ) -> Result<CommandResult, CommandError> {
         let conf_id = req.conf_id.clone();
 
         // Check if conference already exists
-        {
-            let states = self.conference_states.read().await;
-            if states.contains_key(&conf_id) {
-                return Err(CommandError::CommandFailed(format!(
-                    "conference {} already exists",
-                    conf_id
-                )));
-            }
+        if self.conference_states.contains_key(&conf_id) {
+            return Err(CommandError::CommandFailed(format!(
+                "conference {} already exists",
+                conf_id
+            )));
         }
 
         // For external backend, validate MCU URI if provided
@@ -1332,10 +1293,7 @@ impl RwiCommandProcessor {
             .create_conference_mixer(conf_id.clone(), 8000);
 
         // Store conference state
-        {
-            let mut states = self.conference_states.write().await;
-            states.insert(conf_id.clone(), state);
-        }
+        self.conference_states.insert(conf_id.clone(), state);
 
         // Emit event
         let event = RwiEvent::ConferenceCreated {
@@ -1349,7 +1307,7 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_add(
-        &self,
+        &mut self,
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
@@ -1358,12 +1316,10 @@ impl RwiCommandProcessor {
 
         // Get conference state
         let mut state = {
-            let mut states = self.conference_states.write().await;
-            let state = states.get_mut(conf_id).ok_or_else(|| {
+            let state = self.conference_states.get(conf_id).ok_or_else(|| {
                 CommandError::CommandFailed(format!("conference {} not found", conf_id))
             })?;
 
-            // Check max members
             if let Some(max) = state.max_members {
                 if state.members.len() >= max as usize {
                     return Err(CommandError::CommandFailed(format!(
@@ -1391,11 +1347,8 @@ impl RwiCommandProcessor {
 
         // Update state
         state.members.push(call_id.to_string());
-        {
-            let mut states = self.conference_states.write().await;
-            if let Some(s) = states.get_mut(conf_id) {
-                s.members.push(call_id.to_string());
-            }
+        if let Some(s) = self.conference_states.get_mut(conf_id) {
+            s.members.push(call_id.to_string());
         }
 
         // Emit event
@@ -1414,34 +1367,27 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_remove(
-        &self,
+        &mut self,
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        // Get conference state
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let state = self.conference_states.get(conf_id).ok_or_else(|| {
+            CommandError::CommandFailed(format!("conference {} not found", conf_id))
+        })?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
+        if !state.members.contains(&call_id.to_string()) {
+            return Err(CommandError::CommandFailed(format!(
+                "call {} is not in conference {}",
+                call_id, conf_id
+            )));
         }
 
         // Remove from mixer
         self.mixer_registry.remove_participant(call_id);
 
         // Update state
-        {
-            let mut states = self.conference_states.write().await;
-            if let Some(s) = states.get_mut(conf_id) {
-                s.members.retain(|c| c != call_id);
-            }
+        if let Some(s) = self.conference_states.get_mut(conf_id) {
+            s.members.retain(|c| c != call_id);
         }
 
         // Emit event
@@ -1460,23 +1406,19 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_mute(
-        &self,
+        &mut self,
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        // Verify call is in conference
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let state = self.conference_states.get(conf_id).ok_or_else(|| {
+            CommandError::CommandFailed(format!("conference {} not found", conf_id))
+        })?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
+        if !state.members.contains(&call_id.to_string()) {
+            return Err(CommandError::CommandFailed(format!(
+                "call {} is not in conference {}",
+                call_id, conf_id
+            )));
         }
 
         // TODO: Actually mute the participant in the mixer
@@ -1498,23 +1440,19 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_unmute(
-        &self,
+        &mut self,
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        // Verify call is in conference
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let state = self.conference_states.get(conf_id).ok_or_else(|| {
+            CommandError::CommandFailed(format!("conference {} not found", conf_id))
+        })?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
+        if !state.members.contains(&call_id.to_string()) {
+            return Err(CommandError::CommandFailed(format!(
+                "call {} is not in conference {}",
+                call_id, conf_id
+            )));
         }
 
         // TODO: Actually unmute the participant in the mixer
@@ -1535,15 +1473,14 @@ impl RwiCommandProcessor {
         })
     }
 
-    async fn conference_destroy(&self, conf_id: &str) -> Result<CommandResult, CommandError> {
+    async fn conference_destroy(&mut self, conf_id: &str) -> Result<CommandResult, CommandError> {
         // Get conference state to get members
-        let members = {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
-            state.members.clone()
-        };
+        let members = self
+            .conference_states
+            .get(conf_id)
+            .ok_or_else(|| CommandError::CommandFailed(format!("conference {} not found", conf_id)))?
+            .members
+            .clone();
 
         // Remove all participants from mixer
         for call_id in &members {
@@ -1554,10 +1491,7 @@ impl RwiCommandProcessor {
         self.mixer_registry.remove_mixer(conf_id);
 
         // Remove conference state
-        {
-            let mut states = self.conference_states.write().await;
-            states.remove(conf_id);
-        }
+        self.conference_states.remove(conf_id);
 
         // Emit event
         let event = RwiEvent::ConferenceDestroyed {
@@ -1573,7 +1507,7 @@ impl RwiCommandProcessor {
     }
 
     async fn set_ringback_source(
-        &self,
+        &mut self,
         target_call_id: &str,
         source_call_id: &str,
     ) -> Result<CommandResult, CommandError> {
@@ -1583,8 +1517,8 @@ impl RwiCommandProcessor {
             target_call_id: target_call_id.to_string(),
             source_call_id: source_call_id.to_string(),
         };
-        let mut states = self.ringback_states.write().await;
-        states.insert(target_call_id.to_string(), ringback_state);
+        self.ringback_states
+            .insert(target_call_id.to_string(), ringback_state);
         let event = RwiEvent::MediaRingbackPassthroughStarted {
             source: source_call_id.to_string(),
             target: target_call_id.to_string(),
@@ -1596,7 +1530,7 @@ impl RwiCommandProcessor {
     }
 
     async fn supervisor_listen(
-        &self,
+        &mut self,
         supervisor_call_id: &str,
         target_call_id: &str,
     ) -> Result<CommandResult, CommandError> {
@@ -1681,8 +1615,8 @@ impl RwiCommandProcessor {
             target_call_id: target_call_id.to_string(),
             mode: SupervisorMode::Listen,
         };
-        let mut states = self.supervisor_states.write().await;
-        states.insert(supervisor_call_id.to_string(), state);
+        self.supervisor_states
+            .insert(supervisor_call_id.to_string(), state);
         let event = RwiEvent::SupervisorListenStarted {
             supervisor_call_id: supervisor_call_id.to_string(),
             target_call_id: target_call_id.to_string(),
@@ -1694,7 +1628,7 @@ impl RwiCommandProcessor {
     }
 
     async fn supervisor_whisper(
-        &self,
+        &mut self,
         supervisor_call_id: &str,
         target_call_id: &str,
         _agent_leg: &str,
@@ -1770,8 +1704,8 @@ impl RwiCommandProcessor {
             target_call_id: target_call_id.to_string(),
             mode: SupervisorMode::Whisper,
         };
-        let mut states = self.supervisor_states.write().await;
-        states.insert(supervisor_call_id.to_string(), state);
+        self.supervisor_states
+            .insert(supervisor_call_id.to_string(), state);
         let event = RwiEvent::SupervisorWhisperStarted {
             supervisor_call_id: supervisor_call_id.to_string(),
             target_call_id: target_call_id.to_string(),
@@ -1783,7 +1717,7 @@ impl RwiCommandProcessor {
     }
 
     async fn supervisor_barge(
-        &self,
+        &mut self,
         supervisor_call_id: &str,
         target_call_id: &str,
         _agent_leg: &str,
@@ -1861,8 +1795,8 @@ impl RwiCommandProcessor {
             target_call_id: target_call_id.to_string(),
             mode: SupervisorMode::Barge,
         };
-        let mut states = self.supervisor_states.write().await;
-        states.insert(supervisor_call_id.to_string(), state);
+        self.supervisor_states
+            .insert(supervisor_call_id.to_string(), state);
         let event = RwiEvent::SupervisorBargeStarted {
             supervisor_call_id: supervisor_call_id.to_string(),
             target_call_id: target_call_id.to_string(),
@@ -1874,7 +1808,7 @@ impl RwiCommandProcessor {
     }
 
     async fn supervisor_stop(
-        &self,
+        &mut self,
         supervisor_call_id: &str,
         target_call_id: &str,
     ) -> Result<CommandResult, CommandError> {
@@ -1905,8 +1839,7 @@ impl RwiCommandProcessor {
             "Supervisor mode stopped"
         );
 
-        let mut states = self.supervisor_states.write().await;
-        states.remove(supervisor_call_id);
+        self.supervisor_states.remove(supervisor_call_id);
         let event = RwiEvent::SupervisorModeStopped {
             supervisor_call_id: supervisor_call_id.to_string(),
             target_call_id: target_call_id.to_string(),
@@ -1921,7 +1854,7 @@ impl RwiCommandProcessor {
 
     /// Supervisor takeover - replaces the agent on the call
     async fn supervisor_takeover(
-        &self,
+        &mut self,
         supervisor_call_id: &str,
         target_call_id: &str,
         agent_leg: &str,
@@ -1955,10 +1888,8 @@ impl RwiCommandProcessor {
             target_call_id: target_call_id.to_string(),
             mode: SupervisorMode::Barge,
         };
-        {
-            let mut states = self.supervisor_states.write().await;
-            states.insert(supervisor_call_id.to_string(), state);
-        }
+        self.supervisor_states
+            .insert(supervisor_call_id.to_string(), state);
 
         // Send SupervisorBarge action to both calls
         supervisor_handle
@@ -1998,7 +1929,7 @@ impl RwiCommandProcessor {
     }
 
     async fn media_stream_start(
-        &self,
+        &mut self,
         call_id: &str,
         stream_id: &str,
         direction: &str,
@@ -2009,8 +1940,7 @@ impl RwiCommandProcessor {
             stream_id: stream_id.to_string(),
             direction: direction.to_string(),
         };
-        let mut states = self.media_stream_states.write().await;
-        states.insert(call_id.to_string(), state);
+        self.media_stream_states.insert(call_id.to_string(), state);
         let event = RwiEvent::MediaStreamStarted {
             call_id: call_id.to_string(),
         };
@@ -2019,10 +1949,9 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn media_stream_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn media_stream_stop(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         self.get_handle(call_id).await?;
-        let mut states = self.media_stream_states.write().await;
-        states.remove(call_id);
+        self.media_stream_states.remove(call_id);
         let event = RwiEvent::MediaStreamStopped {
             call_id: call_id.to_string(),
         };
@@ -2032,7 +1961,7 @@ impl RwiCommandProcessor {
     }
 
     async fn media_inject_start(
-        &self,
+        &mut self,
         call_id: &str,
         stream_id: &str,
         format: &crate::rwi::session::MediaFormat,
@@ -2045,8 +1974,7 @@ impl RwiCommandProcessor {
             sample_rate: format.sample_rate,
             channels: format.channels,
         };
-        let mut states = self.media_inject_states.write().await;
-        states.insert(call_id.to_string(), state);
+        self.media_inject_states.insert(call_id.to_string(), state);
         let event = RwiEvent::MediaStreamStarted {
             call_id: call_id.to_string(),
         };
@@ -2055,10 +1983,9 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    async fn media_inject_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+    async fn media_inject_stop(&mut self, call_id: &str) -> Result<CommandResult, CommandError> {
         self.get_handle(call_id).await?;
-        let mut states = self.media_inject_states.write().await;
-        states.remove(call_id);
+        self.media_inject_states.remove(call_id);
         let event = RwiEvent::MediaStreamStopped {
             call_id: call_id.to_string(),
         };
@@ -2156,17 +2083,17 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    fn create_test_processor() -> Arc<RwiCommandProcessor> {
+    fn create_test_processor() -> RwiCommandProcessor {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        Arc::new(RwiCommandProcessor::new(registry, gateway))
+        RwiCommandProcessor::new(registry, gateway)
     }
 
     fn create_test_processor_with_registry(
         registry: Arc<ActiveProxyCallRegistry>,
-    ) -> Arc<RwiCommandProcessor> {
+    ) -> RwiCommandProcessor {
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        Arc::new(RwiCommandProcessor::new(registry, gateway))
+        RwiCommandProcessor::new(registry, gateway)
     }
 
     fn create_test_call(
@@ -2244,7 +2171,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_calls_empty() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::ListCalls)
             .await;
@@ -2256,7 +2183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_answer_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Answer {
                 call_id: "nonexistent".into(),
@@ -2268,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ring_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Ring {
                 call_id: "nonexistent".into(),
@@ -2280,7 +2207,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Reject {
                 call_id: "nonexistent".into(),
@@ -2293,7 +2220,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::AttachCall {
                 call_id: "nonexistent".into(),
@@ -2306,7 +2233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detach_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::DetachCall {
                 call_id: "nonexistent".into(),
@@ -2326,7 +2253,7 @@ mod tests {
             "callee1",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
 
         // Detach should succeed
         let result = processor
@@ -2344,7 +2271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hangup_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Hangup {
                 call_id: "nonexistent".into(),
@@ -2358,7 +2285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_call_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Transfer {
                 call_id: "nonexistent".into(),
@@ -2370,7 +2297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_not_found_leg_a() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Bridge {
                 leg_a: "missing-a".into(),
@@ -2384,7 +2311,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_not_found_leg_b() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
 
         let result = processor
@@ -2400,7 +2327,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_both_legs_exist_sends_bridgeto() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let _ha = create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
         let _hb = create_test_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
 
@@ -2422,7 +2349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unbridge_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Unbridge {
                 call_id: "nope".into(),
@@ -2434,7 +2361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_success() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Subscribe {
                 contexts: vec!["ctx1".into()],
@@ -2445,7 +2372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_success() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Unsubscribe {
                 contexts: vec!["ctx1".into()],
@@ -2456,7 +2383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_play_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::MediaPlay(
                 crate::rwi::session::MediaPlayRequest {
@@ -2477,7 +2404,7 @@ mod tests {
     #[tokio::test]
     async fn test_originate_no_server_returns_error() {
         // Without a SIP server wired in, originate should return CommandFailed
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
@@ -2507,7 +2434,7 @@ mod tests {
         // Even with a SIP server, an invalid URI should return CommandFailed
         // Here we don't have a real SipServer so we just verify the no-server path;
         // URI-parse errors are caught in the same method after the server check.
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
@@ -2538,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn test_answer_existing_call() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let _handle = create_test_call(
             &registry,
             "call-001",
@@ -2563,7 +2490,7 @@ mod tests {
     #[tokio::test]
     async fn test_hangup_existing_call() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let _handle = create_test_call(
             &registry,
             "call-001",
@@ -2589,7 +2516,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_calls_with_multiple_calls() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
 
         create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         create_test_call(&registry, "call-2", "1002", "2001", DialDirection::Outbound);
@@ -2611,7 +2538,7 @@ mod tests {
     #[tokio::test]
     async fn test_call_direction_filtering() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
 
         create_test_call(
             &registry,
@@ -2650,7 +2577,7 @@ mod tests {
     async fn test_bridge_emits_event_to_gateway() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway.clone()));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway.clone());
 
         // Create two legs
         let _ha = create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
@@ -2699,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_stop_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::MediaStop {
                 call_id: "ghost".into(),
@@ -2712,7 +2639,7 @@ mod tests {
     #[tokio::test]
     async fn test_media_stop_existing_call_sends_stop_playback() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let (_handle, mut rx) = create_test_call_with_rx(
             &registry,
             "call-stop",
@@ -2742,7 +2669,7 @@ mod tests {
     #[tokio::test]
     async fn test_unbridge_existing_call_sends_unbridge() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let (_handle, mut rx) = create_test_call_with_rx(
             &registry,
             "call-unb",
@@ -2771,7 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_sends_bridge_to_to_leg_a() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let mut processor = create_test_processor_with_registry(registry.clone());
         let (_ha, mut rx_a) =
             create_test_call_with_rx(&registry, "leg-a2", "1001", "2001", DialDirection::Outbound);
         let _hb = create_test_call(&registry, "leg-b2", "1001", "2002", DialDirection::Outbound);
@@ -2800,7 +2727,7 @@ mod tests {
     async fn test_unbridge_emits_call_unbridged_event_to_gateway() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway.clone()));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway.clone());
 
         let (_handle, _rx) =
             create_test_call_with_rx(&registry, "call-ev", "1001", "2000", DialDirection::Inbound);
@@ -2860,7 +2787,7 @@ mod tests {
             "2001",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SetRingbackSource {
@@ -2881,7 +2808,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SetRingbackSource {
@@ -2903,7 +2830,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SetRingbackSource {
@@ -2925,7 +2852,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::RecordStart(
@@ -2952,7 +2879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_start_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
@@ -2981,7 +2908,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::RecordStart(
@@ -3020,7 +2947,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::RecordPause {
@@ -3041,7 +2968,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::RecordStart(
@@ -3087,7 +3014,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::RecordResume {
@@ -3108,7 +3035,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::RecordStart(
@@ -3153,7 +3080,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::RecordStop {
@@ -3178,7 +3105,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::QueueEnqueue(
@@ -3198,7 +3125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_enqueue_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
@@ -3224,7 +3151,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::QueueEnqueue(
@@ -3251,7 +3178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_dequeue_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::QueueDequeue {
                 call_id: "nonexistent".into(),
@@ -3271,7 +3198,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::QueueEnqueue(
@@ -3307,7 +3234,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::QueueHold {
@@ -3333,7 +3260,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::QueueEnqueue(
@@ -3376,7 +3303,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::QueueUnhold {
@@ -3404,7 +3331,7 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SupervisorListen {
@@ -3423,7 +3350,7 @@ mod tests {
     async fn test_supervisor_listen_not_found() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SupervisorListen {
@@ -3447,7 +3374,7 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SupervisorWhisper {
@@ -3475,7 +3402,7 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SupervisorBarge {
@@ -3495,7 +3422,7 @@ mod tests {
     async fn test_supervisor_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::SupervisorStop {
@@ -3510,7 +3437,7 @@ mod tests {
     async fn test_media_stream_start_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::MediaStreamStart(
@@ -3531,7 +3458,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_stream_start_not_found() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::MediaStreamStart(
                 crate::rwi::session::MediaStreamRequest {
@@ -3554,7 +3481,7 @@ mod tests {
     async fn test_media_stream_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::MediaStreamStart(
@@ -3584,7 +3511,7 @@ mod tests {
     async fn test_media_inject_start_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         let result = processor
             .execute_command(RwiCommandPayload::MediaInjectStart(
@@ -3606,7 +3533,7 @@ mod tests {
     async fn test_media_inject_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let mut processor = create_test_processor_with_registry(registry);
 
         processor
             .execute_command(RwiCommandPayload::MediaInjectStart(
@@ -3633,7 +3560,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_message_no_server() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::SipMessage {
                 call_id: "call-1".into(),
@@ -3652,7 +3579,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_notify_no_server() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::SipNotify {
                 call_id: "call-1".into(),
@@ -3672,7 +3599,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_options_ping_no_server() {
-        let processor = create_test_processor();
+        let mut processor = create_test_processor();
         let result = processor
             .execute_command(RwiCommandPayload::SipOptionsPing {
                 call_id: "call-1".into(),
@@ -3692,7 +3619,7 @@ mod tests {
     async fn test_conference_create_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         let result = processor
             .execute_command(RwiCommandPayload::ConferenceCreate(
@@ -3718,7 +3645,7 @@ mod tests {
     async fn test_conference_create_duplicate_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         // Create first conference
         processor
@@ -3754,7 +3681,7 @@ mod tests {
     async fn test_conference_create_external_requires_mcu_uri() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         let result = processor
             .execute_command(RwiCommandPayload::ConferenceCreate(
@@ -3780,7 +3707,7 @@ mod tests {
     async fn test_conference_add_not_found_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         let result = processor
             .execute_command(RwiCommandPayload::ConferenceAdd {
@@ -3797,7 +3724,7 @@ mod tests {
     async fn test_conference_destroy_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         // Create conference
         processor
@@ -3832,7 +3759,7 @@ mod tests {
     async fn test_conference_destroy_not_found_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         let result = processor
             .execute_command(RwiCommandPayload::ConferenceDestroy {
@@ -3847,7 +3774,7 @@ mod tests {
     async fn test_conference_mute_not_in_conference_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let mut processor = RwiCommandProcessor::new(registry, gateway);
 
         // Create conference but don't add any calls
         processor
@@ -3883,7 +3810,7 @@ mod tests {
     async fn test_conference_add_with_max_members() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create conference with max 2 members
         processor
@@ -3939,7 +3866,7 @@ mod tests {
     async fn test_queue_set_priority_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
@@ -3968,7 +3895,7 @@ mod tests {
     async fn test_queue_set_priority_not_in_queue_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call but don't enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
@@ -3988,7 +3915,7 @@ mod tests {
     async fn test_queue_assign_agent_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
@@ -4017,7 +3944,7 @@ mod tests {
     async fn test_queue_requeue_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call and enqueue it
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
@@ -4048,22 +3975,19 @@ mod tests {
     async fn test_record_mask_segment_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call and manually add to record_states (bypassing the actual recording command)
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        {
-            let mut states = processor.record_states.write().await;
-            states.insert(
-                "call-1".to_string(),
-                RecordState {
-                    recording_id: "rec-1".to_string(),
-                    mode: "mixed".to_string(),
-                    path: "/tmp/recording.wav".to_string(),
-                    is_paused: false,
-                },
-            );
-        }
+        processor.record_states.insert(
+            "call-1".to_string(),
+            RecordState {
+                recording_id: "rec-1".to_string(),
+                mode: "mixed".to_string(),
+                path: "/tmp/recording.wav".to_string(),
+                is_paused: false,
+            },
+        );
 
         // Mask a segment
         let result = processor
@@ -4081,7 +4005,7 @@ mod tests {
     async fn test_record_mask_segment_no_recording_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let mut processor = RwiCommandProcessor::new(registry.clone(), gateway);
 
         // Create a call but don't start recording
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
