@@ -3,7 +3,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -16,7 +16,7 @@ pub struct RwiRequestEnvelope {
     pub params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AuthError {
     #[error("missing token")]
     MissingToken,
@@ -56,7 +56,7 @@ impl AuthError {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[error("{message}")]
 pub struct HandleTextMessageError {
     action_id: String,
@@ -101,12 +101,21 @@ impl From<HandleTextMessageError> for RwiResponse {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum Error {
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error(transparent)]
     Message(#[from] HandleTextMessageError),
+}
+
+impl Error {
+    pub fn into_rwi_response(self) -> RwiResponse {
+        match self {
+            Error::Auth(error) => error.into_rwi_response(),
+            Error::Message(error) => error.into_rwi_response(),
+        }
+    }
 }
 
 impl IntoResponse for Error {
@@ -122,15 +131,26 @@ impl IntoResponse for Error {
 
 impl From<Error> for RwiResponse {
     fn from(value: Error) -> Self {
-        match value {
-            Error::Auth(error) => error.into_rwi_response(),
-            Error::Message(error) => error.into_rwi_response(),
-        }
+        value.into_rwi_response()
     }
 }
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         HandleTextMessageError::new("", RwiErrorCode::ParseError, value.to_string()).into()
+    }
+}
+
+pub struct RwiWireResponse(pub crate::rwi::Result<RwiResponse>);
+
+impl Serialize for RwiWireResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.0 {
+            Ok(response) => response.serialize(serializer),
+            Err(error) => error.clone().into_rwi_response().serialize(serializer),
+        }
     }
 }

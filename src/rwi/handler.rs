@@ -10,13 +10,13 @@ use crate::rwi::proto::{
     RwiResponseData, TrackIdData, TransferAttendedData,
 };
 use crate::rwi::session::{OwnershipMode, RwiCommandPayload};
-use crate::rwi::types::{HandleTextMessageError, RwiRequestEnvelope};
+use crate::rwi::types::{HandleTextMessageError, RwiRequestEnvelope, RwiWireResponse};
 use axum::{
     Extension,
     extract::Query,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::HeaderMap,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -35,9 +35,12 @@ pub async fn rwi_ws_handler(
 ) -> Result<Response> {
     let identity = authenticate_request(&headers, &params, auth).await?;
 
-    Ok(ws.protocols(["rwi-v1"]).on_upgrade(async move |socket| {
-        handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
-    }))
+    Ok(ws
+        .protocols(["rwi-v1"])
+        .on_upgrade(async move |socket| {
+            handle_websocket(socket, identity, gateway, call_registry, sip_server).await;
+        })
+        .into_response())
 }
 
 fn extract_token(
@@ -102,14 +105,13 @@ async fn handle_websocket(
             ws_msg = ws_receiver.next() => {
                 match ws_msg {
                     Some(Ok(Message::Text(text))) => {
-                        let response = handle_text_message(
+                        let response = RwiWireResponse(handle_text_message(
                             text.as_ref(),
                             processor.clone(),
                             &session_id,
                             gateway.clone(),
                         )
-                        .await
-                        .unwrap_or_else(Into::into);
+                        .await);
                         if let Ok(json) = serde_json::to_string(&response) {
                             if ws_sender.send(Message::Text(json.into())).await.is_err() {
                                 break;
@@ -307,9 +309,7 @@ mod tests {
     async fn process_msg(json: &str) -> serde_json::Value {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = handle_text_message(json, processor, "test-session", gateway)
-            .await
-            .unwrap_or_else(Into::into);
+        let resp = RwiWireResponse(handle_text_message(json, processor, "test-session", gateway).await);
         serde_json::to_value(resp).expect("response should be valid JSON")
     }
 
@@ -412,9 +412,7 @@ mod tests {
     async fn test_invalid_json_returns_error() {
         let processor = create_test_processor();
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let resp = handle_text_message("not json", processor, "sess", gateway)
-            .await
-            .unwrap_or_else(Into::into);
+        let resp = RwiWireResponse(handle_text_message("not json", processor, "sess", gateway).await);
         let v: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(v["response"], "error");
         assert_eq!(v["error"]["code"], "parse_error");
