@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use rsipstack::transport::SipAddr;
 use sea_orm::{ActiveModelTrait, Database, QueryOrder, Set, entity::prelude::*};
 pub use sea_orm_migration::prelude::*;
-use sea_orm_migration::schema::{boolean, integer, pk_auto, string, string_null, timestamp};
+use sea_orm_migration::schema::{boolean, integer, string, timestamp};
+use sea_orm_migration::sea_query::ColumnDef;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -17,7 +18,7 @@ use tracing::{info, warn};
 #[sea_orm(table_name = "rustpbx_locations")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
-    pub id: i64,
+    pub id: u64,
     pub aor: String,
     pub expires: i64,
     pub username: String,
@@ -28,13 +29,21 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub supports_webrtc: bool,
-    pub user_agent: Option<String>,
+    pub user_agent: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 impl ActiveModelBehavior for ActiveModel {}
 impl Entity {}
+
+fn optional_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
 
 /// Database backed Locator implementation using SeaORM
 pub struct DbLocator {
@@ -53,33 +62,103 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(Entity)
                     .if_not_exists()
-                    .col(pk_auto(Column::Id))
-                    .col(string(Column::Aor).char_len(255).not_null())
-                    .col(integer(Column::Expires).not_null())
-                    .col(string(Column::Username).char_len(200).not_null())
-                    .col(string_null(Column::Realm).char_len(200))
-                    .col(string(Column::Destination).char_len(255).not_null())
-                    .col(string(Column::Transport).char_len(32).not_null())
-                    .col(integer(Column::LastModified).not_null())
-                    .col(timestamp(Column::CreatedAt).not_null())
-                    .col(timestamp(Column::UpdatedAt).not_null())
-                    .col(boolean(Column::SupportsWebrtc).not_null().default(false))
-                    .col(string_null(Column::UserAgent).char_len(255))
+                    .comment("SIP registration locations for the database locator")
+                    .character_set("utf8mb4")
+                    .collate("utf8mb4_unicode_ci")
+                    .col(
+                        ColumnDef::new(Column::Id)
+                            .big_unsigned()
+                            .not_null()
+                            .primary_key()
+                            .auto_increment()
+                            .comment("Primary key"),
+                    )
+                    .col(
+                        string(Column::Aor)
+                            .char_len(255)
+                            .default("")
+                            .comment("Registered address of record"),
+                    )
+                    .col(
+                        integer(Column::Expires)
+                            .not_null()
+                            .default(0)
+                            .comment("Registration expiration in seconds"),
+                    )
+                    .col(
+                        string(Column::Username)
+                            .char_len(200)
+                            .default("")
+                            .comment("Normalized SIP username"),
+                    )
+                    .col(
+                        string(Column::Realm)
+                            .char_len(200)
+                            .default("")
+                            .comment("Normalized SIP realm"),
+                    )
+                    .col(
+                        string(Column::Destination)
+                            .char_len(255)
+                            .default("")
+                            .comment("Resolved SIP destination host and port"),
+                    )
+                    .col(
+                        string(Column::Transport)
+                            .char_len(32)
+                            .default("")
+                            .comment("SIP transport"),
+                    )
+                    .col(
+                        integer(Column::LastModified)
+                            .not_null()
+                            .default(0)
+                            .comment("Last registration update as Unix epoch seconds"),
+                    )
+                    .col(
+                        timestamp(Column::CreatedAt)
+                            .default(Expr::current_timestamp())
+                            .comment("Record creation timestamp"),
+                    )
+                    .col(
+                        timestamp(Column::UpdatedAt)
+                            .default(Expr::current_timestamp())
+                            .comment("Record update timestamp"),
+                    )
+                    .col(
+                        boolean(Column::SupportsWebrtc)
+                            .not_null()
+                            .default(false)
+                            .comment("Whether this contact supports WebRTC"),
+                    )
+                    .col(
+                        string(Column::UserAgent)
+                            .char_len(255)
+                            .default("")
+                            .comment("SIP user agent"),
+                    )
                     .to_owned(),
             )
             .await?;
 
         // Add index on username+realm
-        manager
-            .create_index(
-                Index::create()
-                    .table(Entity)
-                    .name("idx_locations_realm_username")
-                    .col(Column::Realm)
-                    .col(Column::Username)
-                    .to_owned(),
-            )
-            .await
+        if !manager
+            .has_index("rustpbx_locations", "idx_locations_realm_username")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .table(Entity)
+                        .name("idx_locations_realm_username")
+                        .col(Column::Realm)
+                        .col(Column::Username)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -110,6 +189,10 @@ impl MigratorTrait for Migrator {
 impl DbLocator {
     /// Create a new DbLocator with a database connection
     pub async fn new(url: String) -> Result<Self> {
+        Self::new_with_migrate(url, true).await
+    }
+
+    pub async fn new_with_migrate(url: String, migrate: bool) -> Result<Self> {
         // Connect to the database
         let db = Database::connect(&url)
             .await
@@ -119,17 +202,23 @@ impl DbLocator {
             realm_checker: Mutex::new(None),
         };
         info!("Creating DbLocator");
-        match db_locator.migrate().await {
-            Ok(_) => Ok(db_locator),
-            Err(e) => {
-                warn!("migrate locator fail {}", e);
-                Err(e)
+        if migrate {
+            match db_locator.migrate().await {
+                Ok(_) => Ok(db_locator),
+                Err(e) => {
+                    warn!("migrate locator fail {}", e);
+                    Err(e)
+                }
             }
+        } else {
+            Ok(db_locator)
         }
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        Migrator::up(&self.db, None)
+        let manager = SchemaManager::new(&self.db);
+        Migration
+            .up(&manager)
             .await
             .map_err(|e| anyhow::anyhow!("Migration error: {}", e))?;
         Ok(())
@@ -234,7 +323,7 @@ impl Locator for DbLocator {
                 active_model.last_modified = Set(now);
                 active_model.updated_at = Set(chrono::Utc::now());
                 active_model.supports_webrtc = Set(location.supports_webrtc);
-                active_model.user_agent = Set(location.user_agent.clone());
+                active_model.user_agent = Set(location.user_agent.clone().unwrap_or_default());
 
                 active_model
                     .update(&self.db)
@@ -257,7 +346,7 @@ impl Locator for DbLocator {
                 active_model.created_at = Set(now_dt);
                 active_model.updated_at = Set(now_dt);
                 active_model.supports_webrtc = Set(location.supports_webrtc);
-                active_model.user_agent = Set(location.user_agent.clone());
+                active_model.user_agent = Set(location.user_agent.clone().unwrap_or_default());
 
                 // Insert without specifying id
                 active_model
@@ -325,7 +414,7 @@ impl Locator for DbLocator {
                 supports_webrtc: loc.supports_webrtc,
                 transport: Some(transport),
                 registered_aor: Some(registered_aor),
-                user_agent: loc.user_agent.clone(),
+                user_agent: optional_string(&loc.user_agent),
                 ..Default::default()
             });
         }
@@ -473,7 +562,7 @@ impl Locator for DbLocator {
                 supports_webrtc: model.supports_webrtc,
                 transport: Some(transport),
                 registered_aor: Some(registered_aor),
-                user_agent: model.user_agent.clone(),
+                user_agent: optional_string(&model.user_agent),
                 ..Default::default()
             });
         }
